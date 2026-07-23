@@ -7,6 +7,7 @@ import {
   Clipboard,
   Copy,
   Desktop,
+  FileText,
   Gear,
   Link,
   Plus,
@@ -30,7 +31,8 @@ const crosscopy = {
     invoke<void>("set_sync_enabled", { value }),
   setLaunchAtLogin: (value: boolean) =>
     invoke<void>("set_launch_at_login", { value }),
-  unpair: (peerId: string) => invoke<void>("unpair", { peerId })
+  unpair: (peerId: string) => invoke<void>("unpair", { peerId }),
+  exportDiagnostics: () => invoke<string>("export_diagnostics")
 };
 
 const EMPTY_STATE: UiState = {
@@ -52,6 +54,7 @@ function App(): React.JSX.Element {
   const [code, setCode] = useState("");
   const [error, setError] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  const [diagnosticsMessage, setDiagnosticsMessage] = useState("");
 
   useEffect(() => {
     let unlisten: UnlistenFn | undefined;
@@ -113,6 +116,18 @@ function App(): React.JSX.Element {
     setPairMode(null);
     setCode("");
     setError("");
+  }
+
+  async function exportDiagnostics(): Promise<void> {
+    setDiagnosticsMessage("正在生成");
+    try {
+      const path = await crosscopy.exportDiagnostics();
+      setDiagnosticsMessage(`已导出到 ${path}`);
+    } catch (reason) {
+      setDiagnosticsMessage(
+        typeof reason === "string" ? reason : "诊断日志导出失败"
+      );
+    }
   }
 
   return (
@@ -280,20 +295,29 @@ function App(): React.JSX.Element {
               )}
             </section>
 
-            <label className="login-setting">
-              <span>
-                <strong>开机自动启动</strong>
-                <small>保持后台运行，电脑上线后自动连接</small>
-              </span>
-              <input
-                type="checkbox"
-                checked={state.launchAtLogin}
-                onChange={(event) =>
-                  void crosscopy.setLaunchAtLogin(event.target.checked)
-                }
-              />
-              <i aria-hidden="true" />
-            </label>
+            <div className="footer-settings">
+              <div className="diagnostics-setting">
+                <button type="button" onClick={() => void exportDiagnostics()}>
+                  <FileText size={17} />
+                  导出诊断日志
+                </button>
+                {diagnosticsMessage && <small>{diagnosticsMessage}</small>}
+              </div>
+              <label className="login-setting">
+                <span>
+                  <strong>开机自动启动</strong>
+                  <small>保持后台运行，电脑上线后自动连接</small>
+                </span>
+                <input
+                  type="checkbox"
+                  checked={state.launchAtLogin}
+                  onChange={(event) =>
+                    void crosscopy.setLaunchAtLogin(event.target.checked)
+                  }
+                />
+                <i aria-hidden="true" />
+              </label>
+            </div>
           </>
         )}
       </section>

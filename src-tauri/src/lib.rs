@@ -1,5 +1,6 @@
 mod core;
 mod crypto;
+mod logger;
 mod model;
 mod store;
 
@@ -60,6 +61,11 @@ fn unpair(core: State<'_, Arc<Core>>, peer_id: String) -> Result<(), String> {
     core.unpair(&peer_id)
 }
 
+#[tauri::command]
+fn export_diagnostics(core: State<'_, Arc<Core>>) -> Result<String, String> {
+    core.export_diagnostics()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -75,8 +81,9 @@ pub fn run() {
         ))
         .setup(|app| {
             let app_dir = app.path().app_data_dir()?;
-            let store = Arc::new(store::Store::load(app_dir)?);
-            let core = Core::new(store, app.handle().clone());
+            let store = Arc::new(store::Store::load(app_dir.clone())?);
+            let logger = Arc::new(logger::Logger::new(&app_dir)?);
+            let core = Core::new(store, logger, app.handle().clone());
             app.manage(Arc::clone(&core));
             tauri::async_runtime::spawn(async move {
                 if let Err(error) = core.start().await {
@@ -127,7 +134,8 @@ pub fn run() {
             submit_pairing_code,
             set_sync_enabled,
             set_launch_at_login,
-            unpair
+            unpair,
+            export_diagnostics
         ])
         .run(tauri::generate_context!())
         .expect("failed to run CrossCopy");

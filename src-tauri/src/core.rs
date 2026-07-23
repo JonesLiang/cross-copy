@@ -1,5 +1,6 @@
 use crate::{
     crypto::{decode_secret, decrypt, encrypt, fingerprint, pairing_key, proof, random_secret, Envelope},
+    logger::{masked_ip, Logger},
     model::{Activity, ClipboardPayload, DiscoveryPacket, Peer, PeerView, UiState},
     store::Store,
 };
@@ -124,6 +125,7 @@ enum LocalClipboard {
 pub struct Core {
     pub store: Arc<Store>,
     app: AppHandle,
+    logger: Arc<Logger>,
     discovered: Mutex<HashMap<String, SeenPeer>>,
     pairing: Mutex<Option<PairSession>>,
     transfers: Mutex<HashMap<String, Transfer>>,
@@ -133,10 +135,11 @@ pub struct Core {
 }
 
 impl Core {
-    pub fn new(store: Arc<Store>, app: AppHandle) -> Arc<Self> {
+    pub fn new(store: Arc<Store>, logger: Arc<Logger>, app: AppHandle) -> Arc<Self> {
         Arc::new(Self {
             store,
             app,
+            logger,
             discovered: Mutex::new(HashMap::new()),
             pairing: Mutex::new(None),
             transfers: Mutex::new(HashMap::new()),
@@ -147,12 +150,25 @@ impl Core {
     }
 
     pub async fn start(self: &Arc<Self>) -> Result<(), String> {
+        self.logger.info(
+            "service_start",
+            format!(
+                "version={} platform={}/{}",
+                env!("CARGO_PKG_VERSION"),
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            ),
+        );
         let listener = TcpListener::bind(("0.0.0.0", TRANSFER_PORT))
             .await
             .map_err(|e| format!("无法监听局域网端口 {TRANSFER_PORT}：{e}"))?;
         self.port.store(
             listener.local_addr().map_err(|e| e.to_string())?.port() as u64,
             Ordering::Relaxed,
+        );
+        self.logger.info(
+            "tcp_listen",
+            format!("port={}", self.port.load(Ordering::Relaxed)),
         );
         let server_core = Arc::clone(self);
         tauri::async_runtime::spawn(async move {
@@ -161,10 +177,25 @@ impl Core {
                     Ok((stream, address)) => {
                         let core = Arc::clone(&server_core);
                         tauri::async_runtime::spawn(async move {
-                            let _ = core.handle_connection(stream, address).await;
+                            if let Err(error) =
+                                Arc::clone(&core).handle_connection(stream, address).await
+                            {
+                                core.logger.error(
+                                    "tcp_connection_failed",
+                                    format!(
+                                        "source={} error={error}",
+                                        masked_ip(address.ip())
+                                    ),
+                                );
+                            }
                         });
                     }
-                    Err(_) => tokio::time::sleep(Duration::from_millis(250)).await,
+                    Err(error) => {
+                        server_core
+                            .logger
+                            .error("tcp_accept_failed", error.to_string());
+                        tokio::time::sleep(Duration::from_millis(250)).await
+                    }
                 }
             }
         });
@@ -216,11 +247,14 @@ impl Core {
             expires_at: now_ms() + 120_000,
             attempts: HashMap::new(),
         });
+        self.logger
+            .info("pairing_opened", "expires_in_seconds=120");
         self.publish();
     }
 
     pub fn cancel_pairing(&self) {
         *self.pairing.lock().expect("pairing lock") = None;
+        self.logger.info("pairing_cancelled", "by_user=true");
         self.publish();
     }
 
@@ -239,14 +273,23 @@ impl Core {
             })
             .cloned()
             .collect();
+        self.logger.info(
+            "pairing_submit",
+            format!("discovered_candidates={}", candidates.len()),
+        );
         let mut last_error = None;
         for seen in candidates {
             match self.try_pair(&seen, &code).await {
                 Ok(()) => return Ok(()),
-                Err(error) => last_error = Some(error),
+                Err(error) => {
+                    self.logger.warn("pairing_tcp_failed", &error);
+                    last_error = Some(error);
+                }
             }
         }
         self.try_pair_udp(&code).await.map_err(|udp_error| {
+            self.logger
+                .error("pairing_all_methods_failed", &udp_error);
             format!(
                 "连接失败：{}；热点模式也失败：{udp_error}",
                 last_error.unwrap_or_else(|| "没有收到对方的设备广播".into())
@@ -275,7 +318,39 @@ impl Core {
             .update(|settings| settings.peers.retain(|peer| peer.id != peer_id))
             .map_err(|e| e.to_string())?;
         self.publish();
+        self.logger.info("peer_removed", "by_user=true");
         Ok(())
+    }
+
+    pub fn export_diagnostics(&self) -> Result<String, String> {
+        let settings = self.store.get();
+        let now = now_ms();
+        let online = self
+            .discovered
+            .lock()
+            .expect("discovery lock")
+            .values()
+            .filter(|peer| now.saturating_sub(peer.last_seen) < ONLINE_WINDOW_MS)
+            .count();
+        let summary = format!(
+            "sync_enabled={}\npaired_peers={}\nonline_peers={}\ndiscovery_port={}\ntransfer_port={}",
+            settings.sync_enabled,
+            settings.peers.len(),
+            online,
+            DISCOVERY_PORT,
+            TRANSFER_PORT
+        );
+        let directory = dirs::download_dir()
+            .ok_or("无法找到下载目录")?
+            .join("CrossCopy");
+        let path = self
+            .logger
+            .export(&directory, &summary)
+            .map_err(|e| e.to_string())?;
+        reveal_file(&path);
+        self.logger
+            .info("diagnostics_exported", "destination=downloads/CrossCopy");
+        Ok(path.to_string_lossy().into_owned())
     }
 
     async fn start_discovery(self: &Arc<Self>) -> Result<(), String> {
@@ -290,6 +365,10 @@ impl Core {
             .set_multicast_loop_v4(false)
             .map_err(|e| e.to_string())?;
         socket.set_broadcast(true).map_err(|e| e.to_string())?;
+        self.logger.info(
+            "discovery_started",
+            format!("port={DISCOVERY_PORT} multicast={MULTICAST} broadcast=true"),
+        );
         let socket = Arc::new(socket);
 
         let receive_core = Arc::clone(self);
@@ -309,7 +388,9 @@ impl Core {
                     {
                         continue;
                     }
-                    receive_core.discovered.lock().expect("discovery lock").insert(
+                    let packet_port = packet.port;
+                    let packet_pairing = packet.pairing_salt.is_some();
+                    let previous = receive_core.discovered.lock().expect("discovery lock").insert(
                         packet.id.clone(),
                         SeenPeer {
                             packet,
@@ -317,6 +398,17 @@ impl Core {
                             last_seen: now_ms(),
                         },
                     );
+                    if previous.is_none() {
+                        receive_core.logger.info(
+                            "peer_discovered",
+                            format!(
+                                "source={} port={} pairing={}",
+                                masked_ip(source.ip()),
+                                packet_port,
+                                packet_pairing
+                            ),
+                        );
+                    }
                     receive_core.publish();
                     continue;
                 }
@@ -475,22 +567,46 @@ impl Core {
                 Ok(value) => value,
                 Err(_) => continue,
             };
-            if let Ok(mut stream) = TcpStream::connect(address).await {
-                let secure = SecureMessage::Clipboard {
-                    payload: payload.clone(),
-                };
-                if let Ok(envelope) = encrypt(&key, &secure) {
-                    let message = WireMessage::Secure {
-                        sender_id: settings.device_id.clone(),
-                        envelope,
+            match TcpStream::connect(address).await {
+                Ok(mut stream) => {
+                    let secure = SecureMessage::Clipboard {
+                        payload: payload.clone(),
                     };
-                    let _ = write_json(&mut stream, &message).await;
+                    if let Ok(envelope) = encrypt(&key, &secure) {
+                        let message = WireMessage::Secure {
+                            sender_id: settings.device_id.clone(),
+                            envelope,
+                        };
+                        if let Err(error) = write_json(&mut stream, &message).await {
+                            self.logger.warn(
+                                "clipboard_announce_failed",
+                                format!(
+                                    "target={} error={error}",
+                                    masked_ip(address.ip())
+                                ),
+                            );
+                        }
+                    }
+                }
+                Err(error) => {
+                    self.logger.warn(
+                        "peer_connect_failed",
+                        format!("target={} error={error}", masked_ip(address.ip())),
+                    );
                 }
             }
         }
     }
 
     async fn try_pair(&self, seen: &SeenPeer, code: &str) -> Result<(), String> {
+        self.logger.info(
+            "pairing_tcp_start",
+            format!(
+                "target={} port={}",
+                masked_ip(seen.host),
+                seen.packet.port
+            ),
+        );
         let settings = self.store.get();
         let salt = seen
             .packet
@@ -537,10 +653,13 @@ impl Core {
             paired_at: now_ms(),
         })?;
         self.add_activity("system", &format!("已连接 {name}"), "配对完成，可以开始复制", "done");
+        self.logger.info("pairing_tcp_succeeded", "peer_saved=true");
         Ok(())
     }
 
     async fn try_pair_udp(&self, code: &str) -> Result<(), String> {
+        self.logger
+            .info("pairing_hotspot_fallback_start", "timeout_seconds=6");
         let socket = UdpSocket::bind(("0.0.0.0", 0))
             .await
             .map_err(|e| e.to_string())?;
@@ -610,6 +729,10 @@ impl Core {
             &format!("通过热点完成配对 ({})", source.ip()),
             "done",
         );
+        self.logger.info(
+            "pairing_hotspot_fallback_succeeded",
+            format!("source={}", masked_ip(source.ip())),
+        );
         Ok(())
     }
 
@@ -632,6 +755,10 @@ impl Core {
         if app != "crosscopy" || protocol != 1 || id == self.store.get().device_id {
             return Ok(());
         }
+        self.logger.info(
+            "pairing_hotspot_request_received",
+            format!("source={}", masked_ip(source.ip())),
+        );
         let pairing_data = {
             let mut pairing = self.pairing.lock().expect("pairing lock");
             let Some(session) = pairing.as_mut() else {
@@ -681,6 +808,10 @@ impl Core {
             "已通过热点完成配对",
             "done",
         );
+        self.logger.info(
+            "pairing_hotspot_response_sent",
+            format!("target={}", masked_ip(source.ip())),
+        );
         Ok(())
     }
 
@@ -689,6 +820,10 @@ impl Core {
         mut stream: TcpStream,
         source: SocketAddr,
     ) -> Result<(), String> {
+        self.logger.info(
+            "tcp_connection_received",
+            format!("source={}", masked_ip(source.ip())),
+        );
         stream.set_nodelay(true).map_err(|e| e.to_string())?;
         let message: WireMessage = read_json(&mut stream).await?;
         match message {
@@ -791,6 +926,10 @@ impl Core {
         }
         match payload {
             ClipboardPayload::Text { text, .. } => {
+                self.logger.info(
+                    "clipboard_text_received",
+                    format!("characters={}", text.chars().count()),
+                );
                 self.suppress_until.store(now_ms() + 1_500, Ordering::Relaxed);
                 ClipboardContext::new()
                     .map_err(|e| e.to_string())?
@@ -805,6 +944,10 @@ impl Core {
                 bytes,
                 ..
             } => {
+                self.logger.info(
+                    "clipboard_files_announced",
+                    format!("items={} bytes={bytes}", names.len()),
+                );
                 let label = summary_names(&names);
                 self.add_activity("received", &label, &format!("正在从 {} 接收", peer.name), "working");
                 self.pull_transfer(peer, transfer_id, label, bytes).await
@@ -819,6 +962,10 @@ impl Core {
         label: String,
         _bytes: u64,
     ) -> Result<(), String> {
+        self.logger.info(
+            "file_transfer_start",
+            format!("bytes={_bytes} peer_online_lookup=true"),
+        );
         let seen = self
             .discovered
             .lock()
@@ -889,6 +1036,10 @@ impl Core {
             )
             .map_err(|e| e.to_string())?;
         self.add_activity("received", &label, &format!("来自 {}，已放入剪贴板", peer.name), "done");
+        self.logger.info(
+            "file_transfer_completed",
+            format!("bytes={_bytes} output_items={}", top_level.len()),
+        );
         Ok(())
     }
 
@@ -1186,6 +1337,22 @@ fn format_bytes(bytes: u64) -> String {
         format!("{:.1} MB", value / MB)
     } else {
         format!("{:.1} GB", value / GB)
+    }
+}
+
+fn reveal_file(path: &Path) {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open")
+            .arg("-R")
+            .arg(path)
+            .spawn();
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("explorer")
+            .arg(format!("/select,{}", path.display()))
+            .spawn();
     }
 }
 

@@ -505,7 +505,6 @@ nav {
 
 .login-setting {
   justify-content: flex-end;
-  margin-top: 28px;
 }
 
 .login-setting > span {
@@ -515,6 +514,48 @@ nav {
 .login-setting strong,
 .login-setting small {
   display: block;
+}
+
+.footer-settings {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  margin-top: 28px;
+}
+
+.diagnostics-setting {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 10px;
+}
+
+.diagnostics-setting button {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 9px;
+  color: var(--muted);
+  background: transparent;
+  border: 0;
+  border-radius: 8px;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.diagnostics-setting button:hover {
+  color: var(--text);
+  background: var(--surface);
+}
+
+.diagnostics-setting small {
+  max-width: 280px;
+  overflow: hidden;
+  color: var(--faint);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .login-setting strong {
