@@ -96,7 +96,13 @@ function App(): React.JSX.Element {
       setPairMode(null);
       setCode("");
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "配对失败，请重试");
+      setError(
+        typeof reason === "string"
+          ? reason
+          : reason instanceof Error
+            ? reason.message
+            : "配对失败，请重试"
+      );
     } finally {
       setSubmitting(false);
     }

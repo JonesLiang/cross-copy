@@ -34,7 +34,9 @@ use uuid::Uuid;
 use walkdir::WalkDir;
 
 const DISCOVERY_PORT: u16 = 47653;
+const TRANSFER_PORT: u16 = 47654;
 const MULTICAST: Ipv4Addr = Ipv4Addr::new(239, 255, 67, 89);
+const GLOBAL_BROADCAST: Ipv4Addr = Ipv4Addr::new(255, 255, 255, 255);
 const CHUNK_SIZE: usize = 1024 * 1024;
 const ONLINE_WINDOW_MS: u64 = 8_000;
 
@@ -74,6 +76,26 @@ enum WireMessage {
     PairRejected,
     Secure {
         sender_id: String,
+        envelope: Envelope,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+enum UdpPairMessage {
+    PairRequest {
+        app: String,
+        protocol: u8,
+        id: String,
+        name: String,
+        code_hash: String,
+    },
+    PairAccepted {
+        app: String,
+        protocol: u8,
+        id: String,
+        name: String,
+        salt: String,
         envelope: Envelope,
     },
 }
@@ -125,9 +147,9 @@ impl Core {
     }
 
     pub async fn start(self: &Arc<Self>) -> Result<(), String> {
-        let listener = TcpListener::bind(("0.0.0.0", 0))
+        let listener = TcpListener::bind(("0.0.0.0", TRANSFER_PORT))
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| format!("无法监听局域网端口 {TRANSFER_PORT}：{e}"))?;
         self.port.store(
             listener.local_addr().map_err(|e| e.to_string())?.port() as u64,
             Ordering::Relaxed,
@@ -217,15 +239,19 @@ impl Core {
             })
             .cloned()
             .collect();
-        if candidates.is_empty() {
-            return Err("没有找到正在等待配对的设备".into());
-        }
+        let mut last_error = None;
         for seen in candidates {
-            if self.try_pair(&seen, &code).await.is_ok() {
-                return Ok(());
+            match self.try_pair(&seen, &code).await {
+                Ok(()) => return Ok(()),
+                Err(error) => last_error = Some(error),
             }
         }
-        Err("验证码不正确，或配对设备已经离线".into())
+        self.try_pair_udp(&code).await.map_err(|udp_error| {
+            format!(
+                "连接失败：{}；热点模式也失败：{udp_error}",
+                last_error.unwrap_or_else(|| "没有收到对方的设备广播".into())
+            )
+        })
     }
 
     pub fn set_sync(&self, value: bool) -> Result<(), String> {
@@ -263,6 +289,7 @@ impl Core {
         socket
             .set_multicast_loop_v4(false)
             .map_err(|e| e.to_string())?;
+        socket.set_broadcast(true).map_err(|e| e.to_string())?;
         let socket = Arc::new(socket);
 
         let receive_core = Arc::clone(self);
@@ -273,36 +300,53 @@ impl Core {
                 let Ok((size, source)) = receive_socket.recv_from(&mut buffer).await else {
                     continue;
                 };
-                let Ok(packet) = serde_json::from_slice::<DiscoveryPacket>(&buffer[..size]) else {
-                    continue;
-                };
-                if packet.app != "crosscopy"
-                    || packet.protocol != 1
-                    || packet.id == receive_core.store.get().device_id
+                if let Ok(packet) =
+                    serde_json::from_slice::<DiscoveryPacket>(&buffer[..size])
                 {
+                    if packet.app != "crosscopy"
+                        || packet.protocol != 1
+                        || packet.id == receive_core.store.get().device_id
+                    {
+                        continue;
+                    }
+                    receive_core.discovered.lock().expect("discovery lock").insert(
+                        packet.id.clone(),
+                        SeenPeer {
+                            packet,
+                            host: source.ip(),
+                            last_seen: now_ms(),
+                        },
+                    );
+                    receive_core.publish();
                     continue;
                 }
-                receive_core.discovered.lock().expect("discovery lock").insert(
-                    packet.id.clone(),
-                    SeenPeer {
-                        packet,
-                        host: source.ip(),
-                        last_seen: now_ms(),
-                    },
-                );
-                receive_core.publish();
+                if let Ok(request) =
+                    serde_json::from_slice::<UdpPairMessage>(&buffer[..size])
+                {
+                    let core = Arc::clone(&receive_core);
+                    let socket = Arc::clone(&receive_socket);
+                    tauri::async_runtime::spawn(async move {
+                        let _ = core
+                            .handle_udp_pair_request(&socket, source, request)
+                            .await;
+                    });
+                }
             }
         });
 
         let beacon_core = Arc::clone(self);
         tauri::async_runtime::spawn(async move {
-            let target = SocketAddr::new(IpAddr::V4(MULTICAST), DISCOVERY_PORT);
+            let multicast_target =
+                SocketAddr::new(IpAddr::V4(MULTICAST), DISCOVERY_PORT);
+            let broadcast_target =
+                SocketAddr::new(IpAddr::V4(GLOBAL_BROADCAST), DISCOVERY_PORT);
             loop {
                 let packet = beacon_core.discovery_packet();
                 if let Ok(bytes) = serde_json::to_vec(&packet) {
-                    let _ = socket.send_to(&bytes, target).await;
+                    let _ = socket.send_to(&bytes, multicast_target).await;
+                    let _ = socket.send_to(&bytes, broadcast_target).await;
                 }
-                tokio::time::sleep(Duration::from_secs(2)).await;
+                tokio::time::sleep(Duration::from_secs(1)).await;
             }
         });
         Ok(())
@@ -454,9 +498,16 @@ impl Core {
             .as_deref()
             .ok_or("配对信息无效")?;
         let key = pairing_key(code, salt)?;
-        let mut stream = TcpStream::connect((seen.host, seen.packet.port))
-            .await
-            .map_err(|e| e.to_string())?;
+        let mut stream = tokio::time::timeout(
+            Duration::from_secs(5),
+            TcpStream::connect((seen.host, seen.packet.port)),
+        )
+        .await
+        .map_err(|_| {
+            "连接超时。请允许 CrossCopy 通过 Windows 防火墙的“专用网络”"
+                .to_string()
+        })?
+        .map_err(|e| format!("无法连接配对设备：{e}"))?;
         write_json(
             &mut stream,
             &WireMessage::PairRequest {
@@ -466,7 +517,10 @@ impl Core {
             },
         )
         .await?;
-        let response: WireMessage = read_json(&mut stream).await?;
+        let response: WireMessage =
+            tokio::time::timeout(Duration::from_secs(5), read_json(&mut stream))
+                .await
+                .map_err(|_| "等待配对设备响应超时".to_string())??;
         let WireMessage::PairAccepted {
             id,
             name,
@@ -483,6 +537,150 @@ impl Core {
             paired_at: now_ms(),
         })?;
         self.add_activity("system", &format!("已连接 {name}"), "配对完成，可以开始复制", "done");
+        Ok(())
+    }
+
+    async fn try_pair_udp(&self, code: &str) -> Result<(), String> {
+        let socket = UdpSocket::bind(("0.0.0.0", 0))
+            .await
+            .map_err(|e| e.to_string())?;
+        socket.set_broadcast(true).map_err(|e| e.to_string())?;
+        socket.set_multicast_ttl_v4(1).map_err(|e| e.to_string())?;
+        let settings = self.store.get();
+        let request = UdpPairMessage::PairRequest {
+            app: "crosscopy".into(),
+            protocol: 1,
+            id: settings.device_id,
+            name: settings.device_name,
+            code_hash: fingerprint(code),
+        };
+        let bytes = serde_json::to_vec(&request).map_err(|e| e.to_string())?;
+        socket
+            .send_to(
+                &bytes,
+                SocketAddr::new(IpAddr::V4(MULTICAST), DISCOVERY_PORT),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        let _ = socket
+            .send_to(
+                &bytes,
+                SocketAddr::new(IpAddr::V4(GLOBAL_BROADCAST), DISCOVERY_PORT),
+            )
+            .await;
+
+        let mut response_buffer = [0_u8; 4096];
+        let (size, source) = tokio::time::timeout(
+            Duration::from_secs(6),
+            socket.recv_from(&mut response_buffer),
+        )
+        .await
+        .map_err(|_| {
+            "未收到验证码显示方的响应，请检查两台电脑是否在同一热点"
+                .to_string()
+        })?
+        .map_err(|e| e.to_string())?;
+        let response: UdpPairMessage =
+            serde_json::from_slice(&response_buffer[..size]).map_err(|e| e.to_string())?;
+        let UdpPairMessage::PairAccepted {
+            app,
+            protocol,
+            id,
+            name,
+            salt,
+            envelope,
+        } = response
+        else {
+            return Err("收到的热点配对响应无效".into());
+        };
+        if app != "crosscopy" || protocol != 1 {
+            return Err("热点配对协议不兼容".into());
+        }
+        let key = pairing_key(code, &salt)?;
+        let secret: String = decrypt(&key, &envelope)?;
+        self.upsert_peer(Peer {
+            id,
+            name: name.clone(),
+            secret,
+            paired_at: now_ms(),
+        })?;
+        self.add_activity(
+            "system",
+            &format!("已连接 {name}"),
+            &format!("通过热点完成配对 ({})", source.ip()),
+            "done",
+        );
+        Ok(())
+    }
+
+    async fn handle_udp_pair_request(
+        &self,
+        socket: &UdpSocket,
+        source: SocketAddr,
+        request: UdpPairMessage,
+    ) -> Result<(), String> {
+        let UdpPairMessage::PairRequest {
+            app,
+            protocol,
+            id,
+            name,
+            code_hash,
+        } = request
+        else {
+            return Ok(());
+        };
+        if app != "crosscopy" || protocol != 1 || id == self.store.get().device_id {
+            return Ok(());
+        }
+        let pairing_data = {
+            let mut pairing = self.pairing.lock().expect("pairing lock");
+            let Some(session) = pairing.as_mut() else {
+                return Ok(());
+            };
+            let attempts = session.attempts.entry(source.ip()).or_default();
+            *attempts += 1;
+            if *attempts > 5
+                || session.expires_at <= now_ms()
+                || fingerprint(&session.code) != code_hash
+            {
+                return Ok(());
+            }
+            Some((session.code.clone(), session.salt.clone()))
+        };
+        let Some((code, salt)) = pairing_data else {
+            return Ok(());
+        };
+        let key = pairing_key(&code, &salt)?;
+        let secret = random_secret();
+        let settings = self.store.get();
+        let response = UdpPairMessage::PairAccepted {
+            app: "crosscopy".into(),
+            protocol: 1,
+            id: settings.device_id,
+            name: settings.device_name,
+            salt,
+            envelope: encrypt(&key, &secret)?,
+        };
+        self.upsert_peer(Peer {
+            id,
+            name: name.clone(),
+            secret,
+            paired_at: now_ms(),
+        })?;
+        socket
+            .send_to(
+                &serde_json::to_vec(&response).map_err(|e| e.to_string())?,
+                source,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        *self.pairing.lock().expect("pairing lock") = None;
+        self.add_activity(
+            "system",
+            &format!("已连接 {name}"),
+            "已通过热点完成配对",
+            "done",
+        );
         Ok(())
     }
 
