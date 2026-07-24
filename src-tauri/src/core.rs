@@ -11,6 +11,7 @@ use aes_gcm::{
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use clipboard_rs::{
     Clipboard, ClipboardContext, ClipboardHandler, ClipboardWatcher, ClipboardWatcherContext,
+    ContentFormat,
 };
 use rand::RngCore;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -40,6 +41,8 @@ const MULTICAST: Ipv4Addr = Ipv4Addr::new(239, 255, 67, 89);
 const GLOBAL_BROADCAST: Ipv4Addr = Ipv4Addr::new(255, 255, 255, 255);
 const CHUNK_SIZE: usize = 1024 * 1024;
 const ONLINE_WINDOW_MS: u64 = 8_000;
+const CLIPBOARD_RETRY_ATTEMPTS: usize = 8;
+const CLIPBOARD_RETRY_DELAY_MS: u64 = 40;
 
 #[derive(Clone)]
 struct SeenPeer {
@@ -463,30 +466,52 @@ impl Core {
 
     fn start_clipboard_watcher(self: &Arc<Self>) -> Result<(), String> {
         let (sender, mut receiver) = mpsc::unbounded_channel();
+        let watcher_logger = Arc::clone(&self.logger);
         std::thread::Builder::new()
             .name("crosscopy-clipboard".into())
             .spawn(move || {
-                let Ok(context) = ClipboardContext::new() else {
-                    return;
+                let context = match ClipboardContext::new() {
+                    Ok(context) => context,
+                    Err(error) => {
+                        watcher_logger.error("clipboard_context_failed", error.to_string());
+                        return;
+                    }
                 };
-                let handler = ClipboardChangeHandler { context, sender };
-                let Ok(mut watcher) = ClipboardWatcherContext::new() else {
-                    return;
+                let handler = ClipboardChangeHandler {
+                    context,
+                    sender,
+                    logger: Arc::clone(&watcher_logger),
+                };
+                let mut watcher = match ClipboardWatcherContext::new() {
+                    Ok(watcher) => watcher,
+                    Err(error) => {
+                        watcher_logger.error("clipboard_watcher_failed", error.to_string());
+                        return;
+                    }
                 };
                 watcher.add_handler(handler);
+                watcher_logger.info("clipboard_watcher_started", "ready=true");
                 watcher.start_watch();
+                watcher_logger.warn("clipboard_watcher_stopped", "unexpected=true");
             })
             .map_err(|e| e.to_string())?;
 
         let core = Arc::clone(self);
         tauri::async_runtime::spawn(async move {
             while let Some(event) = receiver.recv().await {
-                if now_ms() < core.suppress_until.load(Ordering::Relaxed)
-                    || !core.store.get().sync_enabled
-                {
+                if now_ms() < core.suppress_until.load(Ordering::Relaxed) {
+                    core.logger
+                        .info("clipboard_local_ignored", "reason=remote_write");
+                    continue;
+                }
+                if !core.store.get().sync_enabled {
+                    core.logger
+                        .info("clipboard_local_ignored", "reason=sync_disabled");
                     continue;
                 }
                 if let Err(error) = core.handle_local_clipboard(event).await {
+                    core.logger
+                        .error("clipboard_local_failed", error.to_string());
                     core.add_activity("system", "发送失败", &error, "error");
                 }
             }
@@ -500,6 +525,10 @@ impl Core {
                 if text.is_empty() {
                     return Ok(());
                 }
+                self.logger.info(
+                    "clipboard_local_text",
+                    format!("characters={}", text.chars().count()),
+                );
                 ClipboardPayload::Text {
                     fingerprint: fingerprint(&text),
                     created_at: now_ms(),
@@ -510,6 +539,10 @@ impl Core {
                 if paths.is_empty() {
                     return Ok(());
                 }
+                self.logger.info(
+                    "clipboard_local_files",
+                    format!("items={}", paths.len()),
+                );
                 let transfer_id = Uuid::new_v4().to_string();
                 let (bytes, names) = scan_roots(&paths)?;
                 self.transfers.lock().expect("transfer lock").insert(
@@ -555,17 +588,38 @@ impl Core {
     async fn broadcast(&self, payload: &ClipboardPayload) {
         let settings = self.store.get();
         let discovered = self.discovered.lock().expect("discovery lock").clone();
+        let kind = match payload {
+            ClipboardPayload::Text { .. } => "text",
+            ClipboardPayload::Files { .. } => "files",
+        };
+        let mut online = 0_u32;
+        let mut delivered = 0_u32;
         for peer in settings.peers {
             let Some(seen) = discovered.get(&peer.id) else {
+                self.logger.info(
+                    "clipboard_peer_skipped",
+                    format!("kind={kind} reason=not_discovered"),
+                );
                 continue;
             };
             if now_ms().saturating_sub(seen.last_seen) >= ONLINE_WINDOW_MS {
+                self.logger.info(
+                    "clipboard_peer_skipped",
+                    format!("kind={kind} reason=discovery_stale"),
+                );
                 continue;
             }
+            online += 1;
             let address = SocketAddr::new(seen.host, seen.packet.port);
             let key = match decode_secret(&peer.secret) {
                 Ok(value) => value,
-                Err(_) => continue,
+                Err(error) => {
+                    self.logger.error(
+                        "clipboard_secret_failed",
+                        format!("kind={kind} error={error}"),
+                    );
+                    continue;
+                }
             };
             match TcpStream::connect(address).await {
                 Ok(mut stream) => {
@@ -585,6 +639,8 @@ impl Core {
                                     masked_ip(address.ip())
                                 ),
                             );
+                        } else {
+                            delivered += 1;
                         }
                     }
                 }
@@ -596,6 +652,10 @@ impl Core {
                 }
             }
         }
+        self.logger.info(
+            "clipboard_broadcast_completed",
+            format!("kind={kind} online={online} delivered={delivered}"),
+        );
     }
 
     async fn try_pair(&self, seen: &SeenPeer, code: &str) -> Result<(), String> {
@@ -930,11 +990,8 @@ impl Core {
                     "clipboard_text_received",
                     format!("characters={}", text.chars().count()),
                 );
-                self.suppress_until.store(now_ms() + 1_500, Ordering::Relaxed);
-                ClipboardContext::new()
-                    .map_err(|e| e.to_string())?
-                    .set_text(text.clone())
-                    .map_err(|e| e.to_string())?;
+                self.suppress_until.store(now_ms() + 2_500, Ordering::Relaxed);
+                write_clipboard_text(&text, &self.logger).await?;
                 self.add_activity("received", &ellipsize(&text, 42), &format!("来自 {}", peer.name), "done");
                 Ok(())
             }
@@ -1025,16 +1082,12 @@ impl Core {
             }
             file.flush().await.map_err(|e| e.to_string())?;
         }
-        self.suppress_until.store(now_ms() + 1_500, Ordering::Relaxed);
-        ClipboardContext::new()
-            .map_err(|e| e.to_string())?
-            .set_files(
-                top_level
-                    .iter()
-                    .map(|path| path.to_string_lossy().into_owned())
-                    .collect(),
-            )
-            .map_err(|e| e.to_string())?;
+        self.suppress_until.store(now_ms() + 2_500, Ordering::Relaxed);
+        let clipboard_files: Vec<String> = top_level
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
+        write_clipboard_files(&clipboard_files, &self.logger).await?;
         self.add_activity("received", &label, &format!("来自 {}，已放入剪贴板", peer.name), "done");
         self.logger.info(
             "file_transfer_completed",
@@ -1116,24 +1169,145 @@ impl Core {
 struct ClipboardChangeHandler {
     context: ClipboardContext,
     sender: mpsc::UnboundedSender<LocalClipboard>,
+    logger: Arc<Logger>,
 }
 
 impl ClipboardHandler for ClipboardChangeHandler {
     fn on_clipboard_change(&mut self) {
-        if let Ok(files) = self.context.get_files() {
-            if !files.is_empty() {
-                let _ = self
-                    .sender
-                    .send(LocalClipboard::Files(files.into_iter().map(PathBuf::from).collect()));
+        let files_expected = self.context.has(ContentFormat::Files);
+        let text_expected = self.context.has(ContentFormat::Text);
+        let mut last_error = String::new();
+
+        for attempt in 1..=CLIPBOARD_RETRY_ATTEMPTS {
+            if files_expected {
+                match self.context.get_files() {
+                    Ok(files) if !files.is_empty() => {
+                        self.logger.info(
+                            "clipboard_change_read",
+                            format!("kind=files items={} attempt={attempt}", files.len()),
+                        );
+                        let _ = self.sender.send(LocalClipboard::Files(
+                            files.into_iter().map(PathBuf::from).collect(),
+                        ));
+                        return;
+                    }
+                    Ok(_) => last_error = "empty file list".into(),
+                    Err(error) => last_error = error.to_string(),
+                }
+            } else if text_expected {
+                match self.context.get_text() {
+                    Ok(text) if !text.is_empty() => {
+                        self.logger.info(
+                            "clipboard_change_read",
+                            format!(
+                                "kind=text characters={} attempt={attempt}",
+                                text.chars().count()
+                            ),
+                        );
+                        let _ = self.sender.send(LocalClipboard::Text(text));
+                        return;
+                    }
+                    Ok(_) => last_error = "empty text".into(),
+                    Err(error) => last_error = error.to_string(),
+                }
+            } else {
+                self.logger.info(
+                    "clipboard_change_ignored",
+                    "reason=unsupported_format",
+                );
                 return;
             }
-        }
-        if let Ok(text) = self.context.get_text() {
-            if !text.is_empty() {
-                let _ = self.sender.send(LocalClipboard::Text(text));
+
+            if attempt < CLIPBOARD_RETRY_ATTEMPTS {
+                std::thread::sleep(Duration::from_millis(CLIPBOARD_RETRY_DELAY_MS));
             }
         }
+        self.logger.warn(
+            "clipboard_change_read_failed",
+            format!(
+                "kind={} attempts={} error={last_error}",
+                if files_expected { "files" } else { "text" },
+                CLIPBOARD_RETRY_ATTEMPTS
+            ),
+        );
     }
+}
+
+async fn write_clipboard_text(text: &str, logger: &Logger) -> Result<(), String> {
+    let mut last_error = String::new();
+    for attempt in 1..=CLIPBOARD_RETRY_ATTEMPTS {
+        let result = (|| {
+            let context = ClipboardContext::new().map_err(|error| error.to_string())?;
+            context
+                .set_text(text.to_owned())
+                .map_err(|error| error.to_string())?;
+            let actual = context.get_text().map_err(|error| error.to_string())?;
+            if actual != text {
+                return Err("clipboard verification mismatch".into());
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                logger.info(
+                    "clipboard_text_written",
+                    format!("verified=true attempt={attempt}"),
+                );
+                return Ok(());
+            }
+            Err(error) => last_error = error,
+        }
+        if attempt < CLIPBOARD_RETRY_ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(CLIPBOARD_RETRY_DELAY_MS)).await;
+        }
+    }
+    logger.error(
+        "clipboard_text_write_failed",
+        format!("attempts={} error={last_error}", CLIPBOARD_RETRY_ATTEMPTS),
+    );
+    Err(format!("写入系统文字剪贴板失败：{last_error}"))
+}
+
+async fn write_clipboard_files(files: &[String], logger: &Logger) -> Result<(), String> {
+    let mut last_error = String::new();
+    for attempt in 1..=CLIPBOARD_RETRY_ATTEMPTS {
+        let result = (|| {
+            let context = ClipboardContext::new().map_err(|error| error.to_string())?;
+            context
+                .set_files(files.to_vec())
+                .map_err(|error| error.to_string())?;
+            let actual = context.get_files().map_err(|error| error.to_string())?;
+            if actual.len() != files.len()
+                || !files
+                    .iter()
+                    .all(|expected| actual.iter().any(|value| value == expected))
+            {
+                return Err("clipboard verification mismatch".into());
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                logger.info(
+                    "clipboard_files_written",
+                    format!(
+                        "verified=true items={} attempt={attempt}",
+                        files.len()
+                    ),
+                );
+                return Ok(());
+            }
+            Err(error) => last_error = error,
+        }
+        if attempt < CLIPBOARD_RETRY_ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(CLIPBOARD_RETRY_DELAY_MS)).await;
+        }
+    }
+    logger.error(
+        "clipboard_files_write_failed",
+        format!("attempts={} error={last_error}", CLIPBOARD_RETRY_ATTEMPTS),
+    );
+    Err(format!("写入系统文件剪贴板失败：{last_error}"))
 }
 
 async fn write_json<T: Serialize>(stream: &mut TcpStream, value: &T) -> Result<(), String> {
