@@ -16,6 +16,18 @@ pub struct Settings {
     pub peers: Vec<Peer>,
     pub sync_enabled: bool,
     pub launch_at_login: bool,
+    #[serde(default = "default_copy_shortcut")]
+    pub copy_shortcut: String,
+    #[serde(default = "default_paste_shortcut")]
+    pub paste_shortcut: String,
+}
+
+pub fn default_copy_shortcut() -> String {
+    "Ctrl+Shift+C".into()
+}
+
+pub fn default_paste_shortcut() -> String {
+    "Ctrl+Shift+V".into()
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -40,10 +52,25 @@ pub struct Activity {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct TransferProgress {
+    pub id: String,
+    pub label: String,
+    pub direction: String,
+    pub transferred: u64,
+    pub total: u64,
+    pub status: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UiState {
     pub device_name: String,
     pub sync_enabled: bool,
     pub launch_at_login: bool,
+    pub copy_shortcut: String,
+    pub paste_shortcut: String,
+    pub has_pending_clipboard: bool,
+    pub transfer: Option<TransferProgress>,
     pub pairing_code: Option<String>,
     pub pairing_expires_at: Option<u64>,
     pub peers: Vec<PeerView>,

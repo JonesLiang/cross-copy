@@ -1,7 +1,11 @@
 use crate::{
-    crypto::{decode_secret, decrypt, encrypt, fingerprint, pairing_key, proof, random_secret, Envelope},
+    crypto::{
+        decode_secret, decrypt, encrypt, fingerprint, pairing_key, proof, random_secret, Envelope,
+    },
     logger::{masked_ip, Logger},
-    model::{Activity, ClipboardPayload, DiscoveryPacket, Peer, PeerView, UiState},
+    model::{
+        Activity, ClipboardPayload, DiscoveryPacket, Peer, PeerView, TransferProgress, UiState,
+    },
     store::Store,
 };
 use aes_gcm::{
@@ -9,9 +13,10 @@ use aes_gcm::{
     Aes256Gcm, Nonce,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use clipboard_rs::{
-    Clipboard, ClipboardContext, ClipboardHandler, ClipboardWatcher, ClipboardWatcherContext,
-    ContentFormat,
+use clipboard_rs::{Clipboard, ClipboardContext, ContentFormat};
+use enigo::{
+    Direction::{Click, Press, Release},
+    Enigo, Key, Keyboard, Settings as EnigoSettings,
 };
 use rand::RngCore;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -25,12 +30,12 @@ use std::{
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 use tokio::{
     fs::{self, File},
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
-    sync::mpsc,
+    sync::Notify,
 };
 use uuid::Uuid;
 use walkdir::WalkDir;
@@ -40,9 +45,10 @@ const TRANSFER_PORT: u16 = 47654;
 const MULTICAST: Ipv4Addr = Ipv4Addr::new(239, 255, 67, 89);
 const GLOBAL_BROADCAST: Ipv4Addr = Ipv4Addr::new(255, 255, 255, 255);
 const CHUNK_SIZE: usize = 1024 * 1024;
-const ONLINE_WINDOW_MS: u64 = 8_000;
+const ONLINE_WINDOW_MS: u64 = 35_000;
 const CLIPBOARD_RETRY_ATTEMPTS: usize = 8;
 const CLIPBOARD_RETRY_DELAY_MS: u64 = 40;
+const ACTIVE_DISCOVERY_MS: u64 = 30_000;
 
 #[derive(Clone)]
 struct SeenPeer {
@@ -125,6 +131,18 @@ enum LocalClipboard {
     Files(Vec<PathBuf>),
 }
 
+#[derive(Clone)]
+enum PendingClipboard {
+    Text(String),
+    Files(Vec<String>),
+}
+
+enum ClipboardSnapshot {
+    Text(String),
+    Files(Vec<String>),
+    Empty,
+}
+
 pub struct Core {
     pub store: Arc<Store>,
     app: AppHandle,
@@ -133,7 +151,12 @@ pub struct Core {
     pairing: Mutex<Option<PairSession>>,
     transfers: Mutex<HashMap<String, Transfer>>,
     activities: Mutex<Vec<Activity>>,
-    suppress_until: AtomicU64,
+    transfer_progress: Mutex<Option<TransferProgress>>,
+    pending_clipboard: Mutex<Option<PendingClipboard>>,
+    awake_until: AtomicU64,
+    last_discovery_response: AtomicU64,
+    last_progress_emit: AtomicU64,
+    discovery_wake: Notify,
     port: AtomicU64,
 }
 
@@ -147,7 +170,12 @@ impl Core {
             pairing: Mutex::new(None),
             transfers: Mutex::new(HashMap::new()),
             activities: Mutex::new(Vec::new()),
-            suppress_until: AtomicU64::new(0),
+            transfer_progress: Mutex::new(None),
+            pending_clipboard: Mutex::new(None),
+            awake_until: AtomicU64::new(now_ms() + ACTIVE_DISCOVERY_MS),
+            last_discovery_response: AtomicU64::new(0),
+            last_progress_emit: AtomicU64::new(0),
+            discovery_wake: Notify::new(),
             port: AtomicU64::new(0),
         })
     }
@@ -185,10 +213,7 @@ impl Core {
                             {
                                 core.logger.error(
                                     "tcp_connection_failed",
-                                    format!(
-                                        "source={} error={error}",
-                                        masked_ip(address.ip())
-                                    ),
+                                    format!("source={} error={error}", masked_ip(address.ip())),
                                 );
                             }
                         });
@@ -203,7 +228,6 @@ impl Core {
             }
         });
         self.start_discovery().await?;
-        self.start_clipboard_watcher()?;
         Ok(())
     }
 
@@ -216,6 +240,18 @@ impl Core {
             device_name: settings.device_name,
             sync_enabled: settings.sync_enabled,
             launch_at_login: settings.launch_at_login,
+            copy_shortcut: settings.copy_shortcut,
+            paste_shortcut: settings.paste_shortcut,
+            has_pending_clipboard: self
+                .pending_clipboard
+                .lock()
+                .expect("pending clipboard lock")
+                .is_some(),
+            transfer: self
+                .transfer_progress
+                .lock()
+                .expect("transfer progress lock")
+                .clone(),
             pairing_code: pairing.as_ref().map(|session| session.code.clone()),
             pairing_expires_at: pairing.as_ref().map(|session| session.expires_at),
             peers: settings
@@ -226,8 +262,9 @@ impl Core {
                     PeerView {
                         id: peer.id.clone(),
                         name: peer.name.clone(),
-                        online: seen
-                            .is_some_and(|value| now.saturating_sub(value.last_seen) < ONLINE_WINDOW_MS),
+                        online: seen.is_some_and(|value| {
+                            now.saturating_sub(value.last_seen) < ONLINE_WINDOW_MS
+                        }),
                         last_seen: seen.map(|value| value.last_seen),
                     }
                 })
@@ -241,6 +278,7 @@ impl Core {
     }
 
     pub fn begin_pairing(&self) {
+        self.wake_network();
         let code = format!("{:06}", rand::random_range(0..1_000_000));
         let mut salt = [0_u8; 16];
         rand::rng().fill_bytes(&mut salt);
@@ -250,8 +288,7 @@ impl Core {
             expires_at: now_ms() + 120_000,
             attempts: HashMap::new(),
         });
-        self.logger
-            .info("pairing_opened", "expires_in_seconds=120");
+        self.logger.info("pairing_opened", "expires_in_seconds=120");
         self.publish();
     }
 
@@ -265,6 +302,7 @@ impl Core {
         if code.len() != 6 || !code.chars().all(|value| value.is_ascii_digit()) {
             return Err("请输入 6 位数字验证码".into());
         }
+        self.wake_network();
         let candidates: Vec<SeenPeer> = self
             .discovered
             .lock()
@@ -291,8 +329,7 @@ impl Core {
             }
         }
         self.try_pair_udp(&code).await.map_err(|udp_error| {
-            self.logger
-                .error("pairing_all_methods_failed", &udp_error);
+            self.logger.error("pairing_all_methods_failed", &udp_error);
             format!(
                 "连接失败：{}；热点模式也失败：{udp_error}",
                 last_error.unwrap_or_else(|| "没有收到对方的设备广播".into())
@@ -305,7 +342,126 @@ impl Core {
             .update(|settings| settings.sync_enabled = value)
             .map_err(|e| e.to_string())?;
         self.publish();
+        if value {
+            self.wake_network();
+        }
         Ok(())
+    }
+
+    pub fn set_shortcuts(&self, copy: String, paste: String) -> Result<(), String> {
+        self.store
+            .update(|settings| {
+                settings.copy_shortcut = copy;
+                settings.paste_shortcut = paste;
+            })
+            .map_err(|error| error.to_string())?;
+        self.publish();
+        Ok(())
+    }
+
+    pub async fn trigger_copy(self: &Arc<Self>) {
+        if !self.store.get().sync_enabled {
+            self.add_activity("system", "同步已暂停", "请先开启同步", "error");
+            return;
+        }
+        self.wake_network();
+        let original = match capture_clipboard() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.add_activity("system", "无法保护本机剪贴板", &error, "error");
+                return;
+            }
+        };
+        if let Err(error) = simulate_native_shortcut('c') {
+            self.logger.error("shortcut_copy_simulation_failed", &error);
+            self.add_activity("system", "无法复制", &error, "error");
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let event = read_current_clipboard(&self.logger).await;
+        if let Err(error) = restore_clipboard(original, &self.logger).await {
+            self.logger.error("clipboard_restore_failed", &error);
+            self.add_activity("system", "恢复本机剪贴板失败", &error, "error");
+            return;
+        }
+        let event = match event {
+            Ok(event) => event,
+            Err(error) => {
+                self.add_activity("system", "未读取到内容", &error, "error");
+                return;
+            }
+        };
+        let peer_is_known_online = self
+            .discovered
+            .lock()
+            .expect("discovery lock")
+            .values()
+            .any(|seen| now_ms().saturating_sub(seen.last_seen) < ONLINE_WINDOW_MS);
+        // Known peers send immediately. A cold or sleeping peer gets one LAN round trip.
+        tokio::time::sleep(Duration::from_millis(if peer_is_known_online {
+            20
+        } else {
+            350
+        }))
+        .await;
+        if let Err(error) = self.handle_local_clipboard(event).await {
+            self.logger.error("clipboard_local_failed", &error);
+            self.add_activity("system", "发送失败", &error, "error");
+        }
+    }
+
+    pub async fn trigger_paste(self: &Arc<Self>) {
+        if !self.store.get().sync_enabled {
+            self.add_activity("system", "同步已暂停", "请先开启同步", "error");
+            return;
+        }
+        self.wake_network();
+        let original = match capture_clipboard() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.add_activity("system", "无法保护本机剪贴板", &error, "error");
+                return;
+            }
+        };
+        let pending = self
+            .pending_clipboard
+            .lock()
+            .expect("pending clipboard lock")
+            .clone();
+        let result = match pending {
+            Some(PendingClipboard::Text(text)) => write_clipboard_text(&text, &self.logger).await,
+            Some(PendingClipboard::Files(files)) => {
+                write_clipboard_files(&files, &self.logger).await
+            }
+            None => {
+                self.add_activity(
+                    "system",
+                    "没有待粘贴内容",
+                    "请先在另一台电脑触发跨设备复制",
+                    "error",
+                );
+                return;
+            }
+        };
+        if let Err(error) = result {
+            let _ = restore_clipboard(original, &self.logger).await;
+            self.add_activity("system", "写入剪贴板失败", &error, "error");
+            return;
+        }
+        if let Err(error) = simulate_native_shortcut('v') {
+            self.logger
+                .error("shortcut_paste_simulation_failed", &error);
+            self.add_activity("system", "无法粘贴", &error, "error");
+            let _ = restore_clipboard(original, &self.logger).await;
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        if let Err(error) = restore_clipboard(original, &self.logger).await {
+            self.logger.error("clipboard_restore_failed", &error);
+            self.add_activity("system", "恢复本机剪贴板失败", &error, "error");
+            return;
+        }
+        self.add_activity("system", "已触发跨设备粘贴", "内容已粘贴到当前应用", "done");
     }
 
     pub fn set_launch_at_login(&self, value: bool) -> Result<(), String> {
@@ -382,9 +538,7 @@ impl Core {
                 let Ok((size, source)) = receive_socket.recv_from(&mut buffer).await else {
                     continue;
                 };
-                if let Ok(packet) =
-                    serde_json::from_slice::<DiscoveryPacket>(&buffer[..size])
-                {
+                if let Ok(packet) = serde_json::from_slice::<DiscoveryPacket>(&buffer[..size]) {
                     if packet.app != "crosscopy"
                         || packet.protocol != 1
                         || packet.id == receive_core.store.get().device_id
@@ -393,14 +547,25 @@ impl Core {
                     }
                     let packet_port = packet.port;
                     let packet_pairing = packet.pairing_salt.is_some();
-                    let previous = receive_core.discovered.lock().expect("discovery lock").insert(
-                        packet.id.clone(),
-                        SeenPeer {
-                            packet,
-                            host: source.ip(),
-                            last_seen: now_ms(),
-                        },
-                    );
+                    let packet_id = packet.id.clone();
+                    let is_paired = receive_core
+                        .store
+                        .get()
+                        .peers
+                        .iter()
+                        .any(|peer| peer.id == packet_id);
+                    let previous = receive_core
+                        .discovered
+                        .lock()
+                        .expect("discovery lock")
+                        .insert(
+                            packet_id,
+                            SeenPeer {
+                                packet,
+                                host: source.ip(),
+                                last_seen: now_ms(),
+                            },
+                        );
                     if previous.is_none() {
                         receive_core.logger.info(
                             "peer_discovered",
@@ -412,18 +577,27 @@ impl Core {
                             ),
                         );
                     }
+                    if is_paired {
+                        if now_ms() > receive_core.awake_until.load(Ordering::Relaxed) {
+                            receive_core.wake_network();
+                        } else {
+                            let last = receive_core.last_discovery_response.load(Ordering::Relaxed);
+                            if now_ms().saturating_sub(last) > 2_000 {
+                                receive_core
+                                    .last_discovery_response
+                                    .store(now_ms(), Ordering::Relaxed);
+                                receive_core.discovery_wake.notify_one();
+                            }
+                        }
+                    }
                     receive_core.publish();
                     continue;
                 }
-                if let Ok(request) =
-                    serde_json::from_slice::<UdpPairMessage>(&buffer[..size])
-                {
+                if let Ok(request) = serde_json::from_slice::<UdpPairMessage>(&buffer[..size]) {
                     let core = Arc::clone(&receive_core);
                     let socket = Arc::clone(&receive_socket);
                     tauri::async_runtime::spawn(async move {
-                        let _ = core
-                            .handle_udp_pair_request(&socket, source, request)
-                            .await;
+                        let _ = core.handle_udp_pair_request(&socket, source, request).await;
                     });
                 }
             }
@@ -431,26 +605,43 @@ impl Core {
 
         let beacon_core = Arc::clone(self);
         tauri::async_runtime::spawn(async move {
-            let multicast_target =
-                SocketAddr::new(IpAddr::V4(MULTICAST), DISCOVERY_PORT);
-            let broadcast_target =
-                SocketAddr::new(IpAddr::V4(GLOBAL_BROADCAST), DISCOVERY_PORT);
+            let multicast_target = SocketAddr::new(IpAddr::V4(MULTICAST), DISCOVERY_PORT);
             loop {
                 let packet = beacon_core.discovery_packet();
                 if let Ok(bytes) = serde_json::to_vec(&packet) {
                     let _ = socket.send_to(&bytes, multicast_target).await;
-                    let _ = socket.send_to(&bytes, broadcast_target).await;
+                    for target in discovery_broadcast_targets() {
+                        let _ = socket.send_to(&bytes, target).await;
+                    }
                 }
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                let delay = if now_ms() < beacon_core.awake_until.load(Ordering::Relaxed) {
+                    Duration::from_secs(1)
+                } else {
+                    Duration::from_secs(15)
+                };
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    _ = beacon_core.discovery_wake.notified() => {}
+                }
             }
         });
         Ok(())
     }
 
+    pub fn wake_network(&self) {
+        self.awake_until
+            .store(now_ms() + ACTIVE_DISCOVERY_MS, Ordering::Relaxed);
+        self.discovery_wake.notify_one();
+        self.logger.info("network_wake", "active_for_seconds=30");
+    }
+
     fn discovery_packet(&self) -> DiscoveryPacket {
         let settings = self.store.get();
         let mut pairing = self.pairing.lock().expect("pairing lock");
-        if pairing.as_ref().is_some_and(|value| value.expires_at <= now_ms()) {
+        if pairing
+            .as_ref()
+            .is_some_and(|value| value.expires_at <= now_ms())
+        {
             *pairing = None;
         }
         DiscoveryPacket {
@@ -462,61 +653,6 @@ impl Core {
             pairing_salt: pairing.as_ref().map(|value| value.salt.clone()),
             pairing_expires_at: pairing.as_ref().map(|value| value.expires_at),
         }
-    }
-
-    fn start_clipboard_watcher(self: &Arc<Self>) -> Result<(), String> {
-        let (sender, mut receiver) = mpsc::unbounded_channel();
-        let watcher_logger = Arc::clone(&self.logger);
-        std::thread::Builder::new()
-            .name("crosscopy-clipboard".into())
-            .spawn(move || {
-                let context = match ClipboardContext::new() {
-                    Ok(context) => context,
-                    Err(error) => {
-                        watcher_logger.error("clipboard_context_failed", error.to_string());
-                        return;
-                    }
-                };
-                let handler = ClipboardChangeHandler {
-                    context,
-                    sender,
-                    logger: Arc::clone(&watcher_logger),
-                };
-                let mut watcher = match ClipboardWatcherContext::new() {
-                    Ok(watcher) => watcher,
-                    Err(error) => {
-                        watcher_logger.error("clipboard_watcher_failed", error.to_string());
-                        return;
-                    }
-                };
-                watcher.add_handler(handler);
-                watcher_logger.info("clipboard_watcher_started", "ready=true");
-                watcher.start_watch();
-                watcher_logger.warn("clipboard_watcher_stopped", "unexpected=true");
-            })
-            .map_err(|e| e.to_string())?;
-
-        let core = Arc::clone(self);
-        tauri::async_runtime::spawn(async move {
-            while let Some(event) = receiver.recv().await {
-                if now_ms() < core.suppress_until.load(Ordering::Relaxed) {
-                    core.logger
-                        .info("clipboard_local_ignored", "reason=remote_write");
-                    continue;
-                }
-                if !core.store.get().sync_enabled {
-                    core.logger
-                        .info("clipboard_local_ignored", "reason=sync_disabled");
-                    continue;
-                }
-                if let Err(error) = core.handle_local_clipboard(event).await {
-                    core.logger
-                        .error("clipboard_local_failed", error.to_string());
-                    core.add_activity("system", "发送失败", &error, "error");
-                }
-            }
-        });
-        Ok(())
     }
 
     async fn handle_local_clipboard(self: &Arc<Self>, event: LocalClipboard) -> Result<(), String> {
@@ -539,10 +675,8 @@ impl Core {
                 if paths.is_empty() {
                     return Ok(());
                 }
-                self.logger.info(
-                    "clipboard_local_files",
-                    format!("items={}", paths.len()),
-                );
+                self.logger
+                    .info("clipboard_local_files", format!("items={}", paths.len()));
                 let transfer_id = Uuid::new_v4().to_string();
                 let (bytes, names) = scan_roots(&paths)?;
                 self.transfers.lock().expect("transfer lock").insert(
@@ -567,7 +701,16 @@ impl Core {
                 }
             }
         };
-        self.broadcast(&payload).await;
+        let delivered = self.broadcast(&payload).await;
+        if delivered == 0 {
+            self.add_activity(
+                "system",
+                "未发送",
+                "暂未发现在线设备，请点击连接后重试",
+                "error",
+            );
+            return Ok(());
+        }
         match &payload {
             ClipboardPayload::Text { text, .. } => self.add_activity(
                 "sent",
@@ -575,17 +718,14 @@ impl Core {
                 &format!("{} 个字符", text.chars().count()),
                 "done",
             ),
-            ClipboardPayload::Files { names, bytes, .. } => self.add_activity(
-                "sent",
-                &summary_names(names),
-                &format_bytes(*bytes),
-                "done",
-            ),
+            ClipboardPayload::Files { names, bytes, .. } => {
+                self.add_activity("sent", &summary_names(names), &format_bytes(*bytes), "done")
+            }
         }
         Ok(())
     }
 
-    async fn broadcast(&self, payload: &ClipboardPayload) {
+    async fn broadcast(&self, payload: &ClipboardPayload) -> u32 {
         let settings = self.store.get();
         let discovered = self.discovered.lock().expect("discovery lock").clone();
         let kind = match payload {
@@ -634,10 +774,7 @@ impl Core {
                         if let Err(error) = write_json(&mut stream, &message).await {
                             self.logger.warn(
                                 "clipboard_announce_failed",
-                                format!(
-                                    "target={} error={error}",
-                                    masked_ip(address.ip())
-                                ),
+                                format!("target={} error={error}", masked_ip(address.ip())),
                             );
                         } else {
                             delivered += 1;
@@ -656,33 +793,23 @@ impl Core {
             "clipboard_broadcast_completed",
             format!("kind={kind} online={online} delivered={delivered}"),
         );
+        delivered
     }
 
     async fn try_pair(&self, seen: &SeenPeer, code: &str) -> Result<(), String> {
         self.logger.info(
             "pairing_tcp_start",
-            format!(
-                "target={} port={}",
-                masked_ip(seen.host),
-                seen.packet.port
-            ),
+            format!("target={} port={}", masked_ip(seen.host), seen.packet.port),
         );
         let settings = self.store.get();
-        let salt = seen
-            .packet
-            .pairing_salt
-            .as_deref()
-            .ok_or("配对信息无效")?;
+        let salt = seen.packet.pairing_salt.as_deref().ok_or("配对信息无效")?;
         let key = pairing_key(code, salt)?;
         let mut stream = tokio::time::timeout(
             Duration::from_secs(5),
             TcpStream::connect((seen.host, seen.packet.port)),
         )
         .await
-        .map_err(|_| {
-            "连接超时。请允许 CrossCopy 通过 Windows 防火墙的“专用网络”"
-                .to_string()
-        })?
+        .map_err(|_| "连接超时。请允许 CrossCopy 通过 Windows 防火墙的“专用网络”".to_string())?
         .map_err(|e| format!("无法连接配对设备：{e}"))?;
         write_json(
             &mut stream,
@@ -697,12 +824,7 @@ impl Core {
             tokio::time::timeout(Duration::from_secs(5), read_json(&mut stream))
                 .await
                 .map_err(|_| "等待配对设备响应超时".to_string())??;
-        let WireMessage::PairAccepted {
-            id,
-            name,
-            envelope,
-        } = response
-        else {
+        let WireMessage::PairAccepted { id, name, envelope } = response else {
             return Err("验证码不正确".into());
         };
         let secret: String = decrypt(&key, &envelope)?;
@@ -712,7 +834,12 @@ impl Core {
             secret,
             paired_at: now_ms(),
         })?;
-        self.add_activity("system", &format!("已连接 {name}"), "配对完成，可以开始复制", "done");
+        self.add_activity(
+            "system",
+            &format!("已连接 {name}"),
+            "配对完成，可以开始复制",
+            "done",
+        );
         self.logger.info("pairing_tcp_succeeded", "peer_saved=true");
         Ok(())
     }
@@ -754,10 +881,7 @@ impl Core {
             socket.recv_from(&mut response_buffer),
         )
         .await
-        .map_err(|_| {
-            "未收到验证码显示方的响应，请检查两台电脑是否在同一热点"
-                .to_string()
-        })?
+        .map_err(|_| "未收到验证码显示方的响应，请检查两台电脑是否在同一热点".to_string())?
         .map_err(|e| e.to_string())?;
         let response: UdpPairMessage =
             serde_json::from_slice(&response_buffer[..size]).map_err(|e| e.to_string())?;
@@ -891,9 +1015,10 @@ impl Core {
                 id,
                 name,
                 proof: received,
-            } => self
-                .handle_pair_request(&mut stream, source.ip(), id, name, received)
-                .await,
+            } => {
+                self.handle_pair_request(&mut stream, source.ip(), id, name, received)
+                    .await
+            }
             WireMessage::Secure {
                 sender_id,
                 envelope,
@@ -905,6 +1030,22 @@ impl Core {
                     .into_iter()
                     .find(|peer| peer.id == sender_id)
                     .ok_or("设备未配对")?;
+                self.discovered.lock().expect("discovery lock").insert(
+                    peer.id.clone(),
+                    SeenPeer {
+                        packet: DiscoveryPacket {
+                            app: "crosscopy".into(),
+                            protocol: 1,
+                            id: peer.id.clone(),
+                            name: peer.name.clone(),
+                            port: TRANSFER_PORT,
+                            pairing_salt: None,
+                            pairing_expires_at: None,
+                        },
+                        host: source.ip(),
+                        last_seen: now_ms(),
+                    },
+                );
                 let key = decode_secret(&peer.secret)?;
                 let secure: SecureMessage = decrypt(&key, &envelope)?;
                 match secure {
@@ -912,7 +1053,11 @@ impl Core {
                         self.handle_remote_clipboard(peer, payload).await
                     }
                     SecureMessage::Pull { transfer_id } => {
-                        self.send_transfer(&mut stream, &key, &transfer_id).await
+                        let result = self.send_transfer(&mut stream, &key, &transfer_id).await;
+                        if let Err(error) = &result {
+                            self.fail_transfer_progress(error);
+                        }
+                        result
                     }
                     _ => Err("无效请求".into()),
                 }
@@ -972,7 +1117,12 @@ impl Core {
             paired_at: now_ms(),
         })?;
         *self.pairing.lock().expect("pairing lock") = None;
-        self.add_activity("system", &format!("已连接 {name}"), "配对完成，可以开始复制", "done");
+        self.add_activity(
+            "system",
+            &format!("已连接 {name}"),
+            "配对完成，可以开始复制",
+            "done",
+        );
         Ok(())
     }
 
@@ -990,9 +1140,16 @@ impl Core {
                     "clipboard_text_received",
                     format!("characters={}", text.chars().count()),
                 );
-                self.suppress_until.store(now_ms() + 2_500, Ordering::Relaxed);
-                write_clipboard_text(&text, &self.logger).await?;
-                self.add_activity("received", &ellipsize(&text, 42), &format!("来自 {}", peer.name), "done");
+                *self
+                    .pending_clipboard
+                    .lock()
+                    .expect("pending clipboard lock") = Some(PendingClipboard::Text(text.clone()));
+                self.add_activity(
+                    "received",
+                    &ellipsize(&text, 42),
+                    &format!("来自 {}，等待快捷键粘贴", peer.name),
+                    "done",
+                );
                 Ok(())
             }
             ClipboardPayload::Files {
@@ -1006,8 +1163,18 @@ impl Core {
                     format!("items={} bytes={bytes}", names.len()),
                 );
                 let label = summary_names(&names);
-                self.add_activity("received", &label, &format!("正在从 {} 接收", peer.name), "working");
-                self.pull_transfer(peer, transfer_id, label, bytes).await
+                self.add_activity(
+                    "received",
+                    &label,
+                    &format!("正在从 {} 接收", peer.name),
+                    "working",
+                );
+                let result = self.pull_transfer(peer, transfer_id, label, bytes).await;
+                if let Err(error) = &result {
+                    self.fail_transfer_progress(error);
+                    self.add_activity("system", "文件接收失败", error, "error");
+                }
+                result
             }
         }
     }
@@ -1023,6 +1190,7 @@ impl Core {
             "file_transfer_start",
             format!("bytes={_bytes} peer_online_lookup=true"),
         );
+        self.begin_transfer_progress(&transfer_id, &label, "received", _bytes);
         let seen = self
             .discovered
             .lock()
@@ -1054,6 +1222,7 @@ impl Core {
             .await
             .map_err(|e| e.to_string())?;
         let mut top_level = Vec::new();
+        let mut transferred = 0_u64;
         for entry in entries {
             let relative = safe_relative_path(&entry.path)?;
             let target = destination.join(&relative);
@@ -1064,11 +1233,15 @@ impl Core {
                 }
             }
             if entry.directory {
-                fs::create_dir_all(&target).await.map_err(|e| e.to_string())?;
+                fs::create_dir_all(&target)
+                    .await
+                    .map_err(|e| e.to_string())?;
                 continue;
             }
             if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent).await.map_err(|e| e.to_string())?;
+                fs::create_dir_all(parent)
+                    .await
+                    .map_err(|e| e.to_string())?;
             }
             let mut file = File::create(&target).await.map_err(|e| e.to_string())?;
             let mut remaining = entry.size;
@@ -1079,20 +1252,30 @@ impl Core {
                 }
                 file.write_all(&chunk).await.map_err(|e| e.to_string())?;
                 remaining -= chunk.len() as u64;
+                transferred += chunk.len() as u64;
+                self.update_transfer_progress(transferred);
             }
             file.flush().await.map_err(|e| e.to_string())?;
         }
-        self.suppress_until.store(now_ms() + 2_500, Ordering::Relaxed);
         let clipboard_files: Vec<String> = top_level
             .iter()
             .map(|path| path.to_string_lossy().into_owned())
             .collect();
-        write_clipboard_files(&clipboard_files, &self.logger).await?;
-        self.add_activity("received", &label, &format!("来自 {}，已放入剪贴板", peer.name), "done");
+        *self
+            .pending_clipboard
+            .lock()
+            .expect("pending clipboard lock") = Some(PendingClipboard::Files(clipboard_files));
+        self.add_activity(
+            "received",
+            &label,
+            &format!("来自 {}，等待快捷键粘贴", peer.name),
+            "done",
+        );
         self.logger.info(
             "file_transfer_completed",
             format!("bytes={_bytes} output_items={}", top_level.len()),
         );
+        self.complete_transfer_progress();
         Ok(())
     }
 
@@ -1111,6 +1294,20 @@ impl Core {
             .filter(|value| value.expires_at > now_ms())
             .ok_or("传输已过期")?;
         let entries = build_manifest(&transfer.roots)?;
+        let total = entries.iter().map(|entry| entry.size).sum();
+        let label = summary_names(
+            &transfer
+                .roots
+                .iter()
+                .map(|path| {
+                    path.file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect::<Vec<_>>(),
+        );
+        self.begin_transfer_progress(transfer_id, &label, "sent", total);
         write_secure_frame(
             stream,
             key,
@@ -1122,6 +1319,7 @@ impl Core {
         .await?;
         let root_map = root_map(&transfer.roots);
         let mut buffer = vec![0_u8; CHUNK_SIZE];
+        let mut transferred = 0_u64;
         for entry in entries.into_iter().filter(|entry| !entry.directory) {
             let source = resolve_manifest_source(&entry.path, &root_map)?;
             let mut file = File::open(source).await.map_err(|e| e.to_string())?;
@@ -1131,8 +1329,11 @@ impl Core {
                     break;
                 }
                 write_secure_frame(stream, key, &buffer[..size]).await?;
+                transferred += size as u64;
+                self.update_transfer_progress(transferred);
             }
         }
+        self.complete_transfer_progress();
         Ok(())
     }
 
@@ -1164,72 +1365,173 @@ impl Core {
         drop(activities);
         self.publish();
     }
-}
 
-struct ClipboardChangeHandler {
-    context: ClipboardContext,
-    sender: mpsc::UnboundedSender<LocalClipboard>,
-    logger: Arc<Logger>,
-}
-
-impl ClipboardHandler for ClipboardChangeHandler {
-    fn on_clipboard_change(&mut self) {
-        let files_expected = self.context.has(ContentFormat::Files);
-        let text_expected = self.context.has(ContentFormat::Text);
-        let mut last_error = String::new();
-
-        for attempt in 1..=CLIPBOARD_RETRY_ATTEMPTS {
-            if files_expected {
-                match self.context.get_files() {
-                    Ok(files) if !files.is_empty() => {
-                        self.logger.info(
-                            "clipboard_change_read",
-                            format!("kind=files items={} attempt={attempt}", files.len()),
-                        );
-                        let _ = self.sender.send(LocalClipboard::Files(
-                            files.into_iter().map(PathBuf::from).collect(),
-                        ));
-                        return;
-                    }
-                    Ok(_) => last_error = "empty file list".into(),
-                    Err(error) => last_error = error.to_string(),
-                }
-            } else if text_expected {
-                match self.context.get_text() {
-                    Ok(text) if !text.is_empty() => {
-                        self.logger.info(
-                            "clipboard_change_read",
-                            format!(
-                                "kind=text characters={} attempt={attempt}",
-                                text.chars().count()
-                            ),
-                        );
-                        let _ = self.sender.send(LocalClipboard::Text(text));
-                        return;
-                    }
-                    Ok(_) => last_error = "empty text".into(),
-                    Err(error) => last_error = error.to_string(),
-                }
-            } else {
-                self.logger.info(
-                    "clipboard_change_ignored",
-                    "reason=unsupported_format",
-                );
-                return;
-            }
-
-            if attempt < CLIPBOARD_RETRY_ATTEMPTS {
-                std::thread::sleep(Duration::from_millis(CLIPBOARD_RETRY_DELAY_MS));
-            }
+    fn begin_transfer_progress(&self, id: &str, label: &str, direction: &str, total: u64) {
+        *self
+            .transfer_progress
+            .lock()
+            .expect("transfer progress lock") = Some(TransferProgress {
+            id: id.into(),
+            label: label.into(),
+            direction: direction.into(),
+            transferred: 0,
+            total,
+            status: "working".into(),
+        });
+        if let Some(window) = self.app.get_webview_window("transfer") {
+            let _ = window.show();
+        } else {
+            let _ = WebviewWindowBuilder::new(
+                &self.app,
+                "transfer",
+                WebviewUrl::App("index.html?transfer=1".into()),
+            )
+            .title("CrossCopy 传输")
+            .inner_size(420.0, 132.0)
+            .resizable(false)
+            .always_on_top(true)
+            .center()
+            .build();
         }
-        self.logger.warn(
-            "clipboard_change_read_failed",
-            format!(
-                "kind={} attempts={} error={last_error}",
-                if files_expected { "files" } else { "text" },
-                CLIPBOARD_RETRY_ATTEMPTS
-            ),
-        );
+        self.publish();
+    }
+
+    fn update_transfer_progress(&self, transferred: u64) {
+        let mut completed = false;
+        if let Some(progress) = self
+            .transfer_progress
+            .lock()
+            .expect("transfer progress lock")
+            .as_mut()
+        {
+            progress.transferred = transferred.min(progress.total);
+            completed = progress.transferred >= progress.total;
+        }
+        let now = now_ms();
+        let last = self.last_progress_emit.load(Ordering::Relaxed);
+        if completed || now.saturating_sub(last) >= 100 {
+            self.last_progress_emit.store(now, Ordering::Relaxed);
+            self.publish();
+        }
+    }
+
+    fn complete_transfer_progress(&self) {
+        if let Some(progress) = self
+            .transfer_progress
+            .lock()
+            .expect("transfer progress lock")
+            .as_mut()
+        {
+            progress.transferred = progress.total;
+            progress.status = "done".into();
+        }
+        self.publish();
+        let app = self.app.clone();
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1_500)).await;
+            if let Some(window) = app.get_webview_window("transfer") {
+                let _ = window.close();
+            }
+        });
+    }
+
+    fn fail_transfer_progress(&self, error: &str) {
+        if let Some(progress) = self
+            .transfer_progress
+            .lock()
+            .expect("transfer progress lock")
+            .as_mut()
+        {
+            progress.status = "error".into();
+        }
+        self.logger.error("file_transfer_failed", error);
+        self.publish();
+    }
+}
+
+async fn read_current_clipboard(logger: &Logger) -> Result<LocalClipboard, String> {
+    let mut last_error = String::new();
+    for attempt in 1..=CLIPBOARD_RETRY_ATTEMPTS {
+        let result = (|| {
+            let context = ClipboardContext::new().map_err(|error| error.to_string())?;
+            if context.has(ContentFormat::Files) {
+                let files = context.get_files().map_err(|error| error.to_string())?;
+                if files.is_empty() {
+                    return Err("文件列表为空".into());
+                }
+                return Ok(LocalClipboard::Files(
+                    files.into_iter().map(PathBuf::from).collect(),
+                ));
+            }
+            if context.has(ContentFormat::Text) {
+                let text = context.get_text().map_err(|error| error.to_string())?;
+                if text.is_empty() {
+                    return Err("文字内容为空".into());
+                }
+                return Ok(LocalClipboard::Text(text));
+            }
+            Err("当前内容不是受支持的文字、文件或文件夹".into())
+        })();
+        match result {
+            Ok(event) => {
+                logger.info(
+                    "clipboard_shortcut_read",
+                    format!(
+                        "kind={} attempt={attempt}",
+                        match &event {
+                            LocalClipboard::Text(_) => "text",
+                            LocalClipboard::Files(_) => "files",
+                        }
+                    ),
+                );
+                return Ok(event);
+            }
+            Err(error) => last_error = error,
+        }
+        if attempt < CLIPBOARD_RETRY_ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(CLIPBOARD_RETRY_DELAY_MS)).await;
+        }
+    }
+    logger.warn(
+        "clipboard_shortcut_read_failed",
+        format!("attempts={} error={last_error}", CLIPBOARD_RETRY_ATTEMPTS),
+    );
+    Err(last_error)
+}
+
+fn capture_clipboard() -> Result<ClipboardSnapshot, String> {
+    let context = ClipboardContext::new().map_err(|error| error.to_string())?;
+    if context.has(ContentFormat::Files) {
+        return context
+            .get_files()
+            .map(ClipboardSnapshot::Files)
+            .map_err(|error| error.to_string());
+    }
+    if context.has(ContentFormat::Text) {
+        return context
+            .get_text()
+            .map(ClipboardSnapshot::Text)
+            .map_err(|error| error.to_string());
+    }
+    if context
+        .available_formats()
+        .map_err(|error| error.to_string())?
+        .is_empty()
+    {
+        Ok(ClipboardSnapshot::Empty)
+    } else {
+        Err("当前本机剪贴板包含暂不支持保护的格式，请先复制一段文字后重试".into())
+    }
+}
+
+async fn restore_clipboard(snapshot: ClipboardSnapshot, logger: &Logger) -> Result<(), String> {
+    match snapshot {
+        ClipboardSnapshot::Text(text) => write_clipboard_text(&text, logger).await,
+        ClipboardSnapshot::Files(files) => write_clipboard_files(&files, logger).await,
+        ClipboardSnapshot::Empty => ClipboardContext::new()
+            .map_err(|error| error.to_string())?
+            .clear()
+            .map_err(|error| error.to_string()),
     }
 }
 
@@ -1290,10 +1592,7 @@ async fn write_clipboard_files(files: &[String], logger: &Logger) -> Result<(), 
             Ok(()) => {
                 logger.info(
                     "clipboard_files_written",
-                    format!(
-                        "verified=true items={} attempt={attempt}",
-                        files.len()
-                    ),
+                    format!("verified=true items={} attempt={attempt}", files.len()),
                 );
                 return Ok(());
             }
@@ -1308,6 +1607,50 @@ async fn write_clipboard_files(files: &[String], logger: &Logger) -> Result<(), 
         format!("attempts={} error={last_error}", CLIPBOARD_RETRY_ATTEMPTS),
     );
     Err(format!("写入系统文件剪贴板失败：{last_error}"))
+}
+
+fn simulate_native_shortcut(key: char) -> Result<(), String> {
+    let mut enigo = Enigo::new(&EnigoSettings::default())
+        .map_err(|error| format!("无法控制当前应用的键盘输入，请检查系统辅助功能权限：{error}"))?;
+    #[cfg(target_os = "macos")]
+    let modifier = Key::Meta;
+    #[cfg(not(target_os = "macos"))]
+    let modifier = Key::Control;
+
+    enigo
+        .key(modifier, Press)
+        .map_err(|error| error.to_string())?;
+    let click_result = enigo
+        .key(Key::Unicode(key), Click)
+        .map_err(|error| error.to_string());
+    let release_result = enigo
+        .key(modifier, Release)
+        .map_err(|error| error.to_string());
+    click_result?;
+    release_result
+}
+
+fn discovery_broadcast_targets() -> Vec<SocketAddr> {
+    let mut targets = vec![SocketAddr::new(
+        IpAddr::V4(GLOBAL_BROADCAST),
+        DISCOVERY_PORT,
+    )];
+    if let Ok(interfaces) = get_if_addrs::get_if_addrs() {
+        for interface in interfaces {
+            if let get_if_addrs::IfAddr::V4(address) = interface.addr {
+                if address.ip.is_loopback() {
+                    continue;
+                }
+                if let Some(broadcast) = address.broadcast {
+                    let target = SocketAddr::new(IpAddr::V4(broadcast), DISCOVERY_PORT);
+                    if !targets.contains(&target) {
+                        targets.push(target);
+                    }
+                }
+            }
+        }
+    }
+    targets
 }
 
 async fn write_json<T: Serialize>(stream: &mut TcpStream, value: &T) -> Result<(), String> {
@@ -1328,7 +1671,10 @@ async fn read_json<T: DeserializeOwned>(stream: &mut TcpStream) -> Result<T, Str
         return Err("消息过大".into());
     }
     let mut bytes = vec![0_u8; size];
-    stream.read_exact(&mut bytes).await.map_err(|e| e.to_string())?;
+    stream
+        .read_exact(&mut bytes)
+        .await
+        .map_err(|e| e.to_string())?;
     serde_json::from_slice(&bytes).map_err(|e| e.to_string())
 }
 
@@ -1390,7 +1736,11 @@ fn build_manifest(roots: &[PathBuf]) -> Result<Vec<FileEntry>, String> {
                 let metadata = item.metadata().map_err(|e| e.to_string())?;
                 entries.push(FileEntry {
                     path: relative.to_string_lossy().replace('\\', "/"),
-                    size: if metadata.is_file() { metadata.len() } else { 0 },
+                    size: if metadata.is_file() {
+                        metadata.len()
+                    } else {
+                        0
+                    },
                     directory: metadata.is_dir(),
                 });
             }
@@ -1415,11 +1765,21 @@ fn root_map(roots: &[PathBuf]) -> HashMap<String, PathBuf> {
         .collect()
 }
 
-fn resolve_manifest_source(path: &str, roots: &HashMap<String, PathBuf>) -> Result<PathBuf, String> {
+fn resolve_manifest_source(
+    path: &str,
+    roots: &HashMap<String, PathBuf>,
+) -> Result<PathBuf, String> {
     let relative = safe_relative_path(path)?;
     let mut components = relative.components();
-    let root_name = components.next().ok_or("文件路径无效")?.as_os_str().to_string_lossy();
-    let mut source = roots.get(root_name.as_ref()).cloned().ok_or("文件路径无效")?;
+    let root_name = components
+        .next()
+        .ok_or("文件路径无效")?
+        .as_os_str()
+        .to_string_lossy();
+    let mut source = roots
+        .get(root_name.as_ref())
+        .cloned()
+        .ok_or("文件路径无效")?;
     for component in components {
         source.push(component.as_os_str());
     }
@@ -1542,6 +1902,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn secure_frame_payload_limit_has_headroom_for_manifest() {
         assert!(CHUNK_SIZE > 512 * 1024);
     }

@@ -1,4 +1,4 @@
-use crate::model::Settings;
+use crate::model::{default_copy_shortcut, default_paste_shortcut, Settings};
 use std::{fs, io, path::PathBuf, sync::RwLock};
 use uuid::Uuid;
 
@@ -23,6 +23,8 @@ impl Store {
                 peers: Vec::new(),
                 sync_enabled: true,
                 launch_at_login: false,
+                copy_shortcut: default_copy_shortcut(),
+                paste_shortcut: default_paste_shortcut(),
             });
         let store = Self {
             path,

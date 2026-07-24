@@ -1,6 +1,6 @@
 [package]
 name = "crosscopy"
-version = "0.1.1"
+version = "0.2.0"
 description = "Fast private LAN clipboard sync"
 authors = ["CrossCopy"]
 edition = "2021"
@@ -17,6 +17,8 @@ aes-gcm = "0.10"
 base64 = "0.22"
 clipboard-rs = { version = "0.3.5", default-features = false }
 dirs = "6"
+enigo = "0.6"
+get_if_addrs = "0.5"
 hmac = "0.12"
 hostname = "0.4"
 rand = "0.9"
@@ -27,6 +29,7 @@ sha2 = "0.10"
 subtle = "2"
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-autostart = "2"
+tauri-plugin-global-shortcut = "2"
 tauri-plugin-single-instance = "2"
 tokio = { version = "1", features = ["full"] }
 uuid = { version = "1", features = ["v4", "serde"] }

@@ -9,6 +9,8 @@ import {
   Desktop,
   FileText,
   Gear,
+  Keyboard,
+  Lightning,
   Link,
   Plus,
   ShieldCheck,
@@ -32,17 +34,24 @@ const crosscopy = {
   setLaunchAtLogin: (value: boolean) =>
     invoke<void>("set_launch_at_login", { value }),
   unpair: (peerId: string) => invoke<void>("unpair", { peerId }),
-  exportDiagnostics: () => invoke<string>("export_diagnostics")
+  exportDiagnostics: () => invoke<string>("export_diagnostics"),
+  wakeNetwork: () => invoke<void>("wake_network"),
+  setShortcuts: (copy: string, paste: string) =>
+    invoke<void>("set_shortcuts", { copy, paste })
 };
 
 const EMPTY_STATE: UiState = {
   deviceName: "",
   syncEnabled: true,
   launchAtLogin: false,
+  copyShortcut: "Ctrl+Shift+C",
+  pasteShortcut: "Ctrl+Shift+V",
+  hasPendingClipboard: false,
   pairingCode: null,
   pairingExpiresAt: null,
   peers: [],
-  activity: []
+  activity: [],
+  transfer: null
 };
 
 type PairMode = "choose" | "show" | "enter" | null;
@@ -55,6 +64,7 @@ function App(): React.JSX.Element {
   const [error, setError] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [diagnosticsMessage, setDiagnosticsMessage] = useState("");
+  const [view, setView] = useState<"clipboard" | "settings">("clipboard");
 
   useEffect(() => {
     let unlisten: UnlistenFn | undefined;
@@ -141,11 +151,19 @@ function App(): React.JSX.Element {
         </div>
 
         <nav aria-label="主导航">
-          <button className="nav-item active" type="button">
+          <button
+            className={`nav-item ${view === "clipboard" ? "active" : ""}`}
+            type="button"
+            onClick={() => setView("clipboard")}
+          >
             <Clipboard size={18} />
             剪贴板
           </button>
-          <button className="nav-item" type="button">
+          <button
+            className={`nav-item ${view === "settings" ? "active" : ""}`}
+            type="button"
+            onClick={() => setView("settings")}
+          >
             <Gear size={18} />
             设置
           </button>
@@ -163,20 +181,32 @@ function App(): React.JSX.Element {
       <section className="content">
         <header className="topbar">
           <div>
-            <h1>剪贴板</h1>
-            <p>在已配对电脑间复制文本、文件和文件夹</p>
+            <h1>{view === "clipboard" ? "剪贴板" : "设置"}</h1>
+            <p>
+              {view === "clipboard"
+                ? "使用专用快捷键发送和粘贴，不影响普通剪贴板"
+                : "配置快捷键、后台启动和诊断"}
+            </p>
           </div>
-          <button
-            className="primary-button"
-            type="button"
-            onClick={() => setPairMode("choose")}
-          >
-            <Plus size={17} weight="bold" />
-            添加电脑
-          </button>
+          {view === "clipboard" && (
+            <button
+              className="primary-button"
+              type="button"
+              onClick={() => setPairMode("choose")}
+            >
+              <Plus size={17} weight="bold" />
+              添加电脑
+            </button>
+          )}
         </header>
 
-        {!ready ? (
+        {view === "settings" ? (
+          <SettingsPanel
+            state={state}
+            diagnosticsMessage={diagnosticsMessage}
+            onDiagnostics={exportDiagnostics}
+          />
+        ) : !ready ? (
           <LoadingState />
         ) : (
           <>
@@ -245,6 +275,16 @@ function App(): React.JSX.Element {
                           {peer.online ? "已连接" : "离线"}
                         </span>
                       </div>
+                      {!peer.online && (
+                        <button
+                          className="wake-button"
+                          type="button"
+                          onClick={() => void crosscopy.wakeNetwork()}
+                        >
+                          <Lightning size={15} />
+                          连接
+                        </button>
+                      )}
                       <button
                         className="icon-button danger"
                         aria-label={`移除 ${peer.name}`}
@@ -451,6 +491,169 @@ function PairDialog(props: {
   );
 }
 
+function SettingsPanel(props: {
+  state: UiState;
+  diagnosticsMessage: string;
+  onDiagnostics(): Promise<void>;
+}): React.JSX.Element {
+  const [copy, setCopy] = useState(props.state.copyShortcut);
+  const [paste, setPaste] = useState(props.state.pasteShortcut);
+  const [message, setMessage] = useState("");
+
+  useEffect(() => {
+    setCopy(props.state.copyShortcut);
+    setPaste(props.state.pasteShortcut);
+  }, [props.state.copyShortcut, props.state.pasteShortcut]);
+
+  async function save(): Promise<void> {
+    setMessage("正在保存");
+    try {
+      await crosscopy.setShortcuts(copy, paste);
+      setMessage("快捷键已生效");
+    } catch (reason) {
+      setMessage(typeof reason === "string" ? reason : "快捷键保存失败");
+    }
+  }
+
+  return (
+    <div className="settings-page">
+      <section className="settings-group">
+        <div className="settings-intro">
+          <Keyboard size={22} />
+          <div>
+            <h2>跨设备快捷键</h2>
+            <p>点击输入框后按下组合键。普通复制和粘贴只保留在本机。</p>
+          </div>
+        </div>
+        <div className="shortcut-grid">
+          <ShortcutInput label="跨设备复制" value={copy} onChange={setCopy} />
+          <ShortcutInput label="跨设备粘贴" value={paste} onChange={setPaste} />
+        </div>
+        <div className="settings-actions">
+          <button className="primary-button" type="button" onClick={() => void save()}>
+            保存快捷键
+          </button>
+          {message && <span>{message}</span>}
+        </div>
+      </section>
+
+      <section className="settings-group settings-row">
+        <span>
+          <strong>开机自动启动</strong>
+          <small>关闭主窗口后仍在托盘低功耗运行</small>
+        </span>
+        <label className="login-setting">
+          <input
+            type="checkbox"
+            checked={props.state.launchAtLogin}
+            onChange={(event) =>
+              void crosscopy.setLaunchAtLogin(event.target.checked)
+            }
+          />
+          <i aria-hidden="true" />
+        </label>
+      </section>
+
+      <section className="settings-group settings-row">
+        <span>
+          <strong>诊断日志</strong>
+          <small>不包含配对码、剪贴板内容或完整文件路径</small>
+        </span>
+        <div className="diagnostics-setting">
+          <button type="button" onClick={() => void props.onDiagnostics()}>
+            <FileText size={17} />
+            导出日志
+          </button>
+          {props.diagnosticsMessage && <small>{props.diagnosticsMessage}</small>}
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function ShortcutInput(props: {
+  label: string;
+  value: string;
+  onChange(value: string): void;
+}): React.JSX.Element {
+  function capture(event: React.KeyboardEvent<HTMLInputElement>): void {
+    event.preventDefault();
+    if (["Control", "Shift", "Alt", "Meta"].includes(event.key)) return;
+    const modifiers = [
+      event.ctrlKey ? "Ctrl" : "",
+      event.metaKey ? "Command" : "",
+      event.altKey ? "Alt" : "",
+      event.shiftKey ? "Shift" : ""
+    ].filter(Boolean);
+    if (modifiers.length === 0) return;
+    const key = event.key.length === 1 ? event.key.toUpperCase() : event.key;
+    props.onChange([...modifiers, key].join("+"));
+  }
+
+  return (
+    <label className="shortcut-input">
+      <span>{props.label}</span>
+      <input
+        readOnly
+        value={props.value}
+        onKeyDown={capture}
+        onFocus={(event) => event.currentTarget.select()}
+        aria-label={`${props.label}，按下新的组合键`}
+      />
+      <small>点击后直接按下新组合键</small>
+    </label>
+  );
+}
+
+function TransferApp(): React.JSX.Element {
+  const [state, setState] = useState<UiState>(EMPTY_STATE);
+
+  useEffect(() => {
+    let unlisten: UnlistenFn | undefined;
+    void crosscopy.getState().then(setState);
+    void listen<UiState>("state", (event) => setState(event.payload)).then(
+      (stop) => {
+        unlisten = stop;
+      }
+    );
+    return () => unlisten?.();
+  }, []);
+
+  const transfer = state.transfer;
+  const percent =
+    transfer && transfer.total > 0
+      ? Math.min(100, Math.round((transfer.transferred / transfer.total) * 100))
+      : transfer?.status === "done"
+        ? 100
+        : 0;
+
+  return (
+    <main className="transfer-window">
+      <div className={`transfer-symbol ${transfer?.status ?? "working"}`}>
+        {transfer?.direction === "sent" ? (
+          <ArrowUpRight size={20} />
+        ) : (
+          <ArrowDownLeft size={20} />
+        )}
+      </div>
+      <div className="transfer-copy">
+        <div>
+          <strong>{transfer?.label ?? "准备传输"}</strong>
+          <span>{percent}%</span>
+        </div>
+        <div className="progress-track">
+          <i style={{ transform: `scaleX(${percent / 100})` }} />
+        </div>
+        <small>
+          {transfer
+            ? `${formatBytes(transfer.transferred)} / ${formatBytes(transfer.total)}`
+            : "正在建立连接"}
+        </small>
+      </div>
+    </main>
+  );
+}
+
 function LoadingState(): React.JSX.Element {
   return (
     <div className="loading-state" aria-label="正在加载">
@@ -468,8 +671,17 @@ function formatTime(timestamp: number): string {
   }).format(timestamp);
 }
 
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
+  return `${(bytes / 1024 ** 3).toFixed(2)} GB`;
+}
+
+const transferMode = new URLSearchParams(window.location.search).has("transfer");
+
 createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
-    <App />
+    {transferMode ? <TransferApp /> : <App />}
   </React.StrictMode>
 );

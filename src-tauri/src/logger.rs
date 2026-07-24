@@ -93,9 +93,7 @@ impl Logger {
         let Ok(mut state) = self.state.lock() else {
             return;
         };
-        if state.bytes + line.len() as u64 > MAX_LOG_BYTES
-            && self.rotate(&mut state).is_err()
-        {
+        if state.bytes + line.len() as u64 > MAX_LOG_BYTES && self.rotate(&mut state).is_err() {
             return;
         }
         if state.file.write_all(line.as_bytes()).is_ok() {
@@ -117,8 +115,7 @@ impl Logger {
             let source = if index == 1 {
                 self.current.clone()
             } else {
-                self.directory
-                    .join(format!("crosscopy.log.{}", index - 1))
+                self.directory.join(format!("crosscopy.log.{}", index - 1))
             };
             let destination = self.directory.join(format!("crosscopy.log.{index}"));
             if source.exists() {

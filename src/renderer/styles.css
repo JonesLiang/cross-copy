@@ -106,7 +106,7 @@ nav {
   border: 0;
   border-radius: 9px;
   text-align: left;
-  cursor: default;
+  cursor: pointer;
 }
 
 .nav-item.active {
@@ -401,8 +401,22 @@ nav {
 }
 
 .peer-row {
-  grid-template-columns: 38px 1fr 36px;
+  grid-template-columns: 38px 1fr auto 36px;
   gap: 10px;
+}
+
+.wake-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 6px 9px;
+  color: var(--accent);
+  background: var(--accent-soft);
+  border: 0;
+  border-radius: 8px;
+  font-size: 11px;
+  font-weight: 620;
+  cursor: pointer;
 }
 
 .peer-row + .peer-row,
@@ -514,6 +528,171 @@ nav {
 .login-setting strong,
 .login-setting small {
   display: block;
+}
+
+.settings-page {
+  display: grid;
+  gap: 16px;
+  max-width: 720px;
+}
+
+.settings-group {
+  padding: 22px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+
+.settings-intro {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.settings-intro > svg {
+  color: var(--accent);
+}
+
+.settings-intro h2 {
+  margin: 0 0 5px;
+  font-size: 15px;
+}
+
+.settings-intro p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.shortcut-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  margin-top: 22px;
+}
+
+.shortcut-input {
+  display: grid;
+  gap: 7px;
+}
+
+.shortcut-input span {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 620;
+}
+
+.shortcut-input input {
+  width: 100%;
+  height: 44px;
+  padding: 0 12px;
+  color: var(--text);
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.shortcut-input small,
+.settings-actions span,
+.settings-row small {
+  color: var(--faint);
+  font-size: 10px;
+}
+
+.settings-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 18px;
+}
+
+.settings-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+}
+
+.settings-row > span strong,
+.settings-row > span small {
+  display: block;
+}
+
+.settings-row > span strong {
+  margin-bottom: 4px;
+  font-size: 12px;
+}
+
+.transfer-window {
+  display: grid;
+  grid-template-columns: 44px 1fr;
+  align-items: center;
+  gap: 13px;
+  width: 100vw;
+  height: 100vh;
+  padding: 18px 20px;
+  background: var(--surface);
+}
+
+.transfer-symbol {
+  display: grid;
+  place-items: center;
+  width: 42px;
+  height: 42px;
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-radius: 11px;
+}
+
+.transfer-symbol.done {
+  color: var(--success);
+}
+
+.transfer-symbol.error {
+  color: var(--danger);
+}
+
+.transfer-copy {
+  min-width: 0;
+}
+
+.transfer-copy > div:first-child {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.transfer-copy strong {
+  overflow: hidden;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.transfer-copy span,
+.transfer-copy small {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.progress-track {
+  height: 5px;
+  margin: 10px 0 7px;
+  overflow: hidden;
+  background: var(--line);
+  border-radius: 999px;
+}
+
+.progress-track i {
+  display: block;
+  width: 100%;
+  height: 100%;
+  background: var(--accent);
+  border-radius: inherit;
+  transform-origin: left;
+  transition: transform 140ms ease-out;
 }
 
 .footer-settings {
