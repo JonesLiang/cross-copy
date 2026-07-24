@@ -19,6 +19,7 @@ import {
   WarningCircle,
   X
 } from "@phosphor-icons/react";
+import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { ScreenPosition, UiState } from "./types";
@@ -76,6 +77,7 @@ function App(): React.JSX.Element {
   const [error, setError] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [diagnosticsMessage, setDiagnosticsMessage] = useState("");
+  const [appVersion, setAppVersion] = useState("");
   const [view, setView] = useState<"clipboard" | "mouse" | "settings">(
     "clipboard"
   );
@@ -87,6 +89,7 @@ function App(): React.JSX.Element {
       .then(setState)
       .catch(() => setState(EMPTY_STATE))
       .finally(() => setReady(true));
+    void getVersion().then(setAppVersion).catch(() => setAppVersion(""));
     void listen<UiState>("state", (event) => setState(event.payload))
       .then((stop) => {
         unlisten = stop;
@@ -198,6 +201,7 @@ function App(): React.JSX.Element {
             {state.deviceName || "正在读取"}
           </span>
         </div>
+        <div className="app-version">v{appVersion || "—"}</div>
       </aside>
 
       <section className="content">

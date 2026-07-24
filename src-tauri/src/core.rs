@@ -59,7 +59,7 @@ const ONLINE_WINDOW_MS: u64 = 35_000;
 const CLIPBOARD_RETRY_ATTEMPTS: usize = 16;
 const CLIPBOARD_RETRY_DELAY_MS: u64 = 50;
 const ACTIVE_DISCOVERY_MS: u64 = 30_000;
-const MOUSE_PROTOCOL: u8 = 3;
+const MOUSE_PROTOCOL: u8 = 4;
 
 #[derive(Clone)]
 struct SeenPeer {

@@ -140,6 +140,13 @@ nav {
   font-size: 10px;
 }
 
+.app-version {
+  padding: 4px 10px 0;
+  color: var(--faint);
+  font-size: 10px;
+  letter-spacing: 0.02em;
+}
+
 .content {
   padding: 38px 48px 48px;
   overflow: auto;

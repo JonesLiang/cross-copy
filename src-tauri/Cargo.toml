@@ -1,6 +1,6 @@
 [package]
 name = "crosscopy"
-version = "2.0.0"
+version = "2.0.1"
 description = "Fast private LAN mouse sharing and clipboard sync"
 authors = ["CrossCopy"]
 edition = "2021"

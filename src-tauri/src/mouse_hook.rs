@@ -222,7 +222,7 @@ pub fn run_mouse_hook(
 pub fn run_mouse_hook(
     callback: impl Fn(HookMouseEvent) -> bool + Send + Sync + 'static,
 ) -> Result<(), String> {
-    use std::sync::{Arc, OnceLock};
+    use std::sync::{Arc, Mutex, OnceLock};
     use windows::Win32::{
         Foundation::{LPARAM, LRESULT, WPARAM},
         UI::WindowsAndMessaging::{
@@ -235,17 +235,30 @@ pub fn run_mouse_hook(
 
     type MouseCallback = dyn Fn(HookMouseEvent) -> bool + Send + Sync;
     static CALLBACK: OnceLock<Arc<MouseCallback>> = OnceLock::new();
+    static LAST_POSITION: OnceLock<Mutex<Option<(i32, i32)>>> = OnceLock::new();
 
     unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         if code == HC_ACTION as i32 {
             let data = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
+            let native_delta = if wparam.0 as u32 == WM_MOUSEMOVE {
+                let mut last_position = LAST_POSITION
+                    .get_or_init(|| Mutex::new(None))
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let delta = (*last_position)
+                    .map(|(last_x, last_y)| (data.pt.x - last_x, data.pt.y - last_y));
+                *last_position = Some((data.pt.x, data.pt.y));
+                delta
+            } else {
+                None
+            };
             if data.dwExtraInfo != SYNTHETIC_INPUT_MARKER {
                 let wheel_delta = || (data.mouseData >> 16) as u16 as i16 as i64;
                 let event = match wparam.0 as u32 {
                     WM_MOUSEMOVE => Some(HookMouseEvent::Move {
                         x: data.pt.x,
                         y: data.pt.y,
-                        native_delta: None,
+                        native_delta,
                     }),
                     WM_LBUTTONDOWN => Some(HookMouseEvent::Button {
                         button: HookMouseButton::Left,
