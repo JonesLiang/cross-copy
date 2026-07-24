@@ -59,7 +59,7 @@ const ONLINE_WINDOW_MS: u64 = 35_000;
 const CLIPBOARD_RETRY_ATTEMPTS: usize = 16;
 const CLIPBOARD_RETRY_DELAY_MS: u64 = 50;
 const ACTIVE_DISCOVERY_MS: u64 = 30_000;
-const MOUSE_PROTOCOL: u8 = 2;
+const MOUSE_PROTOCOL: u8 = 3;
 
 #[derive(Clone)]
 struct SeenPeer {
@@ -778,12 +778,9 @@ impl Core {
                     continue;
                 }
                 if let Ok(packet) = serde_json::from_slice::<UdpMousePacket>(&buffer[..size]) {
-                    let core = Arc::clone(&receive_core);
-                    tauri::async_runtime::spawn(async move {
-                        if let Err(error) = core.handle_udp_mouse(source, packet).await {
-                            core.logger.warn("mouse_packet_rejected", error);
-                        }
-                    });
+                    if let Err(error) = receive_core.handle_udp_mouse(source, packet).await {
+                        receive_core.logger.warn("mouse_packet_rejected", error);
+                    }
                 }
             }
         });

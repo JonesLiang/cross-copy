@@ -12,16 +12,79 @@ pub enum HookMouseEvent {
     Move {
         x: i32,
         y: i32,
+        native_delta: Option<(i32, i32)>,
     },
     Button {
         button: HookMouseButton,
         pressed: bool,
     },
     Scroll {
-        delta_x: i64,
-        delta_y: i64,
+        delta_x_milli: i64,
+        delta_y_milli: i64,
     },
     CursorVisible(bool),
+}
+
+#[cfg(target_os = "macos")]
+pub fn screen_size() -> (i32, i32) {
+    use core_graphics::display::CGDisplay;
+    let bounds = CGDisplay::main().bounds();
+    (
+        (bounds.size.width.round() as i32).max(2),
+        (bounds.size.height.round() as i32).max(2),
+    )
+}
+
+#[cfg(target_os = "windows")]
+pub fn screen_size() -> (i32, i32) {
+    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
+    unsafe {
+        (
+            GetSystemMetrics(SM_CXSCREEN).max(2),
+            GetSystemMetrics(SM_CYSCREEN).max(2),
+        )
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub fn recenter_cursor(_x: i32, _y: i32, _width: i32, _height: i32) -> Result<(), String> {
+    // macOS supplies reliable post-acceleration relative deltas. Keeping the
+    // hidden source pointer parked at the edge avoids synthetic warp events.
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+pub fn recenter_cursor(x: i32, y: i32, width: i32, height: i32) -> Result<(), String> {
+    use std::mem::size_of;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_MOVE,
+        MOUSEEVENTF_MOVE_NOCOALESCE, MOUSEINPUT,
+    };
+
+    let normalized_x = i64::from(x.clamp(0, width - 1)) * 65_535 / i64::from(width - 1);
+    let normalized_y = i64::from(y.clamp(0, height - 1)) * 65_535 / i64::from(height - 1);
+    let input = INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dx: normalized_x as i32,
+                dy: normalized_y as i32,
+                mouseData: 0,
+                dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE_NOCOALESCE,
+                time: 0,
+                dwExtraInfo: SYNTHETIC_INPUT_MARKER,
+            },
+        },
+    };
+    let sent = unsafe { SendInput(&[input], size_of::<INPUT>() as i32) };
+    if sent == 1 {
+        Ok(())
+    } else {
+        Err(format!(
+            "Windows 鼠标回中失败：{}",
+            std::io::Error::last_os_error()
+        ))
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -91,6 +154,10 @@ pub fn run_mouse_hook(
                     Some(HookMouseEvent::Move {
                         x: point.x.round() as i32,
                         y: point.y.round() as i32,
+                        native_delta: Some((
+                            event.get_integer_value_field(EventField::MOUSE_EVENT_DELTA_X) as i32,
+                            event.get_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y) as i32,
+                        )),
                     })
                 }
                 CGEventType::LeftMouseDown => Some(HookMouseEvent::Button {
@@ -118,12 +185,26 @@ pub fn run_mouse_hook(
                         pressed: matches!(event_type, CGEventType::OtherMouseDown),
                     })
                 }
-                CGEventType::ScrollWheel => Some(HookMouseEvent::Scroll {
-                    delta_x: event
-                        .get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_2),
-                    delta_y: event
-                        .get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1),
-                }),
+                CGEventType::ScrollWheel => {
+                    let scroll_milli = |line_field, fixed_field| {
+                        let lines = event.get_integer_value_field(line_field);
+                        if lines != 0 {
+                            lines.saturating_mul(1_000)
+                        } else {
+                            (event.get_double_value_field(fixed_field) * 1_000.0).round() as i64
+                        }
+                    };
+                    Some(HookMouseEvent::Scroll {
+                        delta_x_milli: scroll_milli(
+                            EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_2,
+                            EventField::SCROLL_WHEEL_EVENT_FIXED_POINT_DELTA_AXIS_2,
+                        ),
+                        delta_y_milli: scroll_milli(
+                            EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_1,
+                            EventField::SCROLL_WHEEL_EVENT_FIXED_POINT_DELTA_AXIS_1,
+                        ),
+                    })
+                }
                 _ => None,
             };
             if hook_event.is_some_and(&callback) {
@@ -145,10 +226,10 @@ pub fn run_mouse_hook(
     use windows::Win32::{
         Foundation::{LPARAM, LRESULT, WPARAM},
         UI::WindowsAndMessaging::{
-            CallNextHookEx, GetMessageW, SetWindowsHookExW, UnhookWindowsHookEx, HC_ACTION,
-            LLMHF_INJECTED, MSG, MSLLHOOKSTRUCT, WH_MOUSE_LL, WM_LBUTTONDOWN, WM_LBUTTONUP,
-            WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-            WM_RBUTTONDOWN, WM_RBUTTONUP,
+            CallNextHookEx, GetMessageW, SetWindowsHookExW, UnhookWindowsHookEx, HC_ACTION, MSG,
+            MSLLHOOKSTRUCT, WH_MOUSE_LL, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
+            WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN,
+            WM_RBUTTONUP,
         },
     };
 
@@ -158,12 +239,13 @@ pub fn run_mouse_hook(
     unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         if code == HC_ACTION as i32 {
             let data = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
-            if data.dwExtraInfo != SYNTHETIC_INPUT_MARKER && data.flags & LLMHF_INJECTED == 0 {
+            if data.dwExtraInfo != SYNTHETIC_INPUT_MARKER {
                 let wheel_delta = || (data.mouseData >> 16) as u16 as i16 as i64;
                 let event = match wparam.0 as u32 {
                     WM_MOUSEMOVE => Some(HookMouseEvent::Move {
                         x: data.pt.x,
                         y: data.pt.y,
+                        native_delta: None,
                     }),
                     WM_LBUTTONDOWN => Some(HookMouseEvent::Button {
                         button: HookMouseButton::Left,
@@ -190,12 +272,12 @@ pub fn run_mouse_hook(
                         pressed: false,
                     }),
                     WM_MOUSEWHEEL => Some(HookMouseEvent::Scroll {
-                        delta_x: 0,
-                        delta_y: wheel_delta(),
+                        delta_x_milli: 0,
+                        delta_y_milli: wheel_delta().saturating_mul(25),
                     }),
                     WM_MOUSEHWHEEL => Some(HookMouseEvent::Scroll {
-                        delta_x: wheel_delta(),
-                        delta_y: 0,
+                        delta_x_milli: wheel_delta().saturating_mul(25),
+                        delta_y_milli: 0,
                     }),
                     _ => None,
                 };

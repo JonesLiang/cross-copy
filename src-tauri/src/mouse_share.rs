@@ -2,7 +2,10 @@ use crate::mouse_hook::SYNTHETIC_INPUT_MARKER;
 use crate::{
     logger::Logger,
     model::ScreenPosition,
-    mouse_hook::{run_mouse_hook, set_cursor_visible, HookMouseButton, HookMouseEvent},
+    mouse_hook::{
+        recenter_cursor, run_mouse_hook, screen_size, set_cursor_visible, HookMouseButton,
+        HookMouseEvent,
+    },
 };
 use enigo::{Axis, Button, Coordinate, Direction, Enigo, Mouse, Settings as EnigoSettings};
 use serde::{Deserialize, Serialize};
@@ -19,6 +22,9 @@ use uuid::Uuid;
 const NO_LATENCY: u64 = u64::MAX;
 const PHYSICAL_INPUT_PRIORITY_MS: u64 = 180;
 const HELD_BUTTON_SAFETY_TIMEOUT_MS: u64 = 10_000;
+const LOGICAL_PIXEL_MILLI: i64 = 1_000;
+const LOGICAL_500_DPI_GAIN_MILLI: i64 = 500;
+const MAX_PHYSICAL_DELTA_PER_EVENT: i32 = 256;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -39,8 +45,9 @@ pub enum MouseSignal {
     },
     Move {
         session_id: String,
-        delta_x: i32,
-        delta_y: i32,
+        sequence: u64,
+        total_x_milli: i64,
+        total_y_milli: i64,
     },
     Button {
         session_id: String,
@@ -49,8 +56,9 @@ pub enum MouseSignal {
     },
     Scroll {
         session_id: String,
-        delta_x: i64,
-        delta_y: i64,
+        sequence: u64,
+        total_x_milli: i64,
+        total_y_milli: i64,
     },
     Return {
         session_id: String,
@@ -84,6 +92,12 @@ struct OutgoingSession {
     exit_edge: ScreenPosition,
     anchor_x: i32,
     anchor_y: i32,
+    move_sequence: u64,
+    total_x_milli: i64,
+    total_y_milli: i64,
+    scroll_sequence: u64,
+    total_scroll_x_milli: i64,
+    total_scroll_y_milli: i64,
     last_remote_at: u64,
 }
 
@@ -91,8 +105,16 @@ struct IncomingSession {
     peer_id: String,
     session_id: String,
     return_edge: ScreenPosition,
-    x: i32,
-    y: i32,
+    x_milli: i64,
+    y_milli: i64,
+    last_move_sequence: u64,
+    last_total_x_milli: i64,
+    last_total_y_milli: i64,
+    scroll_x_milli: i64,
+    scroll_y_milli: i64,
+    last_scroll_sequence: u64,
+    last_total_scroll_x_milli: i64,
+    last_total_scroll_y_milli: i64,
     held_buttons: [bool; 3],
     last_event_at: u64,
 }
@@ -128,11 +150,7 @@ impl MouseShare {
     pub fn new(logger: Arc<Logger>, outbound: mpsc::Sender<OutboundMouseSignal>) -> Arc<Self> {
         let (injector, injection_receiver) = std_mpsc::sync_channel(512);
         let mut enigo = Enigo::new(&mouse_input_settings()).ok();
-        let (screen_width, screen_height) = enigo
-            .as_ref()
-            .and_then(|value| value.main_display().ok())
-            .map(|(width, height)| (width.max(2), height.max(2)))
-            .unwrap_or((1920, 1080));
+        let (screen_width, screen_height) = screen_size();
         let injection_logger = Arc::clone(&logger);
         let _ = std::thread::Builder::new()
             .name("crosscopy-mouse-injector".into())
@@ -289,13 +307,21 @@ impl MouseShare {
                     peer_id: peer_id.to_string(),
                     session_id: session_id.clone(),
                     return_edge: entry_edge,
-                    x,
-                    y,
+                    x_milli: i64::from(x) * LOGICAL_PIXEL_MILLI,
+                    y_milli: i64::from(y) * LOGICAL_PIXEL_MILLI,
+                    last_move_sequence: 0,
+                    last_total_x_milli: 0,
+                    last_total_y_milli: 0,
+                    scroll_x_milli: 0,
+                    scroll_y_milli: 0,
+                    last_scroll_sequence: 0,
+                    last_total_scroll_x_milli: 0,
+                    last_total_scroll_y_milli: 0,
                     held_buttons: [false; 3],
                     last_event_at: now_ms(),
                 });
                 watchdog_session = Some(session_id.clone());
-                simulated_events.push(HookMouseEvent::Move { x, y });
+                simulated_events.push(absolute_move(x, y));
                 responses.push(outbound(
                     peer_id,
                     MouseSignal::Ack {
@@ -310,8 +336,9 @@ impl MouseShare {
             }
             MouseSignal::Move {
                 session_id,
-                delta_x,
-                delta_y,
+                sequence,
+                total_x_milli,
+                total_y_milli,
             } => {
                 let Some(incoming) = runtime.incoming.as_mut() else {
                     return responses;
@@ -319,15 +346,31 @@ impl MouseShare {
                 if incoming.peer_id != peer_id || incoming.session_id != session_id {
                     return responses;
                 }
+                if sequence <= incoming.last_move_sequence {
+                    return responses;
+                }
                 incoming.last_event_at = now_ms();
-                let next_x = (incoming.x + delta_x).clamp(0, width - 1);
-                let next_y = (incoming.y + delta_y).clamp(0, height - 1);
+                let delta_x_milli = total_x_milli.saturating_sub(incoming.last_total_x_milli);
+                let delta_y_milli = total_y_milli.saturating_sub(incoming.last_total_y_milli);
+                incoming.last_move_sequence = sequence;
+                incoming.last_total_x_milli = total_x_milli;
+                incoming.last_total_y_milli = total_y_milli;
+                let next_x_milli = incoming
+                    .x_milli
+                    .saturating_add(delta_x_milli)
+                    .clamp(0, i64::from(width - 1) * LOGICAL_PIXEL_MILLI);
+                let next_y_milli = incoming
+                    .y_milli
+                    .saturating_add(delta_y_milli)
+                    .clamp(0, i64::from(height - 1) * LOGICAL_PIXEL_MILLI);
+                let next_x = milli_to_pixel(next_x_milli);
+                let next_y = milli_to_pixel(next_y_milli);
                 if crossed_return_edge(
                     incoming.return_edge,
                     next_x,
                     next_y,
-                    delta_x,
-                    delta_y,
+                    delta_x_milli,
+                    delta_y_milli,
                     width,
                     height,
                 ) {
@@ -340,12 +383,9 @@ impl MouseShare {
                         .logger
                         .info("mouse_remote_return", format!("ratio={ratio:.3}"));
                 } else {
-                    incoming.x = next_x;
-                    incoming.y = next_y;
-                    simulated_events.push(HookMouseEvent::Move {
-                        x: next_x,
-                        y: next_y,
-                    });
+                    incoming.x_milli = next_x_milli;
+                    incoming.y_milli = next_y_milli;
+                    simulated_events.push(absolute_move(next_x, next_y));
                 }
             }
             MouseSignal::Button {
@@ -364,12 +404,32 @@ impl MouseShare {
             }
             MouseSignal::Scroll {
                 session_id,
-                delta_x,
-                delta_y,
+                sequence,
+                total_x_milli,
+                total_y_milli,
             } => {
                 if let Some(incoming) = matching_incoming_mut(&mut runtime, peer_id, &session_id) {
+                    if sequence <= incoming.last_scroll_sequence {
+                        return responses;
+                    }
                     incoming.last_event_at = now_ms();
-                    simulated_events.push(HookMouseEvent::Scroll { delta_x, delta_y });
+                    incoming.scroll_x_milli = incoming.scroll_x_milli.saturating_add(
+                        total_x_milli.saturating_sub(incoming.last_total_scroll_x_milli),
+                    );
+                    incoming.scroll_y_milli = incoming.scroll_y_milli.saturating_add(
+                        total_y_milli.saturating_sub(incoming.last_total_scroll_y_milli),
+                    );
+                    incoming.last_scroll_sequence = sequence;
+                    incoming.last_total_scroll_x_milli = total_x_milli;
+                    incoming.last_total_scroll_y_milli = total_y_milli;
+                    let delta_x_milli = take_complete_scroll_lines(&mut incoming.scroll_x_milli);
+                    let delta_y_milli = take_complete_scroll_lines(&mut incoming.scroll_y_milli);
+                    if delta_x_milli != 0 || delta_y_milli != 0 {
+                        simulated_events.push(HookMouseEvent::Scroll {
+                            delta_x_milli,
+                            delta_y_milli,
+                        });
+                    }
                 }
             }
             MouseSignal::Return { session_id, ratio } => {
@@ -383,10 +443,7 @@ impl MouseShare {
                 let point = edge_point(outgoing_session.exit_edge, ratio, width, height);
                 runtime.outgoing = None;
                 simulated_events.push(HookMouseEvent::CursorVisible(true));
-                simulated_events.push(HookMouseEvent::Move {
-                    x: point.0,
-                    y: point.1,
-                });
+                simulated_events.push(absolute_move(point.0, point.1));
             }
             MouseSignal::Cancel { session_id } => {
                 if runtime.outgoing.as_ref().is_some_and(|session| {
@@ -546,12 +603,12 @@ impl Inner {
         let (width, height) = (self.screen_width, self.screen_height);
         let mut runtime = self.runtime.lock().expect("mouse runtime lock");
         if let Some(incoming) = runtime.incoming.take() {
-            if let HookMouseEvent::Move { x, y } = event {
+            if let HookMouseEvent::Move { x, y, .. } = event {
                 runtime.last_x = x;
                 runtime.last_y = y;
             }
             let release_events = release_held_buttons(&incoming);
-            let _ = self.outbound.try_send(outbound(
+            let _ = self.outbound.blocking_send(outbound(
                 &incoming.peer_id,
                 MouseSignal::Cancel {
                     session_id: incoming.session_id,
@@ -564,31 +621,38 @@ impl Inner {
             return false;
         }
 
-        if let Some(outgoing) = runtime.outgoing.as_ref() {
+        if let Some(outgoing) = runtime.outgoing.as_mut() {
             let peer_id = outgoing.peer_id.clone();
             let session_id = outgoing.session_id.clone();
-            let mut simulated_event = None;
+            let mut should_recenter = false;
             match event {
-                HookMouseEvent::Move { x, y } => {
-                    let delta_x = x - outgoing.anchor_x;
-                    let delta_y = y - outgoing.anchor_y;
+                HookMouseEvent::Move { x, y, native_delta } => {
+                    let (raw_delta_x, raw_delta_y) =
+                        native_delta.unwrap_or((x - outgoing.anchor_x, y - outgoing.anchor_y));
+                    let delta_x = clamp_physical_delta(raw_delta_x);
+                    let delta_y = clamp_physical_delta(raw_delta_y);
+                    should_recenter = native_delta.is_none();
                     if delta_x != 0 || delta_y != 0 {
+                        outgoing.move_sequence = outgoing.move_sequence.saturating_add(1);
+                        outgoing.total_x_milli = outgoing
+                            .total_x_milli
+                            .saturating_add(i64::from(delta_x) * LOGICAL_500_DPI_GAIN_MILLI);
+                        outgoing.total_y_milli = outgoing
+                            .total_y_milli
+                            .saturating_add(i64::from(delta_y) * LOGICAL_500_DPI_GAIN_MILLI);
                         let _ = self.outbound.try_send(outbound(
                             &peer_id,
                             MouseSignal::Move {
                                 session_id,
-                                delta_x,
-                                delta_y,
+                                sequence: outgoing.move_sequence,
+                                total_x_milli: outgoing.total_x_milli,
+                                total_y_milli: outgoing.total_y_milli,
                             },
                         ));
-                        simulated_event = Some(HookMouseEvent::Move {
-                            x: outgoing.anchor_x,
-                            y: outgoing.anchor_y,
-                        });
                     }
                 }
                 HookMouseEvent::Button { button, pressed } => {
-                    let _ = self.outbound.try_send(outbound(
+                    let _ = self.outbound.blocking_send(outbound(
                         &peer_id,
                         MouseSignal::Button {
                             session_id,
@@ -597,26 +661,36 @@ impl Inner {
                         },
                     ));
                 }
-                HookMouseEvent::Scroll { delta_x, delta_y } => {
+                HookMouseEvent::Scroll {
+                    delta_x_milli,
+                    delta_y_milli,
+                } => {
+                    outgoing.scroll_sequence = outgoing.scroll_sequence.saturating_add(1);
+                    outgoing.total_scroll_x_milli =
+                        outgoing.total_scroll_x_milli.saturating_add(delta_x_milli);
+                    outgoing.total_scroll_y_milli =
+                        outgoing.total_scroll_y_milli.saturating_add(delta_y_milli);
                     let _ = self.outbound.try_send(outbound(
                         &peer_id,
                         MouseSignal::Scroll {
                             session_id,
-                            delta_x,
-                            delta_y,
+                            sequence: outgoing.scroll_sequence,
+                            total_x_milli: outgoing.total_scroll_x_milli,
+                            total_y_milli: outgoing.total_scroll_y_milli,
                         },
                     ));
                 }
                 _ => {}
             }
+            let anchor = (outgoing.anchor_x, outgoing.anchor_y);
             drop(runtime);
-            if let Some(event) = simulated_event {
-                self.inject(event);
+            if should_recenter {
+                let _ = recenter_cursor(anchor.0, anchor.1, width, height);
             }
             return true;
         }
 
-        if let HookMouseEvent::Move { x, y } = event {
+        if let HookMouseEvent::Move { x, y, .. } = event {
             let previous_x = runtime.last_x;
             let previous_y = runtime.last_y;
             runtime.last_x = x;
@@ -635,9 +709,15 @@ impl Inner {
                         exit_edge: position,
                         anchor_x,
                         anchor_y,
+                        move_sequence: 0,
+                        total_x_milli: 0,
+                        total_y_milli: 0,
+                        scroll_sequence: 0,
+                        total_scroll_x_milli: 0,
+                        total_scroll_y_milli: 0,
                         last_remote_at: now_ms(),
                     });
-                    let _ = self.outbound.try_send(outbound(
+                    let _ = self.outbound.blocking_send(outbound(
                         &peer_id,
                         MouseSignal::Enter {
                             session_id,
@@ -646,13 +726,9 @@ impl Inner {
                             sent_at: now_ms(),
                         },
                     ));
-                    let simulated_event = HookMouseEvent::Move {
-                        x: anchor_x,
-                        y: anchor_y,
-                    };
                     drop(runtime);
                     self.inject(HookMouseEvent::CursorVisible(false));
-                    self.inject(simulated_event);
+                    let _ = recenter_cursor(anchor_x, anchor_y, width, height);
                     return true;
                 }
             }
@@ -661,7 +737,16 @@ impl Inner {
     }
 
     fn inject(&self, event: HookMouseEvent) {
-        let _ = self.injector.try_send(event);
+        if matches!(event, HookMouseEvent::Move { .. }) {
+            // Movement is absolute and cumulative, so a saturated injector may
+            // drop an intermediate frame; the next frame catches up instantly.
+            let _ = self.injector.try_send(event);
+        } else {
+            // Cursor visibility, buttons and scrolling are stateful and must
+            // never be discarded, otherwise the source can retain a ghost
+            // cursor or a target can retain a pressed button.
+            let _ = self.injector.send(event);
+        }
     }
 }
 
@@ -756,17 +841,40 @@ fn crossed_return_edge(
     edge: ScreenPosition,
     x: i32,
     y: i32,
-    delta_x: i32,
-    delta_y: i32,
+    delta_x_milli: i64,
+    delta_y_milli: i64,
     width: i32,
     height: i32,
 ) -> bool {
     match edge {
-        ScreenPosition::Left => x <= 0 && delta_x < 0,
-        ScreenPosition::Right => x >= width - 1 && delta_x > 0,
-        ScreenPosition::Up => y <= 0 && delta_y < 0,
-        ScreenPosition::Down => y >= height - 1 && delta_y > 0,
+        ScreenPosition::Left => x <= 0 && delta_x_milli < 0,
+        ScreenPosition::Right => x >= width - 1 && delta_x_milli > 0,
+        ScreenPosition::Up => y <= 0 && delta_y_milli < 0,
+        ScreenPosition::Down => y >= height - 1 && delta_y_milli > 0,
     }
+}
+
+fn absolute_move(x: i32, y: i32) -> HookMouseEvent {
+    HookMouseEvent::Move {
+        x,
+        y,
+        native_delta: None,
+    }
+}
+
+fn clamp_physical_delta(value: i32) -> i32 {
+    value.clamp(-MAX_PHYSICAL_DELTA_PER_EVENT, MAX_PHYSICAL_DELTA_PER_EVENT)
+}
+
+fn milli_to_pixel(value: i64) -> i32 {
+    ((value + LOGICAL_PIXEL_MILLI / 2) / LOGICAL_PIXEL_MILLI)
+        .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+}
+
+fn take_complete_scroll_lines(value: &mut i64) -> i64 {
+    let complete = (*value / LOGICAL_PIXEL_MILLI) * LOGICAL_PIXEL_MILLI;
+    *value -= complete;
+    complete
 }
 
 fn from_hook_button(button: HookMouseButton) -> SharedMouseButton {
@@ -787,7 +895,7 @@ fn to_hook_button(button: SharedMouseButton) -> HookMouseButton {
 
 fn inject_mouse_event(enigo: &mut Enigo, event: HookMouseEvent) -> Result<(), String> {
     match event {
-        HookMouseEvent::Move { x, y } => enigo
+        HookMouseEvent::Move { x, y, .. } => enigo
             .move_mouse(x, y, Coordinate::Abs)
             .map_err(|error| error.to_string()),
         HookMouseEvent::Button { button, pressed } => enigo
@@ -804,7 +912,12 @@ fn inject_mouse_event(enigo: &mut Enigo, event: HookMouseEvent) -> Result<(), St
                 },
             )
             .map_err(|error| error.to_string()),
-        HookMouseEvent::Scroll { delta_x, delta_y } => {
+        HookMouseEvent::Scroll {
+            delta_x_milli,
+            delta_y_milli,
+        } => {
+            let delta_x = delta_x_milli / LOGICAL_PIXEL_MILLI;
+            let delta_y = delta_y_milli / LOGICAL_PIXEL_MILLI;
             if delta_x != 0 {
                 enigo
                     .scroll(clamp_i64(delta_x), Axis::Horizontal)
