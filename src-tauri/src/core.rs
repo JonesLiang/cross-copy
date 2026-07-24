@@ -31,6 +31,8 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
+#[cfg(target_os = "macos")]
+use tokio::sync::oneshot;
 use tokio::{
     fs::{self, File},
     io::{AsyncReadExt, AsyncWriteExt},
@@ -401,11 +403,17 @@ impl Core {
                 return;
             }
         };
-        if let Err(error) = simulate_native_shortcut('c') {
+        self.logger.info(
+            "shortcut_copy_simulation_started",
+            native_shortcut_dispatch_detail(),
+        );
+        if let Err(error) = simulate_native_shortcut(&self.app, 'c').await {
             self.logger.error("shortcut_copy_simulation_failed", &error);
             self.add_activity("system", "无法复制", &error, "error");
             return;
         }
+        self.logger
+            .info("shortcut_copy_simulation_completed", "success=true");
         tokio::time::sleep(Duration::from_millis(100)).await;
         let event = read_current_clipboard(&self.logger).await;
         if let Err(error) = restore_clipboard(original, &self.logger).await {
@@ -485,13 +493,19 @@ impl Core {
             self.add_activity("system", "写入剪贴板失败", &error, "error");
             return;
         }
-        if let Err(error) = simulate_native_shortcut('v') {
+        self.logger.info(
+            "shortcut_paste_simulation_started",
+            native_shortcut_dispatch_detail(),
+        );
+        if let Err(error) = simulate_native_shortcut(&self.app, 'v').await {
             self.logger
                 .error("shortcut_paste_simulation_failed", &error);
             self.add_activity("system", "无法粘贴", &error, "error");
             let _ = restore_clipboard(original, &self.logger).await;
             return;
         }
+        self.logger
+            .info("shortcut_paste_simulation_completed", "success=true");
         tokio::time::sleep(Duration::from_millis(600)).await;
         if let Err(error) = restore_clipboard(original, &self.logger).await {
             self.logger.error("clipboard_restore_failed", &error);
@@ -1541,7 +1555,7 @@ async fn capture_clipboard(logger: &Logger) -> Result<ClipboardSnapshot, String>
     for attempt in 1..=CLIPBOARD_RETRY_ATTEMPTS {
         let result = (|| {
             let context = ClipboardContext::new().map_err(|error| error.to_string())?;
-            let mut formats = vec![
+            let formats = [
                 ContentFormat::Image,
                 ContentFormat::Files,
                 ContentFormat::Text,
@@ -1551,12 +1565,6 @@ async fn capture_clipboard(logger: &Logger) -> Result<ClipboardSnapshot, String>
             let available = context
                 .available_formats()
                 .map_err(|error| error.to_string())?;
-            #[cfg(target_os = "macos")]
-            for format in &available {
-                if format != "unknown format" {
-                    formats.push(ContentFormat::Other(format.clone()));
-                }
-            }
             let contents = context.get(&formats).map_err(|error| error.to_string())?;
             if !contents.is_empty() {
                 return Ok(ClipboardSnapshot::Contents(contents));
@@ -1684,7 +1692,24 @@ fn native_input_settings() -> EnigoSettings {
     settings
 }
 
-fn simulate_native_shortcut(key: char) -> Result<(), String> {
+#[cfg(target_os = "macos")]
+fn native_shortcut_key(key: char) -> Result<Key, String> {
+    // macOS ANSI physical key codes. Avoid Key::Unicode here: Enigo asks
+    // HIToolbox for the current input source, which is main-queue-only on
+    // macOS 26 and previously crashed when called from a Tokio worker.
+    match key {
+        'c' => Ok(Key::Other(8)),
+        'v' => Ok(Key::Other(9)),
+        _ => Err("不支持的原生快捷键".into()),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn native_shortcut_key(key: char) -> Result<Key, String> {
+    Ok(Key::Unicode(key))
+}
+
+fn simulate_native_shortcut_on_current_thread(key: char) -> Result<(), String> {
     let mut enigo = match Enigo::new(&native_input_settings()) {
         Ok(enigo) => enigo,
         Err(error) => {
@@ -1704,18 +1729,47 @@ fn simulate_native_shortcut(key: char) -> Result<(), String> {
     let modifier = Key::Meta;
     #[cfg(not(target_os = "macos"))]
     let modifier = Key::Control;
+    let shortcut_key = native_shortcut_key(key)?;
 
     enigo
         .key(modifier, Press)
         .map_err(|error| error.to_string())?;
     let click_result = enigo
-        .key(Key::Unicode(key), Click)
+        .key(shortcut_key, Click)
         .map_err(|error| error.to_string());
     let release_result = enigo
         .key(modifier, Release)
         .map_err(|error| error.to_string());
     click_result?;
     release_result
+}
+
+#[cfg(target_os = "macos")]
+async fn simulate_native_shortcut(app: &AppHandle, key: char) -> Result<(), String> {
+    let (sender, receiver) = oneshot::channel();
+    app.run_on_main_thread(move || {
+        let _ = sender.send(simulate_native_shortcut_on_current_thread(key));
+    })
+    .map_err(|error| format!("无法切换到 macOS 主线程：{error}"))?;
+    receiver
+        .await
+        .map_err(|_| "macOS 主线程未返回按键模拟结果".to_string())?
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn simulate_native_shortcut(_app: &AppHandle, key: char) -> Result<(), String> {
+    simulate_native_shortcut_on_current_thread(key)
+}
+
+fn native_shortcut_dispatch_detail() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        "dispatch=main_thread"
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        "dispatch=current_thread"
+    }
 }
 
 fn discovery_broadcast_targets() -> Vec<SocketAddr> {
@@ -2014,5 +2068,14 @@ mod tests {
             Some(SYNTHETIC_INPUT_MARKER as i64)
         );
         assert_eq!(settings.windows_dw_extra_info, Some(SYNTHETIC_INPUT_MARKER));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_shortcuts_are_dispatched_on_main_thread() {
+        assert_eq!(native_shortcut_dispatch_detail(), "dispatch=main_thread");
+        assert_eq!(native_shortcut_key('c'), Ok(Key::Other(8)));
+        assert_eq!(native_shortcut_key('v'), Ok(Key::Other(9)));
+        assert!(native_shortcut_key('x').is_err());
     }
 }
