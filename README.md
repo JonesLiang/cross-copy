@@ -19,9 +19,10 @@
 - 托盘后台运行、暂停同步、开机启动、浅色和深色模式
 - 本地滚动日志和一键导出诊断报告
 
-macOS 首次使用专用快捷键时，系统可能要求授予 CrossCopy“辅助功能”
-权限，用于把复制或粘贴动作发送给当前应用。关闭主窗口不会退出
-CrossCopy，可从菜单栏托盘图标重新打开。
+macOS 首次使用时，请在 CrossCopy 设置页点击“打开系统设置”，授予
+CrossCopy“辅助功能”权限，用于把复制或粘贴动作发送给当前应用。
+CrossCopy 不会在每次按快捷键时重复弹出系统授权窗口。关闭主窗口不会
+退出 CrossCopy，可从菜单栏托盘图标重新打开。
 
 ## 导出诊断日志
 
@@ -82,7 +83,10 @@ npm install
 npm run build
 ```
 
-未签名的安装包会触发 macOS Gatekeeper 或 Windows SmartScreen 提示。公开分发前应配置 Apple Developer ID 和 Windows 代码签名证书。
+流水线会给没有开发者证书的 macOS 产物写入固定的本地应用身份，使
+辅助功能授权在版本升级后保持稳定；这不等同于 Apple 公证。未使用
+Developer ID 或 Windows 代码签名证书的安装包仍会触发 Gatekeeper 或
+SmartScreen 提示，公开分发前应配置正式签名证书。
 
 ## 网络说明
 

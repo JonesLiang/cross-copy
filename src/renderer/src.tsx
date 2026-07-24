@@ -36,6 +36,7 @@ const crosscopy = {
   unpair: (peerId: string) => invoke<void>("unpair", { peerId }),
   exportDiagnostics: () => invoke<string>("export_diagnostics"),
   wakeNetwork: () => invoke<void>("wake_network"),
+  openInputPermissions: () => invoke<void>("open_input_permissions"),
   setShortcuts: (copy: string, paste: string) =>
     invoke<void>("set_shortcuts", { copy, paste })
 };
@@ -499,6 +500,7 @@ function SettingsPanel(props: {
   const [copy, setCopy] = useState(props.state.copyShortcut);
   const [paste, setPaste] = useState(props.state.pasteShortcut);
   const [message, setMessage] = useState("");
+  const isMac = navigator.userAgent.includes("Mac");
 
   useEffect(() => {
     setCopy(props.state.copyShortcut);
@@ -553,6 +555,24 @@ function SettingsPanel(props: {
           <i aria-hidden="true" />
         </label>
       </section>
+
+      {isMac && (
+        <section className="settings-group settings-row">
+          <span>
+            <strong>辅助功能权限</strong>
+            <small>只用于向当前应用发送一次原生复制或粘贴按键</small>
+          </span>
+          <div className="diagnostics-setting">
+            <button
+              type="button"
+              onClick={() => void crosscopy.openInputPermissions()}
+            >
+              <ShieldCheck size={17} />
+              打开系统设置
+            </button>
+          </div>
+        </section>
+      )}
 
       <section className="settings-group settings-row">
         <span>

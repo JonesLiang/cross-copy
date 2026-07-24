@@ -25,7 +25,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Component, Path, PathBuf},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -46,9 +46,10 @@ const MULTICAST: Ipv4Addr = Ipv4Addr::new(239, 255, 67, 89);
 const GLOBAL_BROADCAST: Ipv4Addr = Ipv4Addr::new(255, 255, 255, 255);
 const CHUNK_SIZE: usize = 1024 * 1024;
 const ONLINE_WINDOW_MS: u64 = 35_000;
-const CLIPBOARD_RETRY_ATTEMPTS: usize = 8;
-const CLIPBOARD_RETRY_DELAY_MS: u64 = 40;
+const CLIPBOARD_RETRY_ATTEMPTS: usize = 16;
+const CLIPBOARD_RETRY_DELAY_MS: u64 = 50;
 const ACTIVE_DISCOVERY_MS: u64 = 30_000;
+const SYNTHETIC_INPUT_MARKER: usize = 0x4352_4f53_5343_4f50;
 
 #[derive(Clone)]
 struct SeenPeer {
@@ -142,6 +143,25 @@ enum ClipboardSnapshot {
     Empty,
 }
 
+struct ClipboardOperationGuard<'a> {
+    active: &'a AtomicBool,
+}
+
+impl<'a> ClipboardOperationGuard<'a> {
+    fn acquire(active: &'a AtomicBool) -> Option<Self> {
+        active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Self { active })
+    }
+}
+
+impl Drop for ClipboardOperationGuard<'_> {
+    fn drop(&mut self) {
+        self.active.store(false, Ordering::Release);
+    }
+}
+
 pub struct Core {
     pub store: Arc<Store>,
     app: AppHandle,
@@ -152,6 +172,7 @@ pub struct Core {
     activities: Mutex<Vec<Activity>>,
     transfer_progress: Mutex<Option<TransferProgress>>,
     pending_clipboard: Mutex<Option<PendingClipboard>>,
+    clipboard_operation_active: AtomicBool,
     awake_until: AtomicU64,
     last_discovery_response: AtomicU64,
     last_progress_emit: AtomicU64,
@@ -171,6 +192,7 @@ impl Core {
             activities: Mutex::new(Vec::new()),
             transfer_progress: Mutex::new(None),
             pending_clipboard: Mutex::new(None),
+            clipboard_operation_active: AtomicBool::new(false),
             awake_until: AtomicU64::new(now_ms() + ACTIVE_DISCOVERY_MS),
             last_discovery_response: AtomicU64::new(0),
             last_progress_emit: AtomicU64::new(0),
@@ -359,6 +381,14 @@ impl Core {
     }
 
     pub async fn trigger_copy(self: &Arc<Self>) {
+        let Some(_operation) = ClipboardOperationGuard::acquire(&self.clipboard_operation_active)
+        else {
+            self.logger.info(
+                "clipboard_shortcut_ignored",
+                "reason=operation_in_progress kind=copy",
+            );
+            return;
+        };
         if !self.store.get().sync_enabled {
             self.add_activity("system", "同步已暂停", "请先开启同步", "error");
             return;
@@ -410,6 +440,14 @@ impl Core {
     }
 
     pub async fn trigger_paste(self: &Arc<Self>) {
+        let Some(_operation) = ClipboardOperationGuard::acquire(&self.clipboard_operation_active)
+        else {
+            self.logger.info(
+                "clipboard_shortcut_ignored",
+                "reason=operation_in_progress kind=paste",
+            );
+            return;
+        };
         if !self.store.get().sync_enabled {
             self.add_activity("system", "同步已暂停", "请先开启同步", "error");
             return;
@@ -1503,22 +1541,27 @@ async fn capture_clipboard(logger: &Logger) -> Result<ClipboardSnapshot, String>
     for attempt in 1..=CLIPBOARD_RETRY_ATTEMPTS {
         let result = (|| {
             let context = ClipboardContext::new().map_err(|error| error.to_string())?;
-            let formats = [
+            let mut formats = vec![
                 ContentFormat::Image,
                 ContentFormat::Files,
                 ContentFormat::Text,
                 ContentFormat::Rtf,
                 ContentFormat::Html,
             ];
+            let available = context
+                .available_formats()
+                .map_err(|error| error.to_string())?;
+            #[cfg(target_os = "macos")]
+            for format in &available {
+                if format != "unknown format" {
+                    formats.push(ContentFormat::Other(format.clone()));
+                }
+            }
             let contents = context.get(&formats).map_err(|error| error.to_string())?;
             if !contents.is_empty() {
                 return Ok(ClipboardSnapshot::Contents(contents));
             }
-            if context
-                .available_formats()
-                .map_err(|error| error.to_string())?
-                .is_empty()
-            {
+            if available.is_empty() {
                 Ok(ClipboardSnapshot::Empty)
             } else {
                 Err("本机剪贴板暂时被其他程序占用".into())
@@ -1631,15 +1674,24 @@ async fn write_clipboard_files(files: &[String], logger: &Logger) -> Result<(), 
     Err(format!("写入系统文件剪贴板失败：{last_error}"))
 }
 
+fn native_input_settings() -> EnigoSettings {
+    let mut settings = EnigoSettings::default();
+    // Permission prompts are an explicit, one-time product action. Asking from
+    // every shortcut invocation makes macOS display the same dialog forever.
+    settings.open_prompt_to_get_permissions = false;
+    settings.event_source_user_data = Some(SYNTHETIC_INPUT_MARKER as i64);
+    settings.windows_dw_extra_info = Some(SYNTHETIC_INPUT_MARKER);
+    settings
+}
+
 fn simulate_native_shortcut(key: char) -> Result<(), String> {
-    let mut enigo = match Enigo::new(&EnigoSettings::default()) {
+    let mut enigo = match Enigo::new(&native_input_settings()) {
         Ok(enigo) => enigo,
         Err(error) => {
             #[cfg(target_os = "macos")]
             {
-                open_accessibility_settings();
                 return Err(format!(
-                    "已打开系统“辅助功能”设置。请允许 CrossCopy，然后完全退出并重新打开：{error}"
+                    "CrossCopy 当前版本未获得辅助功能权限。请在“系统设置 → 隐私与安全性 → 辅助功能”中允许 CrossCopy；如果已经开启，请关闭后重新开启一次：{error}"
                 ));
             }
             #[cfg(not(target_os = "macos"))]
@@ -1664,13 +1716,6 @@ fn simulate_native_shortcut(key: char) -> Result<(), String> {
         .map_err(|error| error.to_string());
     click_result?;
     release_result
-}
-
-#[cfg(target_os = "macos")]
-fn open_accessibility_settings() {
-    let _ = std::process::Command::new("open")
-        .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
-        .spawn();
 }
 
 fn discovery_broadcast_targets() -> Vec<SocketAddr> {
@@ -1936,6 +1981,7 @@ fn reveal_file(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
 
     #[test]
     fn rejects_traversal_paths() {
@@ -1948,5 +1994,25 @@ mod tests {
     #[allow(clippy::assertions_on_constants)]
     fn secure_frame_payload_limit_has_headroom_for_manifest() {
         assert!(CHUNK_SIZE > 512 * 1024);
+    }
+
+    #[test]
+    fn clipboard_operation_guard_prevents_reentrant_shortcuts() {
+        let active = AtomicBool::new(false);
+        let first = ClipboardOperationGuard::acquire(&active).expect("first operation");
+        assert!(ClipboardOperationGuard::acquire(&active).is_none());
+        drop(first);
+        assert!(ClipboardOperationGuard::acquire(&active).is_some());
+    }
+
+    #[test]
+    fn native_input_never_prompts_from_a_shortcut() {
+        let settings = native_input_settings();
+        assert!(!settings.open_prompt_to_get_permissions);
+        assert_eq!(
+            settings.event_source_user_data,
+            Some(SYNTHETIC_INPUT_MARKER as i64)
+        );
+        assert_eq!(settings.windows_dw_extra_info, Some(SYNTHETIC_INPUT_MARKER));
     }
 }

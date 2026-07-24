@@ -38,8 +38,23 @@ jobs:
       - name: 安装前端依赖
         run: npm ci
 
-      - name: 打包 macOS Intel 和 Apple Silicon 通用版
-        run: npm run build -- --target universal-apple-darwin
+      - name: 打包 macOS Intel 和 Apple Silicon 通用应用
+        run: npm run build -- --target universal-apple-darwin --bundles app
+
+      - name: 固定应用身份并验证签名
+        run: |
+          chmod +x scripts/sign-macos-app.sh
+          scripts/sign-macos-app.sh src-tauri/target/universal-apple-darwin/release/bundle/macos/CrossCopy.app
+
+      - name: 生成 DMG
+        run: |
+          mkdir -p src-tauri/target/universal-apple-darwin/release/bundle/dmg
+          hdiutil create \
+            -volname CrossCopy \
+            -srcfolder src-tauri/target/universal-apple-darwin/release/bundle/macos/CrossCopy.app \
+            -ov \
+            -format UDZO \
+            src-tauri/target/universal-apple-darwin/release/bundle/dmg/CrossCopy_Universal.dmg
 
       - name: 上传 macOS 安装包
         uses: actions/upload-artifact@v4

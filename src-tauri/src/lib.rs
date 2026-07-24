@@ -70,6 +70,18 @@ fn wake_network(core: State<'_, Arc<Core>>) {
 }
 
 #[tauri::command]
+fn open_input_permissions() -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
+            .spawn()
+            .map_err(|error| format!("无法打开辅助功能设置：{error}"))?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
 fn set_shortcuts(
     app: tauri::AppHandle,
     core: State<'_, Arc<Core>>,
@@ -230,6 +242,7 @@ pub fn run() {
             unpair,
             export_diagnostics,
             wake_network,
+            open_input_permissions,
             set_shortcuts
         ])
         .run(tauri::generate_context!())
