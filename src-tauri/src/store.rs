@@ -1,4 +1,6 @@
-use crate::model::{default_copy_shortcut, default_paste_shortcut, Settings};
+use crate::model::{
+    default_copy_shortcut, default_mouse_shortcut, default_paste_shortcut, ScreenPosition, Settings,
+};
 use std::{fs, io, path::PathBuf, sync::RwLock};
 use uuid::Uuid;
 
@@ -25,6 +27,9 @@ impl Store {
                 launch_at_login: false,
                 copy_shortcut: default_copy_shortcut(),
                 paste_shortcut: default_paste_shortcut(),
+                mouse_share_enabled: false,
+                mouse_shortcut: default_mouse_shortcut(),
+                mouse_position: ScreenPosition::Right,
             });
         let store = Self {
             path,

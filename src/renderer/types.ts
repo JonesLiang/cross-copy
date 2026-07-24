@@ -1,9 +1,17 @@
+export type ScreenPosition = "left" | "right" | "up" | "down";
+
 export type UiState = {
   deviceName: string;
   syncEnabled: boolean;
   launchAtLogin: boolean;
   copyShortcut: string;
   pasteShortcut: string;
+  mouseShareEnabled: boolean;
+  mouseShortcut: string;
+  mousePosition: ScreenPosition;
+  mouseLatencyMs: number | null;
+  mouseSessionActive: boolean;
+  mouseListenerStarted: boolean;
   hasPendingClipboard: boolean;
   pairingCode: string | null;
   pairingExpiresAt: number | null;

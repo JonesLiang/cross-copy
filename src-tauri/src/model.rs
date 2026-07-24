@@ -1,4 +1,26 @@
 use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ScreenPosition {
+    Left,
+    #[default]
+    Right,
+    Up,
+    Down,
+}
+
+impl ScreenPosition {
+    pub fn opposite(self) -> Self {
+        match self {
+            Self::Left => Self::Right,
+            Self::Right => Self::Left,
+            Self::Up => Self::Down,
+            Self::Down => Self::Up,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Peer {
@@ -20,6 +42,12 @@ pub struct Settings {
     pub copy_shortcut: String,
     #[serde(default = "default_paste_shortcut")]
     pub paste_shortcut: String,
+    #[serde(default)]
+    pub mouse_share_enabled: bool,
+    #[serde(default = "default_mouse_shortcut")]
+    pub mouse_shortcut: String,
+    #[serde(default)]
+    pub mouse_position: ScreenPosition,
 }
 
 pub fn default_copy_shortcut() -> String {
@@ -28,6 +56,10 @@ pub fn default_copy_shortcut() -> String {
 
 pub fn default_paste_shortcut() -> String {
     "Ctrl+Shift+V".into()
+}
+
+pub fn default_mouse_shortcut() -> String {
+    "Ctrl+Shift+M".into()
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -69,6 +101,12 @@ pub struct UiState {
     pub launch_at_login: bool,
     pub copy_shortcut: String,
     pub paste_shortcut: String,
+    pub mouse_share_enabled: bool,
+    pub mouse_shortcut: String,
+    pub mouse_position: ScreenPosition,
+    pub mouse_latency_ms: Option<u64>,
+    pub mouse_session_active: bool,
+    pub mouse_listener_started: bool,
     pub has_pending_clipboard: bool,
     pub transfer: Option<TransferProgress>,
     pub pairing_code: Option<String>,
@@ -104,4 +142,8 @@ pub struct DiscoveryPacket {
     pub port: u16,
     pub pairing_salt: Option<String>,
     pub pairing_expires_at: Option<u64>,
+    #[serde(default)]
+    pub mouse_share_enabled: bool,
+    #[serde(default)]
+    pub mouse_position: ScreenPosition,
 }

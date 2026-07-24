@@ -1,7 +1,7 @@
 {
   "name": "crosscopy",
-  "version": "0.2.5",
-  "description": "Fast, private LAN clipboard sync for macOS and Windows",
+  "version": "2.0.0",
+  "description": "Fast private LAN mouse sharing and clipboard sync",
   "type": "module",
   "scripts": {
     "dev": "tauri dev",

@@ -1,0 +1,841 @@
+use crate::mouse_hook::SYNTHETIC_INPUT_MARKER;
+use crate::{
+    logger::Logger,
+    model::ScreenPosition,
+    mouse_hook::{run_mouse_hook, set_cursor_visible, HookMouseButton, HookMouseEvent},
+};
+use enigo::{Axis, Button, Coordinate, Direction, Enigo, Mouse, Settings as EnigoSettings};
+use serde::{Deserialize, Serialize};
+use std::{
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc as std_mpsc, Arc, Mutex,
+    },
+    time::{SystemTime, UNIX_EPOCH},
+};
+use tokio::sync::mpsc;
+use uuid::Uuid;
+
+const NO_LATENCY: u64 = u64::MAX;
+const PHYSICAL_INPUT_PRIORITY_MS: u64 = 180;
+const HELD_BUTTON_SAFETY_TIMEOUT_MS: u64 = 10_000;
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SharedMouseButton {
+    Left,
+    Right,
+    Middle,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum MouseSignal {
+    Enter {
+        session_id: String,
+        entry_edge: ScreenPosition,
+        ratio: f64,
+        sent_at: u64,
+    },
+    Move {
+        session_id: String,
+        delta_x: i32,
+        delta_y: i32,
+    },
+    Button {
+        session_id: String,
+        button: SharedMouseButton,
+        pressed: bool,
+    },
+    Scroll {
+        session_id: String,
+        delta_x: i64,
+        delta_y: i64,
+    },
+    Return {
+        session_id: String,
+        ratio: f64,
+    },
+    Cancel {
+        session_id: String,
+    },
+    Ack {
+        session_id: String,
+        sent_at: u64,
+    },
+    Latency {
+        session_id: String,
+        milliseconds: u64,
+    },
+    KeepAlive {
+        session_id: String,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub struct OutboundMouseSignal {
+    pub peer_id: String,
+    pub signal: MouseSignal,
+}
+
+struct OutgoingSession {
+    peer_id: String,
+    session_id: String,
+    exit_edge: ScreenPosition,
+    anchor_x: i32,
+    anchor_y: i32,
+    last_remote_at: u64,
+}
+
+struct IncomingSession {
+    peer_id: String,
+    session_id: String,
+    return_edge: ScreenPosition,
+    x: i32,
+    y: i32,
+    held_buttons: [bool; 3],
+    last_event_at: u64,
+}
+
+struct Runtime {
+    target_peer: Option<String>,
+    position: ScreenPosition,
+    last_x: i32,
+    last_y: i32,
+    outgoing: Option<OutgoingSession>,
+    incoming: Option<IncomingSession>,
+}
+
+struct Inner {
+    enabled: AtomicBool,
+    listener_attempted: AtomicBool,
+    listener_started: AtomicBool,
+    latency_ms: AtomicU64,
+    last_physical_at: AtomicU64,
+    runtime: Mutex<Runtime>,
+    outbound: mpsc::Sender<OutboundMouseSignal>,
+    injector: std_mpsc::SyncSender<HookMouseEvent>,
+    logger: Arc<Logger>,
+    screen_width: i32,
+    screen_height: i32,
+}
+
+pub struct MouseShare {
+    inner: Arc<Inner>,
+}
+
+impl MouseShare {
+    pub fn new(logger: Arc<Logger>, outbound: mpsc::Sender<OutboundMouseSignal>) -> Arc<Self> {
+        let (injector, injection_receiver) = std_mpsc::sync_channel(512);
+        let mut enigo = Enigo::new(&mouse_input_settings()).ok();
+        let (screen_width, screen_height) = enigo
+            .as_ref()
+            .and_then(|value| value.main_display().ok())
+            .map(|(width, height)| (width.max(2), height.max(2)))
+            .unwrap_or((1920, 1080));
+        let injection_logger = Arc::clone(&logger);
+        let _ = std::thread::Builder::new()
+            .name("crosscopy-mouse-injector".into())
+            .spawn(move || {
+                let Some(mut enigo) = enigo.take() else {
+                    injection_logger.error(
+                        "mouse_injector_failed",
+                        "provider=enigo initialization_failed=true",
+                    );
+                    return;
+                };
+                let mut last_error_log = 0_u64;
+                while let Ok(event) = injection_receiver.recv() {
+                    if let Err(error) = inject_mouse_event(&mut enigo, event) {
+                        let now = now_ms();
+                        if now.saturating_sub(last_error_log) >= 1_000 {
+                            last_error_log = now;
+                            injection_logger.warn("mouse_simulation_failed", error);
+                        }
+                    }
+                }
+            });
+        Arc::new(Self {
+            inner: Arc::new(Inner {
+                enabled: AtomicBool::new(false),
+                listener_attempted: AtomicBool::new(false),
+                listener_started: AtomicBool::new(false),
+                latency_ms: AtomicU64::new(NO_LATENCY),
+                last_physical_at: AtomicU64::new(0),
+                runtime: Mutex::new(Runtime {
+                    target_peer: None,
+                    position: ScreenPosition::Right,
+                    last_x: 0,
+                    last_y: 0,
+                    outgoing: None,
+                    incoming: None,
+                }),
+                outbound,
+                injector,
+                logger,
+                screen_width,
+                screen_height,
+            }),
+        })
+    }
+
+    pub fn configure(&self, enabled: bool, position: ScreenPosition, target_peer: Option<String>) {
+        let was_enabled = self.inner.enabled.swap(enabled, Ordering::AcqRel);
+        if enabled && !was_enabled {
+            self.inner
+                .listener_attempted
+                .store(false, Ordering::Release);
+        }
+        let mut runtime = self.inner.runtime.lock().expect("mouse runtime lock");
+        let target_changed = runtime.target_peer != target_peer;
+        runtime.position = position;
+        runtime.target_peer = target_peer;
+        let should_start_listener = enabled && runtime.target_peer.is_some();
+        let mut release_events = Vec::new();
+        if !enabled || target_changed {
+            if runtime.outgoing.take().is_some() {
+                release_events.push(HookMouseEvent::CursorVisible(true));
+            }
+            if let Some(incoming) = runtime.incoming.take() {
+                release_events = release_held_buttons(&incoming);
+            }
+            self.inner.latency_ms.store(NO_LATENCY, Ordering::Relaxed);
+        }
+        drop(runtime);
+        for event in release_events {
+            self.inject(event);
+        }
+        if should_start_listener {
+            self.ensure_listener_started();
+        }
+    }
+
+    pub fn listener_started(&self) -> bool {
+        self.inner.listener_started.load(Ordering::Acquire)
+    }
+
+    pub fn latency_ms(&self) -> Option<u64> {
+        match self.inner.latency_ms.load(Ordering::Relaxed) {
+            NO_LATENCY => None,
+            value => Some(value),
+        }
+    }
+
+    pub fn session_active(&self) -> bool {
+        let runtime = self.inner.runtime.lock().expect("mouse runtime lock");
+        runtime.outgoing.is_some() || runtime.incoming.is_some()
+    }
+
+    pub fn expire_unresponsive_outgoing(&self) {
+        let mut runtime = self.inner.runtime.lock().expect("mouse runtime lock");
+        let expired = runtime
+            .outgoing
+            .as_ref()
+            .is_some_and(|session| now_ms().saturating_sub(session.last_remote_at) >= 2_000);
+        if !expired {
+            return;
+        }
+        runtime.outgoing = None;
+        drop(runtime);
+        self.inject(HookMouseEvent::CursorVisible(true));
+        self.inner
+            .logger
+            .warn("mouse_session_cancelled", "reason=peer_unresponsive");
+    }
+
+    pub fn force_stop(&self) {
+        self.inner.enabled.store(false, Ordering::Release);
+        let mut runtime = self.inner.runtime.lock().expect("mouse runtime lock");
+        let outgoing_active = runtime.outgoing.take().is_some();
+        let releases = runtime
+            .incoming
+            .take()
+            .map(|incoming| release_held_buttons(&incoming))
+            .unwrap_or_default();
+        drop(runtime);
+        if outgoing_active {
+            self.inject(HookMouseEvent::CursorVisible(true));
+        }
+        for event in releases {
+            self.inject(event);
+        }
+    }
+
+    pub fn apply_remote(&self, peer_id: &str, signal: MouseSignal) -> Vec<OutboundMouseSignal> {
+        let mut responses = Vec::new();
+        if !self.inner.enabled.load(Ordering::Acquire) {
+            return responses;
+        }
+        let (width, height) = (self.inner.screen_width, self.inner.screen_height);
+        let mut runtime = self.inner.runtime.lock().expect("mouse runtime lock");
+        let mut simulated_events = Vec::new();
+        let mut watchdog_session = None;
+        match signal {
+            MouseSignal::Enter {
+                session_id,
+                entry_edge,
+                ratio,
+                sent_at,
+            } => {
+                if now_ms().saturating_sub(self.inner.last_physical_at.load(Ordering::Relaxed))
+                    < PHYSICAL_INPUT_PRIORITY_MS
+                {
+                    responses.push(outbound(peer_id, MouseSignal::Cancel { session_id }));
+                    return responses;
+                }
+                runtime.outgoing = None;
+                let (x, y) = edge_point(entry_edge, ratio, width, height);
+                runtime.incoming = Some(IncomingSession {
+                    peer_id: peer_id.to_string(),
+                    session_id: session_id.clone(),
+                    return_edge: entry_edge,
+                    x,
+                    y,
+                    held_buttons: [false; 3],
+                    last_event_at: now_ms(),
+                });
+                watchdog_session = Some(session_id.clone());
+                simulated_events.push(HookMouseEvent::Move { x, y });
+                responses.push(outbound(
+                    peer_id,
+                    MouseSignal::Ack {
+                        session_id,
+                        sent_at,
+                    },
+                ));
+                self.inner.logger.info(
+                    "mouse_remote_enter",
+                    format!("edge={entry_edge:?} ratio={ratio:.3}"),
+                );
+            }
+            MouseSignal::Move {
+                session_id,
+                delta_x,
+                delta_y,
+            } => {
+                let Some(incoming) = runtime.incoming.as_mut() else {
+                    return responses;
+                };
+                if incoming.peer_id != peer_id || incoming.session_id != session_id {
+                    return responses;
+                }
+                incoming.last_event_at = now_ms();
+                let next_x = (incoming.x + delta_x).clamp(0, width - 1);
+                let next_y = (incoming.y + delta_y).clamp(0, height - 1);
+                if crossed_return_edge(
+                    incoming.return_edge,
+                    next_x,
+                    next_y,
+                    delta_x,
+                    delta_y,
+                    width,
+                    height,
+                ) {
+                    let ratio = edge_ratio(incoming.return_edge, next_x, next_y, width, height);
+                    let session_id = incoming.session_id.clone();
+                    simulated_events.extend(release_held_buttons(incoming));
+                    runtime.incoming = None;
+                    responses.push(outbound(peer_id, MouseSignal::Return { session_id, ratio }));
+                    self.inner
+                        .logger
+                        .info("mouse_remote_return", format!("ratio={ratio:.3}"));
+                } else {
+                    incoming.x = next_x;
+                    incoming.y = next_y;
+                    simulated_events.push(HookMouseEvent::Move {
+                        x: next_x,
+                        y: next_y,
+                    });
+                }
+            }
+            MouseSignal::Button {
+                session_id,
+                button,
+                pressed,
+            } => {
+                if let Some(incoming) = matching_incoming_mut(&mut runtime, peer_id, &session_id) {
+                    incoming.last_event_at = now_ms();
+                    incoming.held_buttons[button_index(button)] = pressed;
+                    simulated_events.push(HookMouseEvent::Button {
+                        button: to_hook_button(button),
+                        pressed,
+                    });
+                }
+            }
+            MouseSignal::Scroll {
+                session_id,
+                delta_x,
+                delta_y,
+            } => {
+                if let Some(incoming) = matching_incoming_mut(&mut runtime, peer_id, &session_id) {
+                    incoming.last_event_at = now_ms();
+                    simulated_events.push(HookMouseEvent::Scroll { delta_x, delta_y });
+                }
+            }
+            MouseSignal::Return { session_id, ratio } => {
+                let Some(outgoing_session) = runtime.outgoing.as_ref() else {
+                    return responses;
+                };
+                if outgoing_session.peer_id != peer_id || outgoing_session.session_id != session_id
+                {
+                    return responses;
+                }
+                let point = edge_point(outgoing_session.exit_edge, ratio, width, height);
+                runtime.outgoing = None;
+                simulated_events.push(HookMouseEvent::CursorVisible(true));
+                simulated_events.push(HookMouseEvent::Move {
+                    x: point.0,
+                    y: point.1,
+                });
+            }
+            MouseSignal::Cancel { session_id } => {
+                if runtime.outgoing.as_ref().is_some_and(|session| {
+                    session.peer_id == peer_id && session.session_id == session_id
+                }) {
+                    runtime.outgoing = None;
+                    simulated_events.push(HookMouseEvent::CursorVisible(true));
+                }
+                if runtime.incoming.as_ref().is_some_and(|session| {
+                    session.peer_id == peer_id && session.session_id == session_id
+                }) {
+                    if let Some(incoming) = runtime.incoming.take() {
+                        simulated_events.extend(release_held_buttons(&incoming));
+                    }
+                }
+            }
+            MouseSignal::Ack {
+                session_id,
+                sent_at,
+            } => {
+                if let Some(outgoing) = runtime.outgoing.as_mut().filter(|session| {
+                    session.peer_id == peer_id && session.session_id == session_id
+                }) {
+                    outgoing.last_remote_at = now_ms();
+                    let latency = now_ms().saturating_sub(sent_at).div_ceil(2);
+                    self.inner.latency_ms.store(latency, Ordering::Relaxed);
+                    responses.push(outbound(
+                        peer_id,
+                        MouseSignal::Latency {
+                            session_id,
+                            milliseconds: latency,
+                        },
+                    ));
+                }
+            }
+            MouseSignal::Latency {
+                session_id,
+                milliseconds,
+            } => {
+                if runtime.incoming.as_ref().is_some_and(|session| {
+                    session.peer_id == peer_id && session.session_id == session_id
+                }) {
+                    self.inner.latency_ms.store(milliseconds, Ordering::Relaxed);
+                }
+            }
+            MouseSignal::KeepAlive { session_id } => {
+                if let Some(outgoing) = runtime.outgoing.as_mut().filter(|session| {
+                    session.peer_id == peer_id && session.session_id == session_id
+                }) {
+                    outgoing.last_remote_at = now_ms();
+                }
+            }
+        }
+        drop(runtime);
+        for event in simulated_events {
+            self.inject(event);
+        }
+        if let Some(session_id) = watchdog_session {
+            self.start_button_safety_watchdog(peer_id.to_string(), session_id);
+        }
+        responses
+    }
+
+    fn ensure_listener_started(&self) {
+        if self
+            .inner
+            .listener_attempted
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        self.inner.listener_started.store(true, Ordering::Release);
+        let inner = Arc::clone(&self.inner);
+        if let Err(error) = std::thread::Builder::new()
+            .name("crosscopy-mouse-hook".into())
+            .spawn(move || {
+                inner
+                    .logger
+                    .info("mouse_listener_started", "provider=native_mouse_only");
+                let callback_inner = Arc::clone(&inner);
+                if let Err(error) =
+                    run_mouse_hook(move |event| callback_inner.handle_local_event(event))
+                {
+                    inner.listener_started.store(false, Ordering::Release);
+                    inner
+                        .logger
+                        .error("mouse_listener_failed", format!("{error:?}"));
+                }
+            })
+        {
+            self.inner.listener_started.store(false, Ordering::Release);
+            self.inner
+                .logger
+                .error("mouse_listener_thread_failed", error.to_string());
+        }
+    }
+
+    fn inject(&self, event: HookMouseEvent) {
+        self.inner.inject(event);
+    }
+
+    fn start_button_safety_watchdog(&self, peer_id: String, session_id: String) {
+        let inner = Arc::downgrade(&self.inner);
+        let _ = std::thread::Builder::new()
+            .name("crosscopy-button-safety".into())
+            .spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                let Some(inner) = inner.upgrade() else {
+                    return;
+                };
+                let mut runtime = inner.runtime.lock().expect("mouse runtime lock");
+                let Some(incoming) = runtime.incoming.as_mut() else {
+                    return;
+                };
+                if incoming.peer_id != peer_id || incoming.session_id != session_id {
+                    return;
+                }
+                let releases = if now_ms().saturating_sub(incoming.last_event_at)
+                    < HELD_BUTTON_SAFETY_TIMEOUT_MS
+                    || !incoming.held_buttons.iter().any(|pressed| *pressed)
+                {
+                    Vec::new()
+                } else {
+                    let releases = release_held_buttons(incoming);
+                    incoming.held_buttons = [false; 3];
+                    releases
+                };
+                drop(runtime);
+                let _ = inner.outbound.try_send(outbound(
+                    &peer_id,
+                    MouseSignal::KeepAlive {
+                        session_id: session_id.clone(),
+                    },
+                ));
+                let released_any = !releases.is_empty();
+                for event in releases {
+                    inner.inject(event);
+                }
+                if released_any {
+                    inner.logger.warn(
+                        "mouse_buttons_safety_released",
+                        "reason=remote_session_idle",
+                    );
+                }
+            });
+    }
+}
+
+impl Inner {
+    fn handle_local_event(&self, event: HookMouseEvent) -> bool {
+        self.last_physical_at.store(now_ms(), Ordering::Relaxed);
+        if !self.enabled.load(Ordering::Acquire) {
+            return false;
+        }
+
+        let (width, height) = (self.screen_width, self.screen_height);
+        let mut runtime = self.runtime.lock().expect("mouse runtime lock");
+        if let Some(incoming) = runtime.incoming.take() {
+            if let HookMouseEvent::Move { x, y } = event {
+                runtime.last_x = x;
+                runtime.last_y = y;
+            }
+            let release_events = release_held_buttons(&incoming);
+            let _ = self.outbound.try_send(outbound(
+                &incoming.peer_id,
+                MouseSignal::Cancel {
+                    session_id: incoming.session_id,
+                },
+            ));
+            drop(runtime);
+            for event in release_events {
+                self.inject(event);
+            }
+            return false;
+        }
+
+        if let Some(outgoing) = runtime.outgoing.as_ref() {
+            let peer_id = outgoing.peer_id.clone();
+            let session_id = outgoing.session_id.clone();
+            let mut simulated_event = None;
+            match event {
+                HookMouseEvent::Move { x, y } => {
+                    let delta_x = x - outgoing.anchor_x;
+                    let delta_y = y - outgoing.anchor_y;
+                    if delta_x != 0 || delta_y != 0 {
+                        let _ = self.outbound.try_send(outbound(
+                            &peer_id,
+                            MouseSignal::Move {
+                                session_id,
+                                delta_x,
+                                delta_y,
+                            },
+                        ));
+                        simulated_event = Some(HookMouseEvent::Move {
+                            x: outgoing.anchor_x,
+                            y: outgoing.anchor_y,
+                        });
+                    }
+                }
+                HookMouseEvent::Button { button, pressed } => {
+                    let _ = self.outbound.try_send(outbound(
+                        &peer_id,
+                        MouseSignal::Button {
+                            session_id,
+                            button: from_hook_button(button),
+                            pressed,
+                        },
+                    ));
+                }
+                HookMouseEvent::Scroll { delta_x, delta_y } => {
+                    let _ = self.outbound.try_send(outbound(
+                        &peer_id,
+                        MouseSignal::Scroll {
+                            session_id,
+                            delta_x,
+                            delta_y,
+                        },
+                    ));
+                }
+                _ => {}
+            }
+            drop(runtime);
+            if let Some(event) = simulated_event {
+                self.inject(event);
+            }
+            return true;
+        }
+
+        if let HookMouseEvent::Move { x, y } = event {
+            let previous_x = runtime.last_x;
+            let previous_y = runtime.last_y;
+            runtime.last_x = x;
+            runtime.last_y = y;
+            let position = runtime.position;
+            let target = runtime.target_peer.clone();
+            if let Some(peer_id) = target {
+                if reached_exit_edge(position, x, y, previous_x, previous_y, width, height) {
+                    let session_id = Uuid::new_v4().to_string();
+                    let ratio = edge_ratio(position, x, y, width, height);
+                    let anchor_x = width / 2;
+                    let anchor_y = height / 2;
+                    runtime.outgoing = Some(OutgoingSession {
+                        peer_id: peer_id.clone(),
+                        session_id: session_id.clone(),
+                        exit_edge: position,
+                        anchor_x,
+                        anchor_y,
+                        last_remote_at: now_ms(),
+                    });
+                    let _ = self.outbound.try_send(outbound(
+                        &peer_id,
+                        MouseSignal::Enter {
+                            session_id,
+                            entry_edge: position.opposite(),
+                            ratio,
+                            sent_at: now_ms(),
+                        },
+                    ));
+                    let simulated_event = HookMouseEvent::Move {
+                        x: anchor_x,
+                        y: anchor_y,
+                    };
+                    drop(runtime);
+                    self.inject(HookMouseEvent::CursorVisible(false));
+                    self.inject(simulated_event);
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn inject(&self, event: HookMouseEvent) {
+        let _ = self.injector.try_send(event);
+    }
+}
+
+fn outbound(peer_id: &str, signal: MouseSignal) -> OutboundMouseSignal {
+    OutboundMouseSignal {
+        peer_id: peer_id.to_string(),
+        signal,
+    }
+}
+
+fn incoming_matches(runtime: &Runtime, peer_id: &str, session_id: &str) -> bool {
+    runtime
+        .incoming
+        .as_ref()
+        .is_some_and(|session| session.peer_id == peer_id && session.session_id == session_id)
+}
+
+fn matching_incoming_mut<'a>(
+    runtime: &'a mut Runtime,
+    peer_id: &str,
+    session_id: &str,
+) -> Option<&'a mut IncomingSession> {
+    runtime
+        .incoming
+        .as_mut()
+        .filter(|session| session.peer_id == peer_id && session.session_id == session_id)
+}
+
+fn release_held_buttons(session: &IncomingSession) -> Vec<HookMouseEvent> {
+    [
+        HookMouseButton::Left,
+        HookMouseButton::Right,
+        HookMouseButton::Middle,
+    ]
+    .into_iter()
+    .enumerate()
+    .filter(|(index, _)| session.held_buttons[*index])
+    .map(|(_, button)| HookMouseEvent::Button {
+        button,
+        pressed: false,
+    })
+    .collect()
+}
+
+fn button_index(button: SharedMouseButton) -> usize {
+    match button {
+        SharedMouseButton::Left => 0,
+        SharedMouseButton::Right => 1,
+        SharedMouseButton::Middle => 2,
+    }
+}
+
+fn edge_point(edge: ScreenPosition, ratio: f64, width: i32, height: i32) -> (i32, i32) {
+    let ratio = ratio.clamp(0.0, 1.0);
+    match edge {
+        ScreenPosition::Left => (1, (ratio * f64::from(height - 1)).round() as i32),
+        ScreenPosition::Right => (width - 2, (ratio * f64::from(height - 1)).round() as i32),
+        ScreenPosition::Up => ((ratio * f64::from(width - 1)).round() as i32, 1),
+        ScreenPosition::Down => ((ratio * f64::from(width - 1)).round() as i32, height - 2),
+    }
+}
+
+fn edge_ratio(edge: ScreenPosition, x: i32, y: i32, width: i32, height: i32) -> f64 {
+    match edge {
+        ScreenPosition::Left | ScreenPosition::Right => {
+            f64::from(y.clamp(0, height - 1)) / f64::from(height - 1)
+        }
+        ScreenPosition::Up | ScreenPosition::Down => {
+            f64::from(x.clamp(0, width - 1)) / f64::from(width - 1)
+        }
+    }
+}
+
+fn reached_exit_edge(
+    edge: ScreenPosition,
+    x: i32,
+    y: i32,
+    previous_x: i32,
+    previous_y: i32,
+    width: i32,
+    height: i32,
+) -> bool {
+    match edge {
+        ScreenPosition::Left => x <= 0 && x <= previous_x,
+        ScreenPosition::Right => x >= width - 1 && x >= previous_x,
+        ScreenPosition::Up => y <= 0 && y <= previous_y,
+        ScreenPosition::Down => y >= height - 1 && y >= previous_y,
+    }
+}
+
+fn crossed_return_edge(
+    edge: ScreenPosition,
+    x: i32,
+    y: i32,
+    delta_x: i32,
+    delta_y: i32,
+    width: i32,
+    height: i32,
+) -> bool {
+    match edge {
+        ScreenPosition::Left => x <= 0 && delta_x < 0,
+        ScreenPosition::Right => x >= width - 1 && delta_x > 0,
+        ScreenPosition::Up => y <= 0 && delta_y < 0,
+        ScreenPosition::Down => y >= height - 1 && delta_y > 0,
+    }
+}
+
+fn from_hook_button(button: HookMouseButton) -> SharedMouseButton {
+    match button {
+        HookMouseButton::Left => SharedMouseButton::Left,
+        HookMouseButton::Right => SharedMouseButton::Right,
+        HookMouseButton::Middle => SharedMouseButton::Middle,
+    }
+}
+
+fn to_hook_button(button: SharedMouseButton) -> HookMouseButton {
+    match button {
+        SharedMouseButton::Left => HookMouseButton::Left,
+        SharedMouseButton::Right => HookMouseButton::Right,
+        SharedMouseButton::Middle => HookMouseButton::Middle,
+    }
+}
+
+fn inject_mouse_event(enigo: &mut Enigo, event: HookMouseEvent) -> Result<(), String> {
+    match event {
+        HookMouseEvent::Move { x, y } => enigo
+            .move_mouse(x, y, Coordinate::Abs)
+            .map_err(|error| error.to_string()),
+        HookMouseEvent::Button { button, pressed } => enigo
+            .button(
+                match button {
+                    HookMouseButton::Left => Button::Left,
+                    HookMouseButton::Right => Button::Right,
+                    HookMouseButton::Middle => Button::Middle,
+                },
+                if pressed {
+                    Direction::Press
+                } else {
+                    Direction::Release
+                },
+            )
+            .map_err(|error| error.to_string()),
+        HookMouseEvent::Scroll { delta_x, delta_y } => {
+            if delta_x != 0 {
+                enigo
+                    .scroll(clamp_i64(delta_x), Axis::Horizontal)
+                    .map_err(|error| error.to_string())?;
+            }
+            if delta_y != 0 {
+                enigo
+                    .scroll(clamp_i64(-delta_y), Axis::Vertical)
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok(())
+        }
+        HookMouseEvent::CursorVisible(visible) => set_cursor_visible(visible),
+    }
+}
+
+fn mouse_input_settings() -> EnigoSettings {
+    let mut settings = EnigoSettings::default();
+    settings.open_prompt_to_get_permissions = false;
+    settings.event_source_user_data = Some(SYNTHETIC_INPUT_MARKER as i64);
+    settings.windows_dw_extra_info = Some(SYNTHETIC_INPUT_MARKER);
+    settings
+}
+
+fn clamp_i64(value: i64) -> i32 {
+    value.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}

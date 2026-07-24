@@ -12,6 +12,7 @@ import {
   Keyboard,
   Lightning,
   Link,
+  MouseSimple,
   Plus,
   ShieldCheck,
   Trash,
@@ -20,7 +21,7 @@ import {
 } from "@phosphor-icons/react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import type { UiState } from "./types";
+import type { ScreenPosition, UiState } from "./types";
 import "./styles.css";
 
 const crosscopy = {
@@ -37,8 +38,12 @@ const crosscopy = {
   exportDiagnostics: () => invoke<string>("export_diagnostics"),
   wakeNetwork: () => invoke<void>("wake_network"),
   openInputPermissions: () => invoke<void>("open_input_permissions"),
-  setShortcuts: (copy: string, paste: string) =>
-    invoke<void>("set_shortcuts", { copy, paste })
+  setShortcuts: (copy: string, paste: string, mouse: string) =>
+    invoke<void>("set_shortcuts", { copy, paste, mouse }),
+  setMouseShareEnabled: (value: boolean) =>
+    invoke<void>("set_mouse_share_enabled", { value }),
+  setMousePosition: (position: ScreenPosition) =>
+    invoke<void>("set_mouse_position", { position })
 };
 
 const EMPTY_STATE: UiState = {
@@ -47,6 +52,12 @@ const EMPTY_STATE: UiState = {
   launchAtLogin: false,
   copyShortcut: "Ctrl+Shift+C",
   pasteShortcut: "Ctrl+Shift+V",
+  mouseShareEnabled: false,
+  mouseShortcut: "Ctrl+Shift+M",
+  mousePosition: "right",
+  mouseLatencyMs: null,
+  mouseSessionActive: false,
+  mouseListenerStarted: false,
   hasPendingClipboard: false,
   pairingCode: null,
   pairingExpiresAt: null,
@@ -65,7 +76,9 @@ function App(): React.JSX.Element {
   const [error, setError] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [diagnosticsMessage, setDiagnosticsMessage] = useState("");
-  const [view, setView] = useState<"clipboard" | "settings">("clipboard");
+  const [view, setView] = useState<"clipboard" | "mouse" | "settings">(
+    "clipboard"
+  );
 
   useEffect(() => {
     let unlisten: UnlistenFn | undefined;
@@ -161,6 +174,14 @@ function App(): React.JSX.Element {
             剪贴板
           </button>
           <button
+            className={`nav-item ${view === "mouse" ? "active" : ""}`}
+            type="button"
+            onClick={() => setView("mouse")}
+          >
+            <MouseSimple size={18} />
+            鼠标共享
+          </button>
+          <button
             className={`nav-item ${view === "settings" ? "active" : ""}`}
             type="button"
             onClick={() => setView("settings")}
@@ -182,11 +203,19 @@ function App(): React.JSX.Element {
       <section className="content">
         <header className="topbar">
           <div>
-            <h1>{view === "clipboard" ? "剪贴板" : "设置"}</h1>
+            <h1>
+              {view === "clipboard"
+                ? "剪贴板"
+                : view === "mouse"
+                  ? "鼠标共享"
+                  : "设置"}
+            </h1>
             <p>
               {view === "clipboard"
                 ? "使用专用快捷键发送和粘贴，不影响普通剪贴板"
-                : "配置快捷键、后台启动和诊断"}
+                : view === "mouse"
+                  ? "把另一台电脑放到逻辑方位，鼠标即可跨越屏幕"
+                : "配置快捷键、后台启动、系统权限和诊断"}
             </p>
           </div>
           {view === "clipboard" && (
@@ -207,6 +236,8 @@ function App(): React.JSX.Element {
             diagnosticsMessage={diagnosticsMessage}
             onDiagnostics={exportDiagnostics}
           />
+        ) : view === "mouse" ? (
+          <MousePanel state={state} />
         ) : !ready ? (
           <LoadingState />
         ) : (
@@ -492,6 +523,219 @@ function PairDialog(props: {
   );
 }
 
+const SCREEN_OFFSETS: Record<ScreenPosition, { x: number; y: number }> = {
+  left: { x: -150, y: 0 },
+  right: { x: 150, y: 0 },
+  up: { x: 0, y: -82 },
+  down: { x: 0, y: 82 }
+};
+
+function MousePanel(props: { state: UiState }): React.JSX.Element {
+  const peer = props.state.peers[0];
+  const [offset, setOffset] = useState(
+    SCREEN_OFFSETS[props.state.mousePosition]
+  );
+  const [dragging, setDragging] = useState(false);
+  const [dragOrigin, setDragOrigin] = useState({
+    pointerX: 0,
+    pointerY: 0,
+    offsetX: 0,
+    offsetY: 0
+  });
+  const [message, setMessage] = useState("");
+
+  useEffect(() => {
+    if (!dragging) setOffset(SCREEN_OFFSETS[props.state.mousePosition]);
+  }, [dragging, props.state.mousePosition]);
+
+  async function choosePosition(position: ScreenPosition): Promise<void> {
+    setOffset(SCREEN_OFFSETS[position]);
+    setMessage("正在同步屏幕位置");
+    try {
+      await crosscopy.setMousePosition(position);
+      setMessage("两台电脑的逻辑位置已同步");
+    } catch (reason) {
+      setMessage(typeof reason === "string" ? reason : "屏幕位置同步失败");
+    }
+  }
+
+  function startDrag(event: React.PointerEvent<HTMLButtonElement>): void {
+    event.currentTarget.setPointerCapture(event.pointerId);
+    setDragging(true);
+    setDragOrigin({
+      pointerX: event.clientX,
+      pointerY: event.clientY,
+      offsetX: offset.x,
+      offsetY: offset.y
+    });
+  }
+
+  function moveDrag(event: React.PointerEvent<HTMLButtonElement>): void {
+    if (!dragging) return;
+    setOffset({
+      x: Math.max(
+        -175,
+        Math.min(175, dragOrigin.offsetX + event.clientX - dragOrigin.pointerX)
+      ),
+      y: Math.max(
+        -95,
+        Math.min(95, dragOrigin.offsetY + event.clientY - dragOrigin.pointerY)
+      )
+    });
+  }
+
+  function endDrag(event: React.PointerEvent<HTMLButtonElement>): void {
+    if (!dragging) return;
+    event.currentTarget.releasePointerCapture(event.pointerId);
+    setDragging(false);
+    const finalOffset = {
+      x: Math.max(
+        -175,
+        Math.min(175, dragOrigin.offsetX + event.clientX - dragOrigin.pointerX)
+      ),
+      y: Math.max(
+        -95,
+        Math.min(95, dragOrigin.offsetY + event.clientY - dragOrigin.pointerY)
+      )
+    };
+    const position: ScreenPosition =
+      Math.abs(finalOffset.x) >= Math.abs(finalOffset.y)
+        ? finalOffset.x < 0
+          ? "left"
+          : "right"
+        : finalOffset.y < 0
+          ? "up"
+          : "down";
+    void choosePosition(position);
+  }
+
+  const online = Boolean(peer?.online);
+  const latencyLabel =
+    props.state.mouseLatencyMs === null
+      ? "完成一次鼠标穿越后显示"
+      : `${props.state.mouseLatencyMs} ms（单向估算）`;
+
+  return (
+    <div className="mouse-page">
+      <section className="settings-group mouse-toggle-card">
+        <div className="settings-intro">
+          <MouseSimple size={23} />
+          <div>
+            <h2>共享鼠标</h2>
+            <p>
+              开启后移动到指定屏幕边缘即可穿越；任一电脑关闭时，两端会同步关闭。
+            </p>
+          </div>
+        </div>
+        <label className="login-setting">
+          <input
+            type="checkbox"
+            checked={props.state.mouseShareEnabled}
+            disabled={!peer}
+            onChange={(event) =>
+              void crosscopy.setMouseShareEnabled(event.target.checked)
+            }
+          />
+          <i aria-hidden="true" />
+        </label>
+      </section>
+
+      <section className="settings-group topology-card">
+        <div className="topology-heading">
+          <div>
+            <h2>逻辑屏幕位置</h2>
+            <p>拖动另一台电脑到本机的上、下、左或右，松手后自动吸附。</p>
+          </div>
+          <span className={online ? "topology-online" : ""}>
+            {peer ? (online ? "设备在线" : "设备离线") : "尚未配对"}
+          </span>
+        </div>
+
+        <div className="screen-layout" aria-label="拖动调整逻辑屏幕位置">
+          <div className="screen-device local-screen">
+            <Desktop size={27} />
+            <strong>{props.state.deviceName || "本机"}</strong>
+            <small>当前电脑</small>
+          </div>
+          {peer && (
+            <button
+              className={`screen-device peer-screen ${dragging ? "dragging" : ""}`}
+              style={{
+                transform: `translate(-50%, -50%) translate(${offset.x}px, ${offset.y}px)`
+              }}
+              type="button"
+              onPointerDown={startDrag}
+              onPointerMove={moveDrag}
+              onPointerUp={endDrag}
+              onPointerCancel={() => setDragging(false)}
+            >
+              <Desktop size={27} />
+              <strong>{peer.name}</strong>
+              <small>拖动此屏幕</small>
+            </button>
+          )}
+        </div>
+
+        <div className="direction-picker" aria-label="快速选择屏幕方向">
+          {(
+            [
+              ["left", "左侧"],
+              ["right", "右侧"],
+              ["up", "上方"],
+              ["down", "下方"]
+            ] as Array<[ScreenPosition, string]>
+          ).map(([position, label]) => (
+            <button
+              className={
+                props.state.mousePosition === position ? "active" : ""
+              }
+              type="button"
+              key={position}
+              disabled={!peer}
+              onClick={() => void choosePosition(position)}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+        {message && <small className="topology-message">{message}</small>}
+      </section>
+
+      <div className="mouse-metrics">
+        <section className="settings-group metric-card">
+          <span>穿越延时</span>
+          <strong>{latencyLabel}</strong>
+          <small>通过加密 UDP 往返时间计算，不依赖两台电脑的系统时钟。</small>
+        </section>
+        <section className="settings-group metric-card">
+          <span>当前状态</span>
+          <strong>
+            {!props.state.mouseShareEnabled
+              ? "已关闭"
+              : props.state.mouseSessionActive
+                ? "正在跨屏控制"
+                : online
+                  ? "等待鼠标到达屏幕边缘"
+                  : "等待另一台电脑上线"}
+          </strong>
+          <small>
+            {props.state.mouseShareEnabled &&
+            !props.state.mouseListenerStarted
+              ? "鼠标监听启动失败；请检查系统辅助功能权限，然后关闭并重新开启共享。"
+              : props.state.mouseListenerStarted
+              ? "鼠标监听已按需启动；本机物理输入始终优先。"
+              : "首次开启后才会启动鼠标监听，不开启时没有额外轮询。"}
+          </small>
+        </section>
+      </div>
+
+      <section className="mouse-support-note">
+        当前仅转发鼠标移动、左键、右键、滚轮滚动和滚轮按下；键盘不会跨设备发送。
+      </section>
+    </div>
+  );
+}
+
 function SettingsPanel(props: {
   state: UiState;
   diagnosticsMessage: string;
@@ -499,18 +743,24 @@ function SettingsPanel(props: {
 }): React.JSX.Element {
   const [copy, setCopy] = useState(props.state.copyShortcut);
   const [paste, setPaste] = useState(props.state.pasteShortcut);
+  const [mouse, setMouse] = useState(props.state.mouseShortcut);
   const [message, setMessage] = useState("");
   const isMac = navigator.userAgent.includes("Mac");
 
   useEffect(() => {
     setCopy(props.state.copyShortcut);
     setPaste(props.state.pasteShortcut);
-  }, [props.state.copyShortcut, props.state.pasteShortcut]);
+    setMouse(props.state.mouseShortcut);
+  }, [
+    props.state.copyShortcut,
+    props.state.pasteShortcut,
+    props.state.mouseShortcut
+  ]);
 
   async function save(): Promise<void> {
     setMessage("正在保存");
     try {
-      await crosscopy.setShortcuts(copy, paste);
+      await crosscopy.setShortcuts(copy, paste, mouse);
       setMessage("快捷键已生效");
     } catch (reason) {
       setMessage(typeof reason === "string" ? reason : "快捷键保存失败");
@@ -530,6 +780,11 @@ function SettingsPanel(props: {
         <div className="shortcut-grid">
           <ShortcutInput label="跨设备复制" value={copy} onChange={setCopy} />
           <ShortcutInput label="跨设备粘贴" value={paste} onChange={setPaste} />
+          <ShortcutInput
+            label="开启或关闭鼠标共享"
+            value={mouse}
+            onChange={setMouse}
+          />
         </div>
         <div className="settings-actions">
           <button className="primary-button" type="button" onClick={() => void save()}>
@@ -560,7 +815,7 @@ function SettingsPanel(props: {
         <section className="settings-group settings-row">
           <span>
             <strong>辅助功能权限</strong>
-            <small>只用于向当前应用发送一次原生复制或粘贴按键</small>
+            <small>用于跨设备快捷键和鼠标控制，不会转发键盘输入</small>
           </span>
           <div className="diagnostics-setting">
             <button

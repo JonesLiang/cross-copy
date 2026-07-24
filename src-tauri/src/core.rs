@@ -4,8 +4,11 @@ use crate::{
     },
     logger::{masked_ip, Logger},
     model::{
-        Activity, ClipboardPayload, DiscoveryPacket, Peer, PeerView, TransferProgress, UiState,
+        Activity, ClipboardPayload, DiscoveryPacket, Peer, PeerView, ScreenPosition,
+        TransferProgress, UiState,
     },
+    mouse_hook::SYNTHETIC_INPUT_MARKER,
+    mouse_share::{MouseShare, MouseSignal, OutboundMouseSignal},
     store::Store,
 };
 #[cfg(target_os = "windows")]
@@ -40,7 +43,7 @@ use tokio::{
     fs::{self, File},
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
-    sync::Notify,
+    sync::{mpsc, Notify},
 };
 use uuid::Uuid;
 use walkdir::WalkDir;
@@ -56,7 +59,7 @@ const ONLINE_WINDOW_MS: u64 = 35_000;
 const CLIPBOARD_RETRY_ATTEMPTS: usize = 16;
 const CLIPBOARD_RETRY_DELAY_MS: u64 = 50;
 const ACTIVE_DISCOVERY_MS: u64 = 30_000;
-const SYNTHETIC_INPUT_MARKER: usize = 0x4352_4f53_5343_4f50;
+const MOUSE_PROTOCOL: u8 = 2;
 
 #[derive(Clone)]
 struct SeenPeer {
@@ -121,10 +124,31 @@ enum UdpPairMessage {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 enum SecureMessage {
-    Clipboard { payload: ClipboardPayload },
-    Pull { transfer_id: String },
-    Manifest { entries: Vec<FileEntry> },
-    Error { message: String },
+    Clipboard {
+        payload: ClipboardPayload,
+    },
+    Pull {
+        transfer_id: String,
+    },
+    Manifest {
+        entries: Vec<FileEntry>,
+    },
+    MouseConfig {
+        enabled: bool,
+        position: ScreenPosition,
+    },
+    Error {
+        message: String,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UdpMousePacket {
+    app: String,
+    protocol: u8,
+    sender_id: String,
+    envelope: Envelope,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -183,12 +207,18 @@ pub struct Core {
     awake_until: AtomicU64,
     last_discovery_response: AtomicU64,
     last_progress_emit: AtomicU64,
+    last_mouse_state_emit: AtomicU64,
     discovery_wake: Notify,
     port: AtomicU64,
+    mouse: Arc<MouseShare>,
+    mouse_receiver: Mutex<Option<mpsc::Receiver<OutboundMouseSignal>>>,
+    mouse_socket: Mutex<Option<Arc<UdpSocket>>>,
 }
 
 impl Core {
     pub fn new(store: Arc<Store>, logger: Arc<Logger>, app: AppHandle) -> Arc<Self> {
+        let (mouse_sender, mouse_receiver) = mpsc::channel(512);
+        let mouse = MouseShare::new(Arc::clone(&logger), mouse_sender);
         Arc::new(Self {
             store,
             app,
@@ -203,8 +233,12 @@ impl Core {
             awake_until: AtomicU64::new(now_ms() + ACTIVE_DISCOVERY_MS),
             last_discovery_response: AtomicU64::new(0),
             last_progress_emit: AtomicU64::new(0),
+            last_mouse_state_emit: AtomicU64::new(0),
             discovery_wake: Notify::new(),
             port: AtomicU64::new(0),
+            mouse,
+            mouse_receiver: Mutex::new(Some(mouse_receiver)),
+            mouse_socket: Mutex::new(None),
         })
     }
 
@@ -256,6 +290,8 @@ impl Core {
             }
         });
         self.start_discovery().await?;
+        self.start_mouse_outbound();
+        self.refresh_mouse_runtime();
         Ok(())
     }
 
@@ -270,6 +306,12 @@ impl Core {
             launch_at_login: settings.launch_at_login,
             copy_shortcut: settings.copy_shortcut,
             paste_shortcut: settings.paste_shortcut,
+            mouse_share_enabled: settings.mouse_share_enabled,
+            mouse_shortcut: settings.mouse_shortcut,
+            mouse_position: settings.mouse_position,
+            mouse_latency_ms: self.mouse.latency_ms(),
+            mouse_session_active: self.mouse.session_active(),
+            mouse_listener_started: self.mouse.listener_started(),
             has_pending_clipboard: self
                 .pending_clipboard
                 .lock()
@@ -376,14 +418,53 @@ impl Core {
         Ok(())
     }
 
-    pub fn set_shortcuts(&self, copy: String, paste: String) -> Result<(), String> {
+    pub fn set_shortcuts(&self, copy: String, paste: String, mouse: String) -> Result<(), String> {
         self.store
             .update(|settings| {
                 settings.copy_shortcut = copy;
                 settings.paste_shortcut = paste;
+                settings.mouse_shortcut = mouse;
             })
             .map_err(|error| error.to_string())?;
         self.publish();
+        Ok(())
+    }
+
+    pub async fn set_mouse_share_enabled(self: &Arc<Self>, value: bool) -> Result<(), String> {
+        self.store
+            .update(|settings| settings.mouse_share_enabled = value)
+            .map_err(|error| error.to_string())?;
+        self.refresh_mouse_runtime();
+        self.publish();
+        self.broadcast_mouse_config().await;
+        self.logger.info(
+            "mouse_share_toggled",
+            format!("enabled={value} source=local"),
+        );
+        Ok(())
+    }
+
+    pub async fn toggle_mouse_share(self: &Arc<Self>) {
+        let value = !self.store.get().mouse_share_enabled;
+        if let Err(error) = self.set_mouse_share_enabled(value).await {
+            self.logger.error("mouse_share_toggle_failed", error);
+        }
+    }
+
+    pub async fn set_mouse_position(
+        self: &Arc<Self>,
+        position: ScreenPosition,
+    ) -> Result<(), String> {
+        self.store
+            .update(|settings| settings.mouse_position = position)
+            .map_err(|error| error.to_string())?;
+        self.refresh_mouse_runtime();
+        self.publish();
+        self.broadcast_mouse_config().await;
+        self.logger.info(
+            "mouse_position_changed",
+            format!("position={position:?} source=local"),
+        );
         Ok(())
     }
 
@@ -553,9 +634,16 @@ impl Core {
         self.store
             .update(|settings| settings.peers.retain(|peer| peer.id != peer_id))
             .map_err(|e| e.to_string())?;
+        self.refresh_mouse_runtime();
         self.publish();
         self.logger.info("peer_removed", "by_user=true");
         Ok(())
+    }
+
+    pub fn shutdown(&self) {
+        self.mouse.force_stop();
+        self.logger
+            .info("service_stop", "mouse_sessions_released=true");
     }
 
     pub fn export_diagnostics(&self) -> Result<String, String> {
@@ -569,8 +657,12 @@ impl Core {
             .filter(|peer| now.saturating_sub(peer.last_seen) < ONLINE_WINDOW_MS)
             .count();
         let summary = format!(
-            "sync_enabled={}\npaired_peers={}\nonline_peers={}\ndiscovery_port={}\ntransfer_port={}",
+            "sync_enabled={}\nmouse_share_enabled={}\nmouse_position={:?}\nmouse_listener_started={}\nmouse_latency_ms={:?}\npaired_peers={}\nonline_peers={}\ndiscovery_port={}\ntransfer_port={}",
             settings.sync_enabled,
+            settings.mouse_share_enabled,
+            settings.mouse_position,
+            self.mouse.listener_started(),
+            self.mouse.latency_ms(),
             settings.peers.len(),
             online,
             DISCOVERY_PORT,
@@ -606,6 +698,7 @@ impl Core {
             format!("port={DISCOVERY_PORT} multicast={MULTICAST} broadcast=true"),
         );
         let socket = Arc::new(socket);
+        *self.mouse_socket.lock().expect("mouse socket lock") = Some(Arc::clone(&socket));
 
         let receive_core = Arc::clone(self);
         let receive_socket = Arc::clone(&socket);
@@ -625,6 +718,8 @@ impl Core {
                     let packet_port = packet.port;
                     let packet_pairing = packet.pairing_salt.is_some();
                     let packet_id = packet.id.clone();
+                    let peer_mouse_enabled = packet.mouse_share_enabled;
+                    let peer_mouse_position = packet.mouse_position;
                     let is_paired = receive_core
                         .store
                         .get()
@@ -655,6 +750,9 @@ impl Core {
                         );
                     }
                     if is_paired {
+                        receive_core
+                            .reconcile_mouse_discovery(peer_mouse_enabled, peer_mouse_position);
+                        receive_core.refresh_mouse_runtime();
                         // A peer's idle beacon must not extend our active window:
                         // two peers would otherwise wake each other every 30
                         // seconds and never enter low-power discovery. Send at
@@ -676,6 +774,15 @@ impl Core {
                     let socket = Arc::clone(&receive_socket);
                     tauri::async_runtime::spawn(async move {
                         let _ = core.handle_udp_pair_request(&socket, source, request).await;
+                    });
+                    continue;
+                }
+                if let Ok(packet) = serde_json::from_slice::<UdpMousePacket>(&buffer[..size]) {
+                    let core = Arc::clone(&receive_core);
+                    tauri::async_runtime::spawn(async move {
+                        if let Err(error) = core.handle_udp_mouse(source, packet).await {
+                            core.logger.warn("mouse_packet_rejected", error);
+                        }
                     });
                 }
             }
@@ -713,6 +820,215 @@ impl Core {
         self.logger.info("network_wake", "active_for_seconds=30");
     }
 
+    fn start_mouse_outbound(self: &Arc<Self>) {
+        let Some(mut receiver) = self
+            .mouse_receiver
+            .lock()
+            .expect("mouse receiver lock")
+            .take()
+        else {
+            return;
+        };
+        let core = Arc::clone(self);
+        tauri::async_runtime::spawn(async move {
+            let mut last_error_log = 0_u64;
+            while let Some(outbound) = receiver.recv().await {
+                if let Err(error) = core.send_mouse_signal(outbound).await {
+                    let now = now_ms();
+                    if now.saturating_sub(last_error_log) >= 1_000 {
+                        last_error_log = now;
+                        core.logger.warn("mouse_send_failed", error);
+                    }
+                }
+                core.mouse.expire_unresponsive_outgoing();
+                core.publish_mouse_state_throttled();
+            }
+        });
+    }
+
+    fn refresh_mouse_runtime(&self) {
+        let settings = self.store.get();
+        let now = now_ms();
+        let discovered = self.discovered.lock().expect("discovery lock");
+        let target_peer = settings
+            .peers
+            .iter()
+            .find(|peer| {
+                discovered
+                    .get(&peer.id)
+                    .is_some_and(|seen| now.saturating_sub(seen.last_seen) < ONLINE_WINDOW_MS)
+            })
+            .map(|peer| peer.id.clone());
+        drop(discovered);
+        self.mouse.configure(
+            settings.mouse_share_enabled,
+            settings.mouse_position,
+            target_peer,
+        );
+    }
+
+    fn reconcile_mouse_discovery(&self, peer_enabled: bool, _peer_position: ScreenPosition) {
+        let settings = self.store.get();
+        if settings.mouse_share_enabled && !peer_enabled {
+            if self
+                .store
+                .update(|value| value.mouse_share_enabled = false)
+                .is_ok()
+            {
+                self.logger.info(
+                    "mouse_share_toggled",
+                    "enabled=false source=paired_peer_beacon",
+                );
+                self.refresh_mouse_runtime();
+                self.publish();
+            }
+        }
+    }
+
+    async fn broadcast_mouse_config(&self) {
+        self.wake_network();
+        let settings = self.store.get();
+        let discovered = self.discovered.lock().expect("discovery lock").clone();
+        let mut delivered = 0_u32;
+        for peer in &settings.peers {
+            let Some(seen) = discovered.get(&peer.id) else {
+                continue;
+            };
+            if now_ms().saturating_sub(seen.last_seen) >= ONLINE_WINDOW_MS {
+                continue;
+            }
+            let Ok(key) = decode_secret(&peer.secret) else {
+                continue;
+            };
+            let Ok(envelope) = encrypt(
+                &key,
+                &SecureMessage::MouseConfig {
+                    enabled: settings.mouse_share_enabled,
+                    position: settings.mouse_position,
+                },
+            ) else {
+                continue;
+            };
+            let address = SocketAddr::new(seen.host, seen.packet.port);
+            let Ok(Ok(mut stream)) =
+                tokio::time::timeout(Duration::from_millis(800), TcpStream::connect(address)).await
+            else {
+                continue;
+            };
+            if write_json(
+                &mut stream,
+                &WireMessage::Secure {
+                    sender_id: settings.device_id.clone(),
+                    envelope,
+                },
+            )
+            .await
+            .is_ok()
+            {
+                delivered += 1;
+            }
+        }
+        self.logger.info(
+            "mouse_config_broadcast",
+            format!(
+                "enabled={} position={:?} delivered={delivered}",
+                settings.mouse_share_enabled, settings.mouse_position
+            ),
+        );
+    }
+
+    async fn send_mouse_signal(&self, outbound: OutboundMouseSignal) -> Result<(), String> {
+        let settings = self.store.get();
+        if !settings.mouse_share_enabled {
+            return Ok(());
+        }
+        let peer = settings
+            .peers
+            .iter()
+            .find(|peer| peer.id == outbound.peer_id)
+            .ok_or("鼠标目标设备未配对")?;
+        let seen = self
+            .discovered
+            .lock()
+            .expect("discovery lock")
+            .get(&peer.id)
+            .cloned()
+            .ok_or("鼠标目标设备不在线")?;
+        if now_ms().saturating_sub(seen.last_seen) >= ONLINE_WINDOW_MS {
+            return Err("鼠标目标设备已离线".into());
+        }
+        let socket = self
+            .mouse_socket
+            .lock()
+            .expect("mouse socket lock")
+            .clone()
+            .ok_or("鼠标 UDP 通道尚未启动")?;
+        let key = decode_secret(&peer.secret)?;
+        let packet = UdpMousePacket {
+            app: "crosscopy".into(),
+            protocol: MOUSE_PROTOCOL,
+            sender_id: settings.device_id,
+            envelope: encrypt(&key, &outbound.signal)?,
+        };
+        let bytes = serde_json::to_vec(&packet).map_err(|error| error.to_string())?;
+        socket
+            .send_to(&bytes, SocketAddr::new(seen.host, DISCOVERY_PORT))
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    async fn handle_udp_mouse(
+        &self,
+        source: SocketAddr,
+        packet: UdpMousePacket,
+    ) -> Result<(), String> {
+        if packet.app != "crosscopy" || packet.protocol != MOUSE_PROTOCOL {
+            return Err("鼠标协议不兼容".into());
+        }
+        let peer = self
+            .store
+            .get()
+            .peers
+            .into_iter()
+            .find(|peer| peer.id == packet.sender_id)
+            .ok_or("鼠标数据来自未配对设备")?;
+        let key = decode_secret(&peer.secret)?;
+        let signal: MouseSignal = decrypt(&key, &packet.envelope)?;
+        self.discovered.lock().expect("discovery lock").insert(
+            peer.id.clone(),
+            SeenPeer {
+                packet: DiscoveryPacket {
+                    app: "crosscopy".into(),
+                    protocol: 1,
+                    id: peer.id.clone(),
+                    name: peer.name.clone(),
+                    port: TRANSFER_PORT,
+                    pairing_salt: None,
+                    pairing_expires_at: None,
+                    mouse_share_enabled: true,
+                    mouse_position: ScreenPosition::Right,
+                },
+                host: source.ip(),
+                last_seen: now_ms(),
+            },
+        );
+        for response in self.mouse.apply_remote(&peer.id, signal) {
+            self.send_mouse_signal(response).await?;
+        }
+        self.publish_mouse_state_throttled();
+        Ok(())
+    }
+
+    fn publish_mouse_state_throttled(&self) {
+        let now = now_ms();
+        let previous = self.last_mouse_state_emit.load(Ordering::Relaxed);
+        if now.saturating_sub(previous) >= 100 {
+            self.last_mouse_state_emit.store(now, Ordering::Relaxed);
+            self.publish();
+        }
+    }
+
     fn discovery_packet(&self) -> DiscoveryPacket {
         let settings = self.store.get();
         let mut pairing = self.pairing.lock().expect("pairing lock");
@@ -730,6 +1046,8 @@ impl Core {
             port: self.port.load(Ordering::Relaxed) as u16,
             pairing_salt: pairing.as_ref().map(|value| value.salt.clone()),
             pairing_expires_at: pairing.as_ref().map(|value| value.expires_at),
+            mouse_share_enabled: settings.mouse_share_enabled,
+            mouse_position: settings.mouse_position,
         }
     }
 
@@ -1119,6 +1437,8 @@ impl Core {
                             port: TRANSFER_PORT,
                             pairing_salt: None,
                             pairing_expires_at: None,
+                            mouse_share_enabled: false,
+                            mouse_position: ScreenPosition::Right,
                         },
                         host: source.ip(),
                         last_seen: now_ms(),
@@ -1136,6 +1456,24 @@ impl Core {
                             self.fail_transfer_progress(error);
                         }
                         result
+                    }
+                    SecureMessage::MouseConfig { enabled, position } => {
+                        self.store
+                            .update(|settings| {
+                                settings.mouse_share_enabled = enabled;
+                                settings.mouse_position = position.opposite();
+                            })
+                            .map_err(|error| error.to_string())?;
+                        self.refresh_mouse_runtime();
+                        self.publish();
+                        self.logger.info(
+                            "mouse_config_received",
+                            format!(
+                                "enabled={enabled} peer_position={position:?} local_position={:?}",
+                                position.opposite()
+                            ),
+                        );
+                        Ok(())
                     }
                     _ => Err("无效请求".into()),
                 }
@@ -1422,6 +1760,7 @@ impl Core {
                 settings.peers.push(peer);
             })
             .map_err(|e| e.to_string())?;
+        self.refresh_mouse_runtime();
         self.publish();
         Ok(())
     }
