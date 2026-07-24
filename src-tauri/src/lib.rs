@@ -190,9 +190,10 @@ pub fn run() {
             ]) {
                 logger.error("shortcut_registration_failed", error.to_string());
             }
+            let service_logger = Arc::clone(&logger);
             tauri::async_runtime::spawn(async move {
                 if let Err(error) = core.start().await {
-                    eprintln!("CrossCopy service failed: {error}");
+                    service_logger.error("service_start_failed", error);
                 }
             });
             let open = MenuItem::with_id(app, "open", "打开 CrossCopy", true, None::<&str>)?;
@@ -224,12 +225,10 @@ pub fn run() {
         })
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                api.prevent_close();
-                let window = window.clone();
-                tauri::async_runtime::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                    let _ = window.destroy();
-                });
+                if should_hide_on_close(window.label()) {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -261,4 +260,19 @@ fn show_or_create_window(app: &tauri::AppHandle) {
         .min_inner_size(760.0, 580.0)
         .center()
         .build();
+}
+
+fn should_hide_on_close(label: &str) -> bool {
+    label == "main"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_hide_on_close;
+
+    #[test]
+    fn only_main_window_stays_alive_when_closed() {
+        assert!(should_hide_on_close("main"));
+        assert!(!should_hide_on_close("transfer"));
+    }
 }
