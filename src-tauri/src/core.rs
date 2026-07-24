@@ -13,7 +13,7 @@ use aes_gcm::{
     Aes256Gcm, Nonce,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use clipboard_rs::{Clipboard, ClipboardContext, ContentFormat};
+use clipboard_rs::{Clipboard, ClipboardContent, ClipboardContext, ContentFormat};
 use enigo::{
     Direction::{Click, Press, Release},
     Enigo, Key, Keyboard, Settings as EnigoSettings,
@@ -138,8 +138,7 @@ enum PendingClipboard {
 }
 
 enum ClipboardSnapshot {
-    Text(String),
-    Files(Vec<String>),
+    Contents(Vec<ClipboardContent>),
     Empty,
 }
 
@@ -365,7 +364,7 @@ impl Core {
             return;
         }
         self.wake_network();
-        let original = match capture_clipboard() {
+        let original = match capture_clipboard(&self.logger).await {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 self.add_activity("system", "无法保护本机剪贴板", &error, "error");
@@ -416,7 +415,7 @@ impl Core {
             return;
         }
         self.wake_network();
-        let original = match capture_clipboard() {
+        let original = match capture_clipboard(&self.logger).await {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 self.add_activity("system", "无法保护本机剪贴板", &error, "error");
@@ -1499,35 +1498,58 @@ async fn read_current_clipboard(logger: &Logger) -> Result<LocalClipboard, Strin
     Err(last_error)
 }
 
-fn capture_clipboard() -> Result<ClipboardSnapshot, String> {
-    let context = ClipboardContext::new().map_err(|error| error.to_string())?;
-    if context.has(ContentFormat::Files) {
-        return context
-            .get_files()
-            .map(ClipboardSnapshot::Files)
-            .map_err(|error| error.to_string());
+async fn capture_clipboard(logger: &Logger) -> Result<ClipboardSnapshot, String> {
+    let mut last_error = String::new();
+    for attempt in 1..=CLIPBOARD_RETRY_ATTEMPTS {
+        let result = (|| {
+            let context = ClipboardContext::new().map_err(|error| error.to_string())?;
+            let formats = [
+                ContentFormat::Image,
+                ContentFormat::Files,
+                ContentFormat::Text,
+                ContentFormat::Rtf,
+                ContentFormat::Html,
+            ];
+            let contents = context.get(&formats).map_err(|error| error.to_string())?;
+            if !contents.is_empty() {
+                return Ok(ClipboardSnapshot::Contents(contents));
+            }
+            if context
+                .available_formats()
+                .map_err(|error| error.to_string())?
+                .is_empty()
+            {
+                Ok(ClipboardSnapshot::Empty)
+            } else {
+                Err("本机剪贴板暂时被其他程序占用".into())
+            }
+        })();
+        match result {
+            Ok(snapshot) => {
+                logger.info("clipboard_snapshot_captured", format!("attempt={attempt}"));
+                return Ok(snapshot);
+            }
+            Err(error) => last_error = error,
+        }
+        if attempt < CLIPBOARD_RETRY_ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(CLIPBOARD_RETRY_DELAY_MS)).await;
+        }
     }
-    if context.has(ContentFormat::Text) {
-        return context
-            .get_text()
-            .map(ClipboardSnapshot::Text)
-            .map_err(|error| error.to_string());
-    }
-    if context
-        .available_formats()
-        .map_err(|error| error.to_string())?
-        .is_empty()
-    {
-        Ok(ClipboardSnapshot::Empty)
-    } else {
-        Err("当前本机剪贴板包含暂不支持保护的格式，请先复制一段文字后重试".into())
-    }
+    logger.warn(
+        "clipboard_snapshot_failed",
+        format!("attempts={} error={last_error}", CLIPBOARD_RETRY_ATTEMPTS),
+    );
+    Err(format!("保护本机剪贴板失败：{last_error}"))
 }
 
 async fn restore_clipboard(snapshot: ClipboardSnapshot, logger: &Logger) -> Result<(), String> {
     match snapshot {
-        ClipboardSnapshot::Text(text) => write_clipboard_text(&text, logger).await,
-        ClipboardSnapshot::Files(files) => write_clipboard_files(&files, logger).await,
+        ClipboardSnapshot::Contents(contents) => {
+            let context = ClipboardContext::new().map_err(|error| error.to_string())?;
+            context.set(contents).map_err(|error| error.to_string())?;
+            logger.info("clipboard_snapshot_restored", "verified=true");
+            Ok(())
+        }
         ClipboardSnapshot::Empty => ClipboardContext::new()
             .map_err(|error| error.to_string())?
             .clear()
@@ -1610,8 +1632,22 @@ async fn write_clipboard_files(files: &[String], logger: &Logger) -> Result<(), 
 }
 
 fn simulate_native_shortcut(key: char) -> Result<(), String> {
-    let mut enigo = Enigo::new(&EnigoSettings::default())
-        .map_err(|error| format!("无法控制当前应用的键盘输入，请检查系统辅助功能权限：{error}"))?;
+    let mut enigo = match Enigo::new(&EnigoSettings::default()) {
+        Ok(enigo) => enigo,
+        Err(error) => {
+            #[cfg(target_os = "macos")]
+            {
+                open_accessibility_settings();
+                return Err(format!(
+                    "已打开系统“辅助功能”设置。请允许 CrossCopy，然后完全退出并重新打开：{error}"
+                ));
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                return Err(format!("无法控制当前应用的键盘输入：{error}"));
+            }
+        }
+    };
     #[cfg(target_os = "macos")]
     let modifier = Key::Meta;
     #[cfg(not(target_os = "macos"))]
@@ -1628,6 +1664,13 @@ fn simulate_native_shortcut(key: char) -> Result<(), String> {
         .map_err(|error| error.to_string());
     click_result?;
     release_result
+}
+
+#[cfg(target_os = "macos")]
+fn open_accessibility_settings() {
+    let _ = std::process::Command::new("open")
+        .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
+        .spawn();
 }
 
 fn discovery_broadcast_targets() -> Vec<SocketAddr> {

@@ -1,6 +1,6 @@
 {
   "name": "crosscopy",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Fast, private LAN clipboard sync for macOS and Windows",
   "type": "module",
   "scripts": {
