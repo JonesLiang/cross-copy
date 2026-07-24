@@ -655,16 +655,17 @@ impl Core {
                         );
                     }
                     if is_paired {
-                        if now_ms() > receive_core.awake_until.load(Ordering::Relaxed) {
-                            receive_core.wake_network();
-                        } else {
-                            let last = receive_core.last_discovery_response.load(Ordering::Relaxed);
-                            if now_ms().saturating_sub(last) > 2_000 {
-                                receive_core
-                                    .last_discovery_response
-                                    .store(now_ms(), Ordering::Relaxed);
-                                receive_core.discovery_wake.notify_one();
-                            }
+                        // A peer's idle beacon must not extend our active window:
+                        // two peers would otherwise wake each other every 30
+                        // seconds and never enter low-power discovery. Send at
+                        // most one immediate response and remain idle.
+                        let now = now_ms();
+                        let last = receive_core.last_discovery_response.load(Ordering::Relaxed);
+                        if now.saturating_sub(last) > 2_000 {
+                            receive_core
+                                .last_discovery_response
+                                .store(now, Ordering::Relaxed);
+                            receive_core.discovery_wake.notify_one();
                         }
                     }
                     receive_core.publish();
