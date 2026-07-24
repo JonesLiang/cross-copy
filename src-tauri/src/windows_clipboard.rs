@@ -79,7 +79,7 @@ impl<'a> ClipboardRestoreGuard<'a> {
         for attempt in 1..=CLIPBOARD_RETRY_ATTEMPTS {
             let result = match self.snapshot.as_ref().expect("snapshot checked") {
                 OleSnapshot::Data(data) => unsafe {
-                    OleSetClipboard(data)?;
+                    OleSetClipboard(data).map_err(|error| error.to_string())?;
                     // The STA thread is intentionally short-lived. Materialize
                     // the restored IDataObject before it exits so Windows does
                     // not depend on this thread remaining a clipboard owner.
