@@ -8,6 +8,9 @@ use crate::{
     },
     store::Store,
 };
+#[cfg(target_os = "windows")]
+#[path = "windows_clipboard.rs"]
+mod windows_clipboard;
 use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Nonce,
@@ -41,6 +44,8 @@ use tokio::{
 };
 use uuid::Uuid;
 use walkdir::WalkDir;
+#[cfg(target_os = "windows")]
+use windows_clipboard::{windows_capture_selection, windows_paste_pending};
 
 const DISCOVERY_PORT: u16 = 47653;
 const TRANSFER_PORT: u16 = 47654;
@@ -396,36 +401,48 @@ impl Core {
             return;
         }
         self.wake_network();
-        let original = match capture_clipboard(&self.logger).await {
-            Ok(snapshot) => snapshot,
+        #[cfg(target_os = "windows")]
+        let event = match windows_capture_selection(Arc::clone(&self.logger)).await {
+            Ok(event) => event,
             Err(error) => {
-                self.add_activity("system", "无法保护本机剪贴板", &error, "error");
+                self.logger.error("shortcut_copy_failed", &error);
+                self.add_activity("system", "无法复制", &error, "error");
                 return;
             }
         };
-        self.logger.info(
-            "shortcut_copy_simulation_started",
-            native_shortcut_dispatch_detail(),
-        );
-        if let Err(error) = simulate_native_shortcut(&self.app, 'c').await {
-            self.logger.error("shortcut_copy_simulation_failed", &error);
-            self.add_activity("system", "无法复制", &error, "error");
-            return;
-        }
-        self.logger
-            .info("shortcut_copy_simulation_completed", "success=true");
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let event = read_current_clipboard(&self.logger).await;
-        if let Err(error) = restore_clipboard(original, &self.logger).await {
-            self.logger.error("clipboard_restore_failed", &error);
-            self.add_activity("system", "恢复本机剪贴板失败", &error, "error");
-            return;
-        }
-        let event = match event {
-            Ok(event) => event,
-            Err(error) => {
-                self.add_activity("system", "未读取到内容", &error, "error");
+        #[cfg(not(target_os = "windows"))]
+        let event = {
+            let original = match capture_clipboard(&self.logger).await {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    self.add_activity("system", "无法保护本机剪贴板", &error, "error");
+                    return;
+                }
+            };
+            self.logger.info(
+                "shortcut_copy_simulation_started",
+                native_shortcut_dispatch_detail(),
+            );
+            if let Err(error) = simulate_native_shortcut(&self.app, 'c').await {
+                self.logger.error("shortcut_copy_simulation_failed", &error);
+                self.add_activity("system", "无法复制", &error, "error");
                 return;
+            }
+            self.logger
+                .info("shortcut_copy_simulation_completed", "success=true");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let event = read_current_clipboard(&self.logger).await;
+            if let Err(error) = restore_clipboard(original, &self.logger).await {
+                self.logger.error("clipboard_restore_failed", &error);
+                self.add_activity("system", "恢复本机剪贴板失败", &error, "error");
+                return;
+            }
+            match event {
+                Ok(event) => event,
+                Err(error) => {
+                    self.add_activity("system", "未读取到内容", &error, "error");
+                    return;
+                }
             }
         };
         let peer_is_known_online = self
@@ -461,56 +478,65 @@ impl Core {
             return;
         }
         self.wake_network();
-        let original = match capture_clipboard(&self.logger).await {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                self.add_activity("system", "无法保护本机剪贴板", &error, "error");
-                return;
-            }
-        };
         let pending = self
             .pending_clipboard
             .lock()
             .expect("pending clipboard lock")
             .clone();
-        let result = match pending {
-            Some(PendingClipboard::Text(text)) => write_clipboard_text(&text, &self.logger).await,
-            Some(PendingClipboard::Files(files)) => {
-                write_clipboard_files(&files, &self.logger).await
-            }
-            None => {
-                self.add_activity(
-                    "system",
-                    "没有待粘贴内容",
-                    "请先在另一台电脑触发跨设备复制",
-                    "error",
-                );
+        let Some(pending) = pending else {
+            self.add_activity(
+                "system",
+                "没有待粘贴内容",
+                "请先在另一台电脑触发跨设备复制",
+                "error",
+            );
+            return;
+        };
+        #[cfg(target_os = "windows")]
+        {
+            if let Err(error) = windows_paste_pending(pending, Arc::clone(&self.logger)).await {
+                self.logger.error("shortcut_paste_failed", &error);
+                self.add_activity("system", "无法粘贴", &error, "error");
                 return;
             }
-        };
-        if let Err(error) = result {
-            let _ = restore_clipboard(original, &self.logger).await;
-            self.add_activity("system", "写入剪贴板失败", &error, "error");
-            return;
         }
-        self.logger.info(
-            "shortcut_paste_simulation_started",
-            native_shortcut_dispatch_detail(),
-        );
-        if let Err(error) = simulate_native_shortcut(&self.app, 'v').await {
+        #[cfg(not(target_os = "windows"))]
+        {
+            let original = match capture_clipboard(&self.logger).await {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    self.add_activity("system", "无法保护本机剪贴板", &error, "error");
+                    return;
+                }
+            };
+            let result = match pending {
+                PendingClipboard::Text(text) => write_clipboard_text(&text, &self.logger).await,
+                PendingClipboard::Files(files) => write_clipboard_files(&files, &self.logger).await,
+            };
+            if let Err(error) = result {
+                let _ = restore_clipboard(original, &self.logger).await;
+                self.add_activity("system", "写入剪贴板失败", &error, "error");
+                return;
+            }
+            self.logger.info(
+                "shortcut_paste_simulation_started",
+                native_shortcut_dispatch_detail(),
+            );
+            if let Err(error) = simulate_native_shortcut(&self.app, 'v').await {
+                self.logger
+                    .error("shortcut_paste_simulation_failed", &error);
+                self.add_activity("system", "无法粘贴", &error, "error");
+                let _ = restore_clipboard(original, &self.logger).await;
+                return;
+            }
             self.logger
-                .error("shortcut_paste_simulation_failed", &error);
-            self.add_activity("system", "无法粘贴", &error, "error");
-            let _ = restore_clipboard(original, &self.logger).await;
-            return;
-        }
-        self.logger
-            .info("shortcut_paste_simulation_completed", "success=true");
-        tokio::time::sleep(Duration::from_millis(600)).await;
-        if let Err(error) = restore_clipboard(original, &self.logger).await {
-            self.logger.error("clipboard_restore_failed", &error);
-            self.add_activity("system", "恢复本机剪贴板失败", &error, "error");
-            return;
+                .info("shortcut_paste_simulation_completed", "success=true");
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            if let Err(error) = restore_clipboard(original, &self.logger).await {
+                self.logger.error("clipboard_restore_failed", &error);
+                self.add_activity("system", "恢复本机剪贴板失败", &error, "error");
+                return;
+            }
         }
         self.add_activity("system", "已触发跨设备粘贴", "内容已粘贴到当前应用", "done");
     }
