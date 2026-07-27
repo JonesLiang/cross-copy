@@ -25,7 +25,9 @@ export type FsEntry = {
 export type FsRequest =
   | { type: "roots" }
   | { type: "list"; path: string }
+  | { type: "metadata"; path: string }
   | { type: "read"; path: string }
+  | { type: "readRange"; path: string; offset: number; length: number }
   | {
       type: "write";
       path: string;
@@ -35,6 +37,7 @@ export type FsRequest =
   | { type: "createDirectory"; path: string }
   | { type: "createFile"; path: string }
   | { type: "rename"; path: string; destination: string }
+  | { type: "copy"; path: string; destination: string }
   | { type: "remove"; path: string; recursive: boolean };
 
 export type FsResponse =
@@ -45,6 +48,14 @@ export type FsResponse =
       data: string;
       modifiedAt: number | null;
       size: number;
+    }
+  | {
+      type: "fileRange";
+      path: string;
+      data: string;
+      offset: number;
+      totalSize: number;
+      eof: boolean;
     }
   | { type: "done"; entry: FsEntry | null }
   | { type: "error"; message: string };

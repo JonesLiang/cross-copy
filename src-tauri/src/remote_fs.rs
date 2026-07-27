@@ -11,6 +11,7 @@ use tokio::{
 };
 
 const MAX_EDITOR_FILE_SIZE: u64 = 16 * 1024 * 1024;
+const MAX_RANGE_SIZE: u64 = 4 * 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -32,8 +33,16 @@ pub enum FsRequest {
     List {
         path: String,
     },
+    Metadata {
+        path: String,
+    },
     Read {
         path: String,
+    },
+    ReadRange {
+        path: String,
+        offset: u64,
+        length: u64,
     },
     Write {
         path: String,
@@ -47,6 +56,10 @@ pub enum FsRequest {
         path: String,
     },
     Rename {
+        path: String,
+        destination: String,
+    },
+    Copy {
         path: String,
         destination: String,
     },
@@ -67,6 +80,13 @@ pub enum FsResponse {
         data: String,
         modified_at: Option<u64>,
         size: u64,
+    },
+    FileRange {
+        path: String,
+        data: String,
+        offset: u64,
+        total_size: u64,
+        eof: bool,
     },
     Done {
         entry: Option<FsEntry>,
@@ -129,6 +149,12 @@ async fn handle_inner(request: FsRequest) -> Result<FsResponse, String> {
             });
             Ok(FsResponse::Entries { entries })
         }
+        FsRequest::Metadata { path } => {
+            let path = checked_absolute(&path)?;
+            Ok(FsResponse::Done {
+                entry: Some(entry_from_path(path).await?),
+            })
+        }
         FsRequest::Read { path } => {
             let path = checked_absolute(&path)?;
             let metadata = fs::metadata(&path)
@@ -155,6 +181,41 @@ async fn handle_inner(request: FsRequest) -> Result<FsResponse, String> {
                 data: STANDARD.encode(bytes),
                 modified_at: modified_at(&metadata),
                 size: metadata.len(),
+            })
+        }
+        FsRequest::ReadRange {
+            path,
+            offset,
+            length,
+        } => {
+            if length == 0 || length > MAX_RANGE_SIZE {
+                return Err("单次文件分片必须在 1 字节到 4 MB 之间".into());
+            }
+            let path = checked_absolute(&path)?;
+            let metadata = fs::metadata(&path)
+                .await
+                .map_err(|error| friendly_io_error("无法读取文件", error))?;
+            if !metadata.is_file() {
+                return Err("只能读取普通文件".into());
+            }
+            let mut file = fs::File::open(&path)
+                .await
+                .map_err(|error| friendly_io_error("无法打开文件", error))?;
+            file.seek(std::io::SeekFrom::Start(offset))
+                .await
+                .map_err(|error| friendly_io_error("无法定位文件", error))?;
+            let available = metadata.len().saturating_sub(offset);
+            let read_size = available.min(length) as usize;
+            let mut bytes = vec![0_u8; read_size];
+            file.read_exact(&mut bytes)
+                .await
+                .map_err(|error| friendly_io_error("无法读取文件分片", error))?;
+            Ok(FsResponse::FileRange {
+                path: path_to_wire(&path),
+                data: STANDARD.encode(bytes),
+                offset,
+                total_size: metadata.len(),
+                eof: offset.saturating_add(read_size as u64) >= metadata.len(),
             })
         }
         FsRequest::Write {
@@ -198,6 +259,14 @@ async fn handle_inner(request: FsRequest) -> Result<FsResponse, String> {
                 entry: Some(entry_from_path(destination).await?),
             })
         }
+        FsRequest::Copy { path, destination } => {
+            let path = checked_absolute(&path)?;
+            let destination = checked_absolute(&destination)?;
+            copy_path(&path, &destination).await?;
+            Ok(FsResponse::Done {
+                entry: Some(entry_from_path(destination).await?),
+            })
+        }
         FsRequest::Remove { path, recursive } => {
             let path = checked_absolute(&path)?;
             if is_filesystem_root(&path) {
@@ -219,6 +288,54 @@ async fn handle_inner(request: FsRequest) -> Result<FsResponse, String> {
             Ok(FsResponse::Done { entry: None })
         }
     }
+}
+
+async fn copy_path(source: &Path, destination: &Path) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(source)
+        .await
+        .map_err(|error| friendly_io_error("无法读取复制源", error))?;
+    if metadata.is_file() || metadata.file_type().is_symlink() {
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)
+                .await
+                .map_err(|error| friendly_io_error("无法创建目标文件夹", error))?;
+        }
+        fs::copy(source, destination)
+            .await
+            .map_err(|error| friendly_io_error("无法复制文件", error))?;
+        return Ok(());
+    }
+    fs::create_dir(destination)
+        .await
+        .map_err(|error| friendly_io_error("无法创建目标文件夹", error))?;
+    let mut pending = vec![(source.to_path_buf(), destination.to_path_buf())];
+    while let Some((current_source, current_destination)) = pending.pop() {
+        let mut reader = fs::read_dir(&current_source)
+            .await
+            .map_err(|error| friendly_io_error("无法读取源文件夹", error))?;
+        while let Some(item) = reader
+            .next_entry()
+            .await
+            .map_err(|error| friendly_io_error("无法读取源文件夹", error))?
+        {
+            let target = current_destination.join(item.file_name());
+            let item_metadata = item
+                .metadata()
+                .await
+                .map_err(|error| friendly_io_error("无法读取文件信息", error))?;
+            if item_metadata.is_dir() {
+                fs::create_dir(&target)
+                    .await
+                    .map_err(|error| friendly_io_error("无法创建目标文件夹", error))?;
+                pending.push((item.path(), target));
+            } else {
+                fs::copy(item.path(), target)
+                    .await
+                    .map_err(|error| friendly_io_error("无法复制文件", error))?;
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn write_bytes_inner(
