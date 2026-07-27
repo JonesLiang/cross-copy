@@ -192,11 +192,15 @@ jobs:
         run: |
           VERSION="$(node -p "require('./package.json').version")"
           TAG="v$VERSION"
+          if ! git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            git tag "$TAG" "${{ github.sha }}"
+            git push origin "refs/tags/$TAG"
+          fi
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" release-assets/* --clobber
           else
             gh release create "$TAG" release-assets/* \
-              --target "${{ github.sha }}" \
+              --verify-tag \
               --title "CrossCopy $TAG" \
               --generate-notes \
               --latest
