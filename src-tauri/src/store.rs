@@ -31,6 +31,7 @@ impl Store {
                 copy_shortcut: default_copy_shortcut(),
                 paste_shortcut: default_paste_shortcut(),
                 mouse_share_enabled: false,
+                mouse_extreme_performance: false,
                 mouse_shortcut: default_mouse_shortcut(),
                 mouse_position: ScreenPosition::Right,
             });

@@ -2,19 +2,27 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   ArrowDownLeft,
+  ArrowLeft,
   ArrowUpRight,
   Check,
   Clipboard,
   Copy,
   Desktop,
   DownloadSimple,
+  File,
+  Folder,
+  FolderOpen,
   FileText,
   Gear,
   Keyboard,
   Lightning,
   Link,
   MouseSimple,
+  PencilSimple,
   Plus,
+  HardDrives,
+  FloppyDisk,
+  ArrowsClockwise,
   ShieldCheck,
   Trash,
   WarningCircle,
@@ -25,7 +33,14 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check, type Update } from "@tauri-apps/plugin-updater";
-import type { DisplayInfo, ScreenPosition, UiState } from "./types";
+import type {
+  DisplayInfo,
+  FsEntry,
+  FsRequest,
+  FsResponse,
+  ScreenPosition,
+  UiState
+} from "./types";
 import "./styles.css";
 
 const crosscopy = {
@@ -50,6 +65,8 @@ const crosscopy = {
     invoke<void>("set_shortcuts", { copy, paste, mouse }),
   setMouseShareEnabled: (value: boolean) =>
     invoke<void>("set_mouse_share_enabled", { value }),
+  setMouseExtremePerformance: (value: boolean) =>
+    invoke<void>("set_mouse_extreme_performance", { value }),
   setMousePosition: (position: ScreenPosition) =>
     invoke<void>("set_mouse_position", { position }),
   setPeerScreenPosition: (peerId: string, position: ScreenPosition) =>
@@ -57,13 +74,19 @@ const crosscopy = {
   setPeerPermissions: (
     peerId: string,
     clipboardAllowed: boolean,
-    mouseAllowed: boolean
+    mouseAllowed: boolean,
+    filesystemAllowed: boolean
   ) =>
     invoke<void>("set_peer_permissions", {
       peerId,
       clipboardAllowed,
-      mouseAllowed
+      mouseAllowed,
+      filesystemAllowed
     }),
+  filesystemRequest: (peerId: string, request: FsRequest) =>
+    invoke<FsResponse>("filesystem_request", { peerId, request }),
+  filesystemDownload: (peerId: string, paths: string[]) =>
+    invoke<string>("filesystem_download", { peerId, paths }),
   setPeerMouseDpi: (peerId: string, dpi: number) =>
     invoke<void>("set_peer_mouse_dpi", { peerId, dpi }),
   switchMouseToScreen: (screenNumber: number) =>
@@ -78,6 +101,7 @@ const EMPTY_STATE: UiState = {
   copyShortcut: "Ctrl+Shift+C",
   pasteShortcut: "Ctrl+Shift+V",
   mouseShareEnabled: false,
+  mouseExtremePerformance: false,
   mouseShortcut: "Ctrl+Shift+M",
   mousePosition: "right",
   mouseLatencyMs: null,
@@ -116,7 +140,9 @@ function App(): React.JSX.Element {
   const [appVersion, setAppVersion] = useState("");
   const [updateState, setUpdateState] = useState<UpdateState>({ kind: "idle" });
   const availableUpdate = useRef<Update | null>(null);
-  const [view, setView] = useState<"clipboard" | "mouse" | "settings">(
+  const [view, setView] = useState<
+    "clipboard" | "filesystem" | "mouse" | "settings"
+  >(
     "clipboard"
   );
 
@@ -346,6 +372,14 @@ function App(): React.JSX.Element {
             剪贴板
           </button>
           <button
+            className={`nav-item ${view === "filesystem" ? "active" : ""}`}
+            type="button"
+            onClick={() => setView("filesystem")}
+          >
+            <HardDrives size={18} />
+            文件系统
+          </button>
+          <button
             className={`nav-item ${view === "mouse" ? "active" : ""}`}
             type="button"
             onClick={() => setView("mouse")}
@@ -388,6 +422,8 @@ function App(): React.JSX.Element {
             <h1>
               {view === "clipboard"
                 ? "剪贴板"
+                : view === "filesystem"
+                  ? "文件系统"
                 : view === "mouse"
                   ? "鼠标共享"
                   : "设置"}
@@ -395,6 +431,8 @@ function App(): React.JSX.Element {
             <p>
               {view === "clipboard"
                 ? "使用专用快捷键发送和粘贴，不影响普通剪贴板"
+                : view === "filesystem"
+                  ? "直接浏览和管理已授权电脑上的文件"
                 : view === "mouse"
                   ? "把另一台电脑放到逻辑方位，鼠标即可跨越屏幕"
                 : "配置快捷键、后台启动、系统权限和诊断"}
@@ -420,6 +458,8 @@ function App(): React.JSX.Element {
           />
         ) : view === "mouse" ? (
           <MousePanel state={state} />
+        ) : view === "filesystem" ? (
+          <FilesystemPanel state={state} />
         ) : !ready ? (
           <LoadingState />
         ) : (
@@ -871,6 +911,369 @@ function PeerDisplayGlyph(props: {
   );
 }
 
+type RemoteEditor = {
+  path: string;
+  name: string;
+  content: string;
+  modifiedAt: number | null;
+};
+
+function FilesystemPanel(props: { state: UiState }): React.JSX.Element {
+  const availablePeers = props.state.peers.filter(
+    (peer) => peer.online && peer.filesystemAllowed
+  );
+  const [peerId, setPeerId] = useState(availablePeers[0]?.id ?? "");
+  const [path, setPath] = useState<string | null>(null);
+  const [entries, setEntries] = useState<FsEntry[]>([]);
+  const [selectedPath, setSelectedPath] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [message, setMessage] = useState("");
+  const [editor, setEditor] = useState<RemoteEditor | null>(null);
+  const [saving, setSaving] = useState(false);
+
+  const peer =
+    availablePeers.find((candidate) => candidate.id === peerId) ??
+    availablePeers[0];
+
+  useEffect(() => {
+    if (!peer && peerId) setPeerId("");
+    if (peer && peer.id !== peerId) setPeerId(peer.id);
+  }, [peer, peerId]);
+
+  useEffect(() => {
+    setPath(null);
+    setSelectedPath("");
+  }, [peerId]);
+
+  useEffect(() => {
+    if (!peer) {
+      setEntries([]);
+      return;
+    }
+    let cancelled = false;
+    setLoading(true);
+    setMessage("");
+    const request: FsRequest = path
+      ? { type: "list", path }
+      : { type: "roots" };
+    void crosscopy
+      .filesystemRequest(peer.id, request)
+      .then((response) => {
+        if (cancelled) return;
+        if (response.type === "entries") {
+          setEntries(response.entries);
+        } else if (response.type === "error") {
+          setMessage(response.message);
+          setEntries([]);
+        }
+      })
+      .catch((reason) => {
+        if (!cancelled) setMessage(errorText(reason, "无法读取远端文件"));
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [peer?.id, path]);
+
+  async function refresh(): Promise<void> {
+    if (!peer) return;
+    setLoading(true);
+    setMessage("");
+    try {
+      const response = await crosscopy.filesystemRequest(
+        peer.id,
+        path ? { type: "list", path } : { type: "roots" }
+      );
+      if (response.type === "entries") setEntries(response.entries);
+      else if (response.type === "error") setMessage(response.message);
+    } catch (reason) {
+      setMessage(errorText(reason, "刷新失败"));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function openEntry(entry: FsEntry): Promise<void> {
+    setSelectedPath(entry.path);
+    if (entry.directory) {
+      setPath(entry.path);
+      return;
+    }
+    if (!peer) return;
+    setMessage("正在打开远端文件…");
+    try {
+      const response = await crosscopy.filesystemRequest(peer.id, {
+        type: "read",
+        path: entry.path
+      });
+      if (response.type === "error") {
+        setMessage(response.message);
+        return;
+      }
+      if (response.type !== "file") return;
+      const bytes = base64Bytes(response.data);
+      let content: string;
+      try {
+        content = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+      } catch {
+        setMessage("这是二进制文件，请拖到下方区域复制到本机后打开");
+        return;
+      }
+      setEditor({
+        path: response.path,
+        name: entry.name,
+        content,
+        modifiedAt: response.modifiedAt
+      });
+      setMessage("");
+    } catch (reason) {
+      setMessage(errorText(reason, "无法打开远端文件"));
+    }
+  }
+
+  async function saveEditor(): Promise<void> {
+    if (!peer || !editor) return;
+    setSaving(true);
+    try {
+      const response = await crosscopy.filesystemRequest(peer.id, {
+        type: "write",
+        path: editor.path,
+        data: bytesBase64(new TextEncoder().encode(editor.content)),
+        expectedModifiedAt: editor.modifiedAt
+      });
+      if (response.type === "error") {
+        setMessage(response.message);
+        return;
+      }
+      const modifiedAt =
+        response.type === "done" ? (response.entry?.modifiedAt ?? null) : null;
+      setEditor({ ...editor, modifiedAt });
+      setMessage("已直接保存到远端电脑");
+      await refresh();
+    } catch (reason) {
+      setMessage(errorText(reason, "保存失败"));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function createEntry(directory: boolean): Promise<void> {
+    if (!peer || !path) return;
+    const name = window.prompt(directory ? "新文件夹名称" : "新文件名称")?.trim();
+    if (!name || name.includes("/") || name.includes("\\")) return;
+    const target = joinRemotePath(path, name);
+    try {
+      const response = await crosscopy.filesystemRequest(peer.id, {
+        type: directory ? "createDirectory" : "createFile",
+        path: target
+      });
+      if (response.type === "error") setMessage(response.message);
+      else await refresh();
+    } catch (reason) {
+      setMessage(errorText(reason, "新建失败"));
+    }
+  }
+
+  async function renameSelected(): Promise<void> {
+    if (!peer || !selectedPath) return;
+    const current = entries.find((entry) => entry.path === selectedPath);
+    if (!current) return;
+    const name = window.prompt("输入新名称", current.name)?.trim();
+    if (!name || name === current.name || name.includes("/") || name.includes("\\")) return;
+    const parent = parentRemotePath(current.path);
+    if (!parent) return;
+    try {
+      const response = await crosscopy.filesystemRequest(peer.id, {
+        type: "rename",
+        path: current.path,
+        destination: joinRemotePath(parent, name)
+      });
+      if (response.type === "error") setMessage(response.message);
+      else {
+        setSelectedPath("");
+        await refresh();
+      }
+    } catch (reason) {
+      setMessage(errorText(reason, "重命名失败"));
+    }
+  }
+
+  async function removeSelected(): Promise<void> {
+    if (!peer || !selectedPath) return;
+    const current = entries.find((entry) => entry.path === selectedPath);
+    if (!current || !window.confirm(`确定永久删除“${current.name}”吗？`)) return;
+    try {
+      const response = await crosscopy.filesystemRequest(peer.id, {
+        type: "remove",
+        path: current.path,
+        recursive: current.directory
+      });
+      if (response.type === "error") setMessage(response.message);
+      else {
+        setSelectedPath("");
+        await refresh();
+      }
+    } catch (reason) {
+      setMessage(errorText(reason, "删除失败"));
+    }
+  }
+
+  async function download(paths: string[]): Promise<void> {
+    if (!peer || paths.length === 0) return;
+    setMessage("正在复制到本机…");
+    try {
+      const destination = await crosscopy.filesystemDownload(peer.id, paths);
+      setMessage(`已复制到 ${destination}`);
+    } catch (reason) {
+      setMessage(errorText(reason, "复制到本机失败"));
+    }
+  }
+
+  if (props.state.peers.length === 0) {
+    return (
+      <div className="filesystem-empty">
+        <HardDrives size={36} weight="light" />
+        <h2>还没有可访问的电脑</h2>
+        <p>先配对设备，再在“设置 → 设备权限”中开启文件权限。</p>
+      </div>
+    );
+  }
+
+  if (availablePeers.length === 0) {
+    return (
+      <div className="filesystem-empty">
+        <ShieldCheck size={36} weight="light" />
+        <h2>文件系统尚未授权</h2>
+        <p>需要设备在线，并在设置中明确开启该设备的文件权限。</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="filesystem-page">
+      <div className="filesystem-toolbar">
+        <select value={peer?.id ?? ""} onChange={(event) => setPeerId(event.target.value)}>
+          {availablePeers.map((candidate) => (
+            <option key={candidate.id} value={candidate.id}>
+              {candidate.name}
+            </option>
+          ))}
+        </select>
+        <button type="button" disabled={!path} onClick={() => setPath(path ? parentRemotePath(path) : null)}>
+          <ArrowLeft size={16} /> 返回
+        </button>
+        <div className="filesystem-address" title={path ?? "系统位置"}>
+          {path ?? "系统位置"}
+        </div>
+        <button type="button" onClick={() => void refresh()}>
+          <ArrowsClockwise size={16} /> 刷新
+        </button>
+      </div>
+
+      <div className="filesystem-actions">
+        <button type="button" disabled={!path} onClick={() => void createEntry(true)}>
+          <Folder size={16} /> 新建文件夹
+        </button>
+        <button type="button" disabled={!path} onClick={() => void createEntry(false)}>
+          <File size={16} /> 新建文件
+        </button>
+        <button type="button" disabled={!selectedPath} onClick={() => void renameSelected()}>
+          <PencilSimple size={16} /> 重命名
+        </button>
+        <button type="button" disabled={!selectedPath} onClick={() => void removeSelected()}>
+          <Trash size={16} /> 删除
+        </button>
+        <button
+          type="button"
+          disabled={!selectedPath}
+          onClick={() => void download([selectedPath])}
+        >
+          <DownloadSimple size={16} /> 复制到本机
+        </button>
+      </div>
+
+      <div className="filesystem-browser">
+        <div className="filesystem-list" aria-busy={loading}>
+          <div className="filesystem-list-head">
+            <span>名称</span><span>修改时间</span><span>大小</span>
+          </div>
+          {loading ? (
+            <div className="filesystem-loading">正在读取远端目录…</div>
+          ) : entries.length === 0 ? (
+            <div className="filesystem-loading">这个位置是空的</div>
+          ) : (
+            entries.map((entry) => (
+              <button
+                type="button"
+                key={entry.path}
+                className={`filesystem-entry ${selectedPath === entry.path ? "selected" : ""}`}
+                onClick={() => setSelectedPath(entry.path)}
+                onDoubleClick={() => void openEntry(entry)}
+                draggable
+                onDragStart={(event) => {
+                  event.dataTransfer.setData("application/x-crosscopy-path", entry.path);
+                  event.dataTransfer.effectAllowed = "copy";
+                }}
+              >
+                <span>
+                  {entry.directory ? <FolderOpen size={18} /> : <File size={18} />}
+                  <b>{entry.name}</b>
+                  {entry.readonly && <small>只读</small>}
+                </span>
+                <time>{entry.modifiedAt ? formatDateTime(entry.modifiedAt) : "—"}</time>
+                <span>{entry.directory ? "—" : formatBytes(entry.size)}</span>
+              </button>
+            ))
+          )}
+        </div>
+        <div
+          className="filesystem-drop"
+          onDragOver={(event) => {
+            event.preventDefault();
+            event.dataTransfer.dropEffect = "copy";
+          }}
+          onDrop={(event) => {
+            event.preventDefault();
+            const remotePath = event.dataTransfer.getData("application/x-crosscopy-path");
+            if (remotePath) void download([remotePath]);
+          }}
+        >
+          <DownloadSimple size={25} />
+          <strong>拖到这里复制到本机</strong>
+          <span>文件和文件夹会保存到“下载/CrossCopy”</span>
+        </div>
+      </div>
+
+      {message && <div className="filesystem-message">{message}</div>}
+
+      {editor && (
+        <div className="editor-backdrop">
+          <section className="remote-editor">
+            <header>
+              <span><FileText size={18} /><strong>{editor.name}</strong></span>
+              <button type="button" onClick={() => setEditor(null)}><X size={18} /></button>
+            </header>
+            <textarea
+              value={editor.content}
+              spellCheck={false}
+              onChange={(event) => setEditor({ ...editor, content: event.target.value })}
+            />
+            <footer>
+              <small>保存会直接写入 {peer?.name}，本机不创建文件副本</small>
+              <button className="primary-button" type="button" disabled={saving} onClick={() => void saveEditor()}>
+                <FloppyDisk size={16} /> {saving ? "保存中…" : "保存到远端"}
+              </button>
+            </footer>
+          </section>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function MousePanel(props: { state: UiState }): React.JSX.Element {
   const [selectedPeerId, setSelectedPeerId] = useState("");
   const selectedPeer =
@@ -1051,6 +1454,32 @@ function MousePanel(props: { state: UiState }): React.JSX.Element {
             disabled={props.state.peers.length === 0}
             onChange={(event) =>
               void crosscopy.setMouseShareEnabled(event.target.checked)
+            }
+          />
+          <i aria-hidden="true" />
+        </label>
+      </section>
+
+      <section
+        className={`settings-group performance-mode-card ${
+          props.state.mouseExtremePerformance ? "enabled" : ""
+        }`}
+      >
+        <div className="settings-intro">
+          <Lightning size={22} weight="fill" />
+          <div>
+            <h2>极致性能模式</h2>
+            <p>
+              优先保证跨屏流畅度，启用独立实时通道和即时鼠标更新；两端都开启效果最佳，活跃控制期间会增加处理器、网络与电量消耗。
+            </p>
+          </div>
+        </div>
+        <label className="login-setting">
+          <input
+            type="checkbox"
+            checked={props.state.mouseExtremePerformance}
+            onChange={(event) =>
+              void crosscopy.setMouseExtremePerformance(event.target.checked)
             }
           />
           <i aria-hidden="true" />
@@ -1381,7 +1810,8 @@ function SettingsPanel(props: {
                         void crosscopy.setPeerPermissions(
                           peer.id,
                           event.target.checked,
-                          peer.mouseAllowed
+                          peer.mouseAllowed,
+                          peer.filesystemAllowed
                         )
                       }
                     />
@@ -1396,12 +1826,29 @@ function SettingsPanel(props: {
                         void crosscopy.setPeerPermissions(
                           peer.id,
                           peer.clipboardAllowed,
-                          event.target.checked
+                          event.target.checked,
+                          peer.filesystemAllowed
                         )
                       }
                     />
                     <i aria-hidden="true" />
                     鼠标
+                  </label>
+                  <label>
+                    <input
+                      type="checkbox"
+                      checked={peer.filesystemAllowed}
+                      onChange={(event) =>
+                        void crosscopy.setPeerPermissions(
+                          peer.id,
+                          peer.clipboardAllowed,
+                          peer.mouseAllowed,
+                          event.target.checked
+                        )
+                      }
+                    />
+                    <i aria-hidden="true" />
+                    文件
                   </label>
                 </div>
               ))
@@ -1566,6 +2013,57 @@ function formatBytes(bytes: number): string {
   if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KB`;
   if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
   return `${(bytes / 1024 ** 3).toFixed(2)} GB`;
+}
+
+function formatDateTime(timestamp: number): string {
+  return new Intl.DateTimeFormat("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit"
+  }).format(timestamp);
+}
+
+function errorText(reason: unknown, fallback: string): string {
+  return typeof reason === "string"
+    ? reason
+    : reason instanceof Error
+      ? reason.message
+      : fallback;
+}
+
+function base64Bytes(value: string): Uint8Array {
+  const binary = window.atob(value);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return bytes;
+}
+
+function bytesBase64(bytes: Uint8Array): string {
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
+  }
+  return window.btoa(binary);
+}
+
+function parentRemotePath(path: string): string | null {
+  const windowsRoot = /^[A-Za-z]:\\$/;
+  if (path === "/" || windowsRoot.test(path)) return null;
+  const separator = path.includes("\\") ? "\\" : "/";
+  const trimmed = path.endsWith(separator) ? path.slice(0, -1) : path;
+  const index = trimmed.lastIndexOf(separator);
+  if (index < 0) return null;
+  if (separator === "\\" && index === 2) return `${trimmed.slice(0, 2)}\\`;
+  return index === 0 ? "/" : trimmed.slice(0, index);
+}
+
+function joinRemotePath(parent: string, name: string): string {
+  const separator = parent.includes("\\") ? "\\" : "/";
+  return `${parent.endsWith(separator) ? parent : `${parent}${separator}`}${name}`;
 }
 
 const transferMode = new URLSearchParams(window.location.search).has("transfer");

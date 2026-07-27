@@ -3,8 +3,8 @@ use crate::{
     logger::Logger,
     model::ScreenPosition,
     mouse_hook::{
-        recenter_cursor, run_mouse_hook, screen_bounds, set_cursor_visible, DesktopBounds,
-        HookMouseButton, HookMouseEvent,
+        recenter_cursor, run_mouse_hook, screen_bounds, set_cursor_visible, set_realtime_priority,
+        DesktopBounds, HookMouseButton, HookMouseEvent,
     },
 };
 use enigo::{Axis, Button, Coordinate, Direction, Enigo, Mouse, Settings as EnigoSettings};
@@ -154,6 +154,7 @@ struct Runtime {
 
 struct Inner {
     enabled: AtomicBool,
+    extreme_performance: Arc<AtomicBool>,
     listener_attempted: AtomicBool,
     listener_started: AtomicBool,
     latency_ms: AtomicU64,
@@ -171,7 +172,9 @@ pub struct MouseShare {
 
 impl MouseShare {
     pub fn new(logger: Arc<Logger>, outbound: mpsc::Sender<OutboundMouseSignal>) -> Arc<Self> {
-        let (injector, injection_receiver) = std_mpsc::sync_channel(32);
+        let (injector, injection_receiver) = std_mpsc::sync_channel(128);
+        let extreme_performance = Arc::new(AtomicBool::new(false));
+        let injector_extreme_performance = Arc::clone(&extreme_performance);
         let mut enigo = Enigo::new(&mouse_input_settings()).ok();
         let bounds = screen_bounds();
         let injection_logger = Arc::clone(&logger);
@@ -186,7 +189,13 @@ impl MouseShare {
                     return;
                 };
                 let mut last_error_log = 0_u64;
+                let mut high_priority = false;
                 while let Ok(event) = injection_receiver.recv() {
+                    let requested = injector_extreme_performance.load(Ordering::Acquire);
+                    if requested != high_priority {
+                        set_realtime_priority(requested);
+                        high_priority = requested;
+                    }
                     if let Err(error) = inject_mouse_event(&mut enigo, event) {
                         let now = now_ms();
                         if now.saturating_sub(last_error_log) >= 1_000 {
@@ -199,6 +208,7 @@ impl MouseShare {
         let mouse_share = Arc::new(Self {
             inner: Arc::new(Inner {
                 enabled: AtomicBool::new(false),
+                extreme_performance,
                 listener_attempted: AtomicBool::new(false),
                 listener_started: AtomicBool::new(false),
                 latency_ms: AtomicU64::new(NO_LATENCY),
@@ -225,9 +235,13 @@ impl MouseShare {
     pub fn configure(
         &self,
         enabled: bool,
+        extreme_performance: bool,
         targets: Vec<(String, ScreenPosition)>,
         receive_dpi: Vec<(String, u16)>,
     ) {
+        self.inner
+            .extreme_performance
+            .store(extreme_performance, Ordering::Release);
         let latest_bounds = screen_bounds();
         let bounds_changed = {
             let mut bounds = self.inner.bounds.lock().expect("desktop bounds lock");
@@ -650,6 +664,15 @@ impl MouseShare {
                 } else {
                     incoming.x_milli = next_x_milli;
                     incoming.y_milli = next_y_milli;
+                    if self.inner.extreme_performance.load(Ordering::Acquire)
+                        && (next_x != incoming.last_injected_x
+                            || next_y != incoming.last_injected_y)
+                    {
+                        incoming.last_injected_x = next_x;
+                        incoming.last_injected_y = next_y;
+                        incoming.last_injected_at = Instant::now();
+                        simulated_events.push(absolute_move(next_x, next_y));
+                    }
                 }
             }
             MouseSignal::Button {
@@ -889,120 +912,135 @@ impl MouseShare {
         let mouse_share = Arc::downgrade(self);
         let _ = std::thread::Builder::new()
             .name("crosscopy-mouse-maintenance".into())
-            .spawn(move || loop {
-                let Some(mouse_share) = mouse_share.upgrade() else {
-                    return;
-                };
-                let delay = if mouse_share.session_active() { 1 } else { 50 };
-                std::thread::sleep(std::time::Duration::from_millis(delay));
-                mouse_share.expire_unresponsive_outgoing();
+            .spawn(move || {
+                let mut high_priority = false;
+                loop {
+                    let Some(mouse_share) = mouse_share.upgrade() else {
+                        return;
+                    };
+                    let extreme = mouse_share
+                        .inner
+                        .extreme_performance
+                        .load(Ordering::Acquire);
+                    if extreme != high_priority {
+                        set_realtime_priority(extreme);
+                        high_priority = extreme;
+                    }
+                    let delay = if mouse_share.session_active() { 1 } else { 50 };
+                    std::thread::sleep(std::time::Duration::from_millis(delay));
+                    mouse_share.expire_unresponsive_outgoing();
 
-                let now = now_ms();
-                let mut runtime = mouse_share
-                    .inner
-                    .runtime
-                    .lock()
-                    .expect("mouse runtime lock");
-                let mut signals = Vec::new();
-                let mut releases = Vec::new();
-                let mut movement = None;
-                if let Some(outgoing) = runtime.outgoing.as_mut() {
-                    if !outgoing.acknowledged
-                        && now.saturating_sub(outgoing.last_enter_retry_at) >= ENTER_RETRY_MS
-                    {
-                        outgoing.last_enter_retry_at = now;
-                        signals.push(outbound(
-                            &outgoing.peer_id,
-                            MouseSignal::Enter {
-                                session_id: outgoing.session_id.clone(),
-                                entry_edge: outgoing.exit_edge.opposite(),
-                                ratio: outgoing.enter_ratio,
-                                sent_at: now,
-                            },
-                        ));
-                    }
-                    if outgoing.acknowledged
-                        && (outgoing.total_x_milli != outgoing.last_sent_x_milli
-                            || outgoing.total_y_milli != outgoing.last_sent_y_milli)
-                        && now.saturating_sub(outgoing.last_move_sent_at) >= MOVE_SEND_INTERVAL_MS
-                    {
-                        outgoing.move_sequence = outgoing.move_sequence.saturating_add(1);
-                        outgoing.last_move_sent_at = now;
-                        outgoing.last_sent_x_milli = outgoing.total_x_milli;
-                        outgoing.last_sent_y_milli = outgoing.total_y_milli;
-                        signals.push(outbound(
-                            &outgoing.peer_id,
-                            MouseSignal::Move {
-                                session_id: outgoing.session_id.clone(),
-                                sequence: outgoing.move_sequence,
-                                total_x_milli: outgoing.total_x_milli,
-                                total_y_milli: outgoing.total_y_milli,
-                            },
-                        ));
-                    }
-                    if outgoing.acknowledged
-                        && (outgoing.total_scroll_x_milli != outgoing.last_sent_scroll_x_milli
-                            || outgoing.total_scroll_y_milli != outgoing.last_sent_scroll_y_milli)
-                    {
-                        outgoing.scroll_sequence = outgoing.scroll_sequence.saturating_add(1);
-                        outgoing.last_sent_scroll_x_milli = outgoing.total_scroll_x_milli;
-                        outgoing.last_sent_scroll_y_milli = outgoing.total_scroll_y_milli;
-                        signals.push(outbound(
-                            &outgoing.peer_id,
-                            MouseSignal::Scroll {
-                                session_id: outgoing.session_id.clone(),
-                                sequence: outgoing.scroll_sequence,
-                                total_x_milli: outgoing.total_scroll_x_milli,
-                                total_y_milli: outgoing.total_scroll_y_milli,
-                            },
-                        ));
-                    }
-                }
-                if let Some(incoming) = runtime.incoming.as_mut() {
-                    if incoming.last_injected_at.elapsed()
-                        >= Duration::from_millis(TARGET_FRAME_INTERVAL_MS)
-                    {
-                        let x = milli_to_pixel(incoming.x_milli);
-                        let y = milli_to_pixel(incoming.y_milli);
-                        if x != incoming.last_injected_x || y != incoming.last_injected_y {
-                            incoming.last_injected_x = x;
-                            incoming.last_injected_y = y;
-                            incoming.last_injected_at = Instant::now();
-                            movement = Some(absolute_move(x, y));
+                    let now = now_ms();
+                    let mut runtime = mouse_share
+                        .inner
+                        .runtime
+                        .lock()
+                        .expect("mouse runtime lock");
+                    let mut signals = Vec::new();
+                    let mut releases = Vec::new();
+                    let mut movement = None;
+                    if let Some(outgoing) = runtime.outgoing.as_mut() {
+                        if !outgoing.acknowledged
+                            && now.saturating_sub(outgoing.last_enter_retry_at) >= ENTER_RETRY_MS
+                        {
+                            outgoing.last_enter_retry_at = now;
+                            signals.push(outbound(
+                                &outgoing.peer_id,
+                                MouseSignal::Enter {
+                                    session_id: outgoing.session_id.clone(),
+                                    entry_edge: outgoing.exit_edge.opposite(),
+                                    ratio: outgoing.enter_ratio,
+                                    sent_at: now,
+                                },
+                            ));
+                        }
+                        if outgoing.acknowledged
+                            && (outgoing.total_x_milli != outgoing.last_sent_x_milli
+                                || outgoing.total_y_milli != outgoing.last_sent_y_milli)
+                            && now.saturating_sub(outgoing.last_move_sent_at)
+                                >= MOVE_SEND_INTERVAL_MS
+                        {
+                            outgoing.move_sequence = outgoing.move_sequence.saturating_add(1);
+                            outgoing.last_move_sent_at = now;
+                            outgoing.last_sent_x_milli = outgoing.total_x_milli;
+                            outgoing.last_sent_y_milli = outgoing.total_y_milli;
+                            signals.push(outbound(
+                                &outgoing.peer_id,
+                                MouseSignal::Move {
+                                    session_id: outgoing.session_id.clone(),
+                                    sequence: outgoing.move_sequence,
+                                    total_x_milli: outgoing.total_x_milli,
+                                    total_y_milli: outgoing.total_y_milli,
+                                },
+                            ));
+                        }
+                        if outgoing.acknowledged
+                            && (outgoing.total_scroll_x_milli != outgoing.last_sent_scroll_x_milli
+                                || outgoing.total_scroll_y_milli
+                                    != outgoing.last_sent_scroll_y_milli)
+                        {
+                            outgoing.scroll_sequence = outgoing.scroll_sequence.saturating_add(1);
+                            outgoing.last_sent_scroll_x_milli = outgoing.total_scroll_x_milli;
+                            outgoing.last_sent_scroll_y_milli = outgoing.total_scroll_y_milli;
+                            signals.push(outbound(
+                                &outgoing.peer_id,
+                                MouseSignal::Scroll {
+                                    session_id: outgoing.session_id.clone(),
+                                    sequence: outgoing.scroll_sequence,
+                                    total_x_milli: outgoing.total_scroll_x_milli,
+                                    total_y_milli: outgoing.total_scroll_y_milli,
+                                },
+                            ));
                         }
                     }
-                    if now.saturating_sub(incoming.last_keep_alive_at) >= KEEP_ALIVE_MS {
-                        incoming.last_keep_alive_at = now;
-                        signals.push(outbound(
-                            &incoming.peer_id,
-                            MouseSignal::KeepAlive {
-                                session_id: incoming.session_id.clone(),
-                            },
-                        ));
+                    if let Some(incoming) = runtime.incoming.as_mut() {
+                        if !extreme
+                            && incoming.last_injected_at.elapsed()
+                                >= Duration::from_millis(TARGET_FRAME_INTERVAL_MS)
+                        {
+                            let x = milli_to_pixel(incoming.x_milli);
+                            let y = milli_to_pixel(incoming.y_milli);
+                            if x != incoming.last_injected_x || y != incoming.last_injected_y {
+                                incoming.last_injected_x = x;
+                                incoming.last_injected_y = y;
+                                incoming.last_injected_at = Instant::now();
+                                movement = Some(absolute_move(x, y));
+                            }
+                        }
+                        if now.saturating_sub(incoming.last_keep_alive_at) >= KEEP_ALIVE_MS {
+                            incoming.last_keep_alive_at = now;
+                            signals.push(outbound(
+                                &incoming.peer_id,
+                                MouseSignal::KeepAlive {
+                                    session_id: incoming.session_id.clone(),
+                                },
+                            ));
+                        }
+                        if now.saturating_sub(incoming.last_event_at)
+                            >= HELD_BUTTON_SAFETY_TIMEOUT_MS
+                            && incoming.held_buttons.iter().any(|pressed| *pressed)
+                        {
+                            releases = release_held_buttons(incoming);
+                            incoming.held_buttons = [false; 3];
+                        }
                     }
-                    if now.saturating_sub(incoming.last_event_at) >= HELD_BUTTON_SAFETY_TIMEOUT_MS
-                        && incoming.held_buttons.iter().any(|pressed| *pressed)
-                    {
-                        releases = release_held_buttons(incoming);
-                        incoming.held_buttons = [false; 3];
+                    drop(runtime);
+                    for signal in signals {
+                        let _ = mouse_share.inner.outbound.blocking_send(signal);
                     }
-                }
-                drop(runtime);
-                for signal in signals {
-                    let _ = mouse_share.inner.outbound.blocking_send(signal);
-                }
-                if let Some(event) = movement {
-                    mouse_share.inject(event);
-                }
-                let released_any = !releases.is_empty();
-                for event in releases {
-                    mouse_share.inject(event);
-                }
-                if released_any {
-                    mouse_share.inner.logger.warn(
-                        "mouse_buttons_safety_released",
-                        "reason=remote_session_idle",
-                    );
+                    if let Some(event) = movement {
+                        mouse_share.inject(event);
+                    }
+                    let released_any = !releases.is_empty();
+                    for event in releases {
+                        mouse_share.inject(event);
+                    }
+                    if released_any {
+                        mouse_share.inner.logger.warn(
+                            "mouse_buttons_safety_released",
+                            "reason=remote_session_idle",
+                        );
+                    }
                 }
             });
     }
@@ -1065,7 +1103,7 @@ impl Inner {
                             clamp_physical_delta(raw_delta_y),
                         )
                     };
-                    should_recenter = true;
+                    should_recenter = !self.extreme_performance.load(Ordering::Acquire);
                     if delta_x != 0 || delta_y != 0 {
                         if !outgoing.first_move_logged {
                             outgoing.first_move_logged = true;
@@ -1083,7 +1121,11 @@ impl Inner {
                         let now = now_ms();
                         if outgoing.acknowledged
                             && now.saturating_sub(outgoing.last_move_sent_at)
-                                >= MOVE_SEND_INTERVAL_MS
+                                >= if self.extreme_performance.load(Ordering::Acquire) {
+                                    1
+                                } else {
+                                    MOVE_SEND_INTERVAL_MS
+                                }
                         {
                             outgoing.move_sequence = outgoing.move_sequence.saturating_add(1);
                             if self
@@ -1198,7 +1240,7 @@ impl Inner {
                         last_sent_scroll_y_milli: 0,
                         last_remote_at: sent_at,
                     });
-                    let _ = self.outbound.blocking_send(outbound(
+                    let enter = outbound(
                         &peer_id,
                         MouseSignal::Enter {
                             session_id,
@@ -1206,12 +1248,13 @@ impl Inner {
                             ratio,
                             sent_at,
                         },
-                    ));
+                    );
                     self.logger.info(
                         "mouse_outgoing_enter",
                         format!("edge={position:?} ratio={ratio:.3}"),
                     );
                     drop(runtime);
+                    let _ = self.outbound.blocking_send(enter);
                     #[cfg(target_os = "macos")]
                     if let Err(error) = set_cursor_visible(false) {
                         self.logger.warn("mouse_cursor_hide_failed", error);

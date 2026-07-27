@@ -11,6 +11,44 @@ export type DisplayInfo = {
   mirroredCount: number;
 };
 
+export type FsEntry = {
+  name: string;
+  path: string;
+  directory: boolean;
+  symlink: boolean;
+  size: number;
+  modifiedAt: number | null;
+  readonly: boolean;
+  hidden: boolean;
+};
+
+export type FsRequest =
+  | { type: "roots" }
+  | { type: "list"; path: string }
+  | { type: "read"; path: string }
+  | {
+      type: "write";
+      path: string;
+      data: string;
+      expectedModifiedAt: number | null;
+    }
+  | { type: "createDirectory"; path: string }
+  | { type: "createFile"; path: string }
+  | { type: "rename"; path: string; destination: string }
+  | { type: "remove"; path: string; recursive: boolean };
+
+export type FsResponse =
+  | { type: "entries"; entries: FsEntry[] }
+  | {
+      type: "file";
+      path: string;
+      data: string;
+      modifiedAt: number | null;
+      size: number;
+    }
+  | { type: "done"; entry: FsEntry | null }
+  | { type: "error"; message: string };
+
 export type UiState = {
   deviceName: string;
   displays: DisplayInfo[];
@@ -19,6 +57,7 @@ export type UiState = {
   copyShortcut: string;
   pasteShortcut: string;
   mouseShareEnabled: boolean;
+  mouseExtremePerformance: boolean;
   mouseShortcut: string;
   mousePosition: ScreenPosition;
   mouseLatencyMs: number | null;
@@ -35,6 +74,7 @@ export type UiState = {
     direct: boolean;
     clipboardAllowed: boolean;
     mouseAllowed: boolean;
+    filesystemAllowed: boolean;
     mouseReceiveDpi: number;
     mouseShareEnabled: boolean;
     screenNumber: number;

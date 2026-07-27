@@ -34,6 +34,8 @@ pub struct Peer {
     pub clipboard_allowed: bool,
     #[serde(default = "default_true")]
     pub mouse_allowed: bool,
+    #[serde(default)]
+    pub filesystem_allowed: bool,
     #[serde(default = "default_mouse_receive_dpi")]
     pub mouse_receive_dpi: u16,
     #[serde(default)]
@@ -60,6 +62,8 @@ pub struct Settings {
     pub paste_shortcut: String,
     #[serde(default)]
     pub mouse_share_enabled: bool,
+    #[serde(default)]
+    pub mouse_extreme_performance: bool,
     #[serde(default = "default_mouse_shortcut")]
     pub mouse_shortcut: String,
     #[serde(default)]
@@ -96,6 +100,7 @@ pub struct PeerView {
     pub direct: bool,
     pub clipboard_allowed: bool,
     pub mouse_allowed: bool,
+    pub filesystem_allowed: bool,
     pub mouse_receive_dpi: u16,
     pub mouse_share_enabled: bool,
     pub screen_number: u8,
@@ -148,6 +153,7 @@ pub struct UiState {
     pub copy_shortcut: String,
     pub paste_shortcut: String,
     pub mouse_share_enabled: bool,
+    pub mouse_extreme_performance: bool,
     pub mouse_shortcut: String,
     pub mouse_position: ScreenPosition,
     pub mouse_latency_ms: Option<u64>,

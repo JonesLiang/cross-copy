@@ -6,6 +6,7 @@ mod model;
 mod mouse_hook;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod mouse_share;
+mod remote_fs;
 mod store;
 
 use crate::core::Core;
@@ -54,6 +55,11 @@ async fn set_mouse_share_enabled(core: State<'_, Arc<Core>>, value: bool) -> Res
 }
 
 #[tauri::command]
+fn set_mouse_extreme_performance(core: State<'_, Arc<Core>>, value: bool) -> Result<(), String> {
+    core.set_mouse_extreme_performance(value)
+}
+
+#[tauri::command]
 async fn set_mouse_position(
     core: State<'_, Arc<Core>>,
     position: model::ScreenPosition,
@@ -78,9 +84,37 @@ async fn set_peer_permissions(
     peer_id: String,
     clipboard_allowed: bool,
     mouse_allowed: bool,
+    filesystem_allowed: bool,
 ) -> Result<(), String> {
     Arc::clone(core.inner())
-        .set_peer_permissions(peer_id, clipboard_allowed, mouse_allowed)
+        .set_peer_permissions(
+            peer_id,
+            clipboard_allowed,
+            mouse_allowed,
+            filesystem_allowed,
+        )
+        .await
+}
+
+#[tauri::command]
+async fn filesystem_request(
+    core: State<'_, Arc<Core>>,
+    peer_id: String,
+    request: remote_fs::FsRequest,
+) -> Result<remote_fs::FsResponse, String> {
+    Arc::clone(core.inner())
+        .filesystem_request(peer_id, request)
+        .await
+}
+
+#[tauri::command]
+async fn filesystem_download(
+    core: State<'_, Arc<Core>>,
+    peer_id: String,
+    paths: Vec<String>,
+) -> Result<String, String> {
+    Arc::clone(core.inner())
+        .filesystem_download(peer_id, paths)
         .await
 }
 
@@ -387,9 +421,12 @@ pub fn run() {
             submit_pairing_code,
             set_sync_enabled,
             set_mouse_share_enabled,
+            set_mouse_extreme_performance,
             set_mouse_position,
             set_peer_screen_position,
             set_peer_permissions,
+            filesystem_request,
+            filesystem_download,
             set_peer_mouse_dpi,
             switch_mouse_to_screen,
             set_launch_at_login,

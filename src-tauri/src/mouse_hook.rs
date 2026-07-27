@@ -46,6 +46,43 @@ pub enum HookMouseEvent {
 }
 
 #[cfg(target_os = "macos")]
+pub fn set_realtime_priority(enabled: bool) {
+    type QosClass = u32;
+    const QOS_CLASS_USER_INTERACTIVE: QosClass = 0x21;
+    const QOS_CLASS_DEFAULT: QosClass = 0x15;
+    unsafe extern "C" {
+        fn pthread_set_qos_class_self_np(qos_class: QosClass, relative_priority: i32) -> i32;
+    }
+    unsafe {
+        let _ = pthread_set_qos_class_self_np(
+            if enabled {
+                QOS_CLASS_USER_INTERACTIVE
+            } else {
+                QOS_CLASS_DEFAULT
+            },
+            0,
+        );
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub fn set_realtime_priority(enabled: bool) {
+    use windows::Win32::System::Threading::{
+        GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_HIGHEST, THREAD_PRIORITY_NORMAL,
+    };
+    unsafe {
+        let _ = SetThreadPriority(
+            GetCurrentThread(),
+            if enabled {
+                THREAD_PRIORITY_HIGHEST
+            } else {
+                THREAD_PRIORITY_NORMAL
+            },
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
 pub fn screen_bounds() -> DesktopBounds {
     use core_graphics::display::CGDisplay;
     let displays = CGDisplay::active_displays().unwrap_or_default();

@@ -10,6 +10,7 @@ use crate::{
     },
     mouse_hook::SYNTHETIC_INPUT_MARKER,
     mouse_share::{MouseShare, MouseSignal, OutboundMouseSignal},
+    remote_fs::{self, FsRequest, FsResponse},
     store::Store,
 };
 #[cfg(target_os = "windows")]
@@ -53,14 +54,16 @@ use windows_clipboard::{windows_capture_selection, windows_paste_pending};
 
 const DISCOVERY_PORT: u16 = 47653;
 const TRANSFER_PORT: u16 = 47654;
+const MOUSE_PORT: u16 = 47655;
 const MULTICAST: Ipv4Addr = Ipv4Addr::new(239, 255, 67, 89);
 const GLOBAL_BROADCAST: Ipv4Addr = Ipv4Addr::new(255, 255, 255, 255);
 const CHUNK_SIZE: usize = 1024 * 1024;
+const MAX_SECURE_FRAME_SIZE: usize = 24 * 1024 * 1024;
 const ONLINE_WINDOW_MS: u64 = 35_000;
 const CLIPBOARD_RETRY_ATTEMPTS: usize = 16;
 const CLIPBOARD_RETRY_DELAY_MS: u64 = 50;
 const ACTIVE_DISCOVERY_MS: u64 = 30_000;
-const MOUSE_PROTOCOL: u8 = 4;
+const MOUSE_PROTOCOL: u8 = 5;
 
 #[derive(Clone)]
 struct SeenPeer {
@@ -68,6 +71,12 @@ struct SeenPeer {
     host: IpAddr,
     last_seen: u64,
     remote_mouse_enabled: Option<bool>,
+}
+
+#[derive(Clone)]
+struct MouseRoute {
+    address: SocketAddr,
+    key: [u8; 32],
 }
 
 impl SeenPeer {
@@ -164,6 +173,17 @@ enum SecureMessage {
     TrustSync {
         snapshot: TrustSnapshot,
     },
+    Filesystem {
+        request: FsRequest,
+    },
+    FilesystemWrite {
+        path: String,
+        expected_modified_at: Option<u64>,
+        size: u64,
+    },
+    FilesystemDownload {
+        paths: Vec<String>,
+    },
     Error {
         message: String,
     },
@@ -243,11 +263,14 @@ pub struct Core {
     mouse: Arc<MouseShare>,
     mouse_receiver: Mutex<Option<mpsc::Receiver<OutboundMouseSignal>>>,
     mouse_socket: Mutex<Option<Arc<UdpSocket>>>,
+    mouse_routes: Mutex<HashMap<String, MouseRoute>>,
+    device_id: String,
 }
 
 impl Core {
     pub fn new(store: Arc<Store>, logger: Arc<Logger>, app: AppHandle) -> Arc<Self> {
-        let (mouse_sender, mouse_receiver) = mpsc::channel(64);
+        let device_id = store.get().device_id;
+        let (mouse_sender, mouse_receiver) = mpsc::channel(256);
         let mouse = MouseShare::new(Arc::clone(&logger), mouse_sender);
         Arc::new(Self {
             store,
@@ -272,6 +295,8 @@ impl Core {
             mouse,
             mouse_receiver: Mutex::new(Some(mouse_receiver)),
             mouse_socket: Mutex::new(None),
+            mouse_routes: Mutex::new(HashMap::new()),
+            device_id,
         })
     }
 
@@ -350,6 +375,7 @@ impl Core {
             copy_shortcut: settings.copy_shortcut,
             paste_shortcut: settings.paste_shortcut,
             mouse_share_enabled: settings.mouse_share_enabled,
+            mouse_extreme_performance: settings.mouse_extreme_performance,
             mouse_shortcut: settings.mouse_shortcut,
             mouse_position: settings.mouse_position,
             mouse_latency_ms: self.mouse.latency_ms(),
@@ -382,6 +408,7 @@ impl Core {
                         direct: peer.direct,
                         clipboard_allowed: peer.clipboard_allowed,
                         mouse_allowed: peer.mouse_allowed,
+                        filesystem_allowed: peer.filesystem_allowed,
                         mouse_receive_dpi: peer.mouse_receive_dpi,
                         mouse_share_enabled: seen.is_some_and(SeenPeer::mouse_share_enabled),
                         screen_number: peer.screen_number,
@@ -505,6 +532,19 @@ impl Core {
         Ok(())
     }
 
+    pub fn set_mouse_extreme_performance(&self, value: bool) -> Result<(), String> {
+        self.store
+            .update(|settings| settings.mouse_extreme_performance = value)
+            .map_err(|error| error.to_string())?;
+        self.refresh_mouse_runtime();
+        self.publish();
+        self.logger.info(
+            "mouse_extreme_performance_changed",
+            format!("enabled={value}"),
+        );
+        Ok(())
+    }
+
     pub async fn toggle_mouse_share(self: &Arc<Self>) {
         let value = !self.store.get().mouse_share_enabled;
         if let Err(error) = self.set_mouse_share_enabled(value).await {
@@ -566,6 +606,7 @@ impl Core {
         peer_id: String,
         clipboard_allowed: bool,
         mouse_allowed: bool,
+        filesystem_allowed: bool,
     ) -> Result<(), String> {
         let mut found = false;
         self.store
@@ -573,6 +614,7 @@ impl Core {
                 if let Some(peer) = settings.peers.iter_mut().find(|peer| peer.id == peer_id) {
                     peer.clipboard_allowed = clipboard_allowed;
                     peer.mouse_allowed = mouse_allowed;
+                    peer.filesystem_allowed = filesystem_allowed;
                     found = true;
                 }
             })
@@ -586,10 +628,175 @@ impl Core {
         self.logger.info(
             "peer_permissions_changed",
             format!(
-                "peer={peer_id} clipboard_allowed={clipboard_allowed} mouse_allowed={mouse_allowed}"
+                "peer={peer_id} clipboard_allowed={clipboard_allowed} mouse_allowed={mouse_allowed} filesystem_allowed={filesystem_allowed}"
             ),
         );
         Ok(())
+    }
+
+    pub async fn filesystem_request(
+        self: &Arc<Self>,
+        peer_id: String,
+        request: FsRequest,
+    ) -> Result<FsResponse, String> {
+        self.wake_network();
+        let settings = self.store.get();
+        let peer = settings
+            .peers
+            .into_iter()
+            .find(|peer| peer.id == peer_id)
+            .ok_or("设备不存在")?;
+        if !peer.filesystem_allowed {
+            return Err("未授予这台电脑文件系统权限".into());
+        }
+        let seen = self
+            .discovered
+            .lock()
+            .expect("discovery lock")
+            .get(&peer.id)
+            .cloned()
+            .filter(|seen| now_ms().saturating_sub(seen.last_seen) < ONLINE_WINDOW_MS)
+            .ok_or("设备离线，无法访问文件")?;
+        let key = decode_secret(&peer.secret)?;
+        let mut stream = tokio::time::timeout(
+            Duration::from_secs(3),
+            TcpStream::connect((seen.host, seen.packet.port)),
+        )
+        .await
+        .map_err(|_| "连接远端文件系统超时".to_string())?
+        .map_err(|error| format!("无法连接远端文件系统：{error}"))?;
+        stream
+            .set_nodelay(true)
+            .map_err(|error| error.to_string())?;
+        let (secure, write_data) = match request {
+            FsRequest::Write {
+                path,
+                data,
+                expected_modified_at,
+            } => {
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(data)
+                    .map_err(|_| "文件内容编码无效".to_string())?;
+                if bytes.len() > 16 * 1024 * 1024 {
+                    return Err("单次编辑保存不能超过 16 MB".into());
+                }
+                (
+                    SecureMessage::FilesystemWrite {
+                        path,
+                        expected_modified_at,
+                        size: bytes.len() as u64,
+                    },
+                    Some(bytes),
+                )
+            }
+            request => (SecureMessage::Filesystem { request }, None),
+        };
+        write_json(
+            &mut stream,
+            &WireMessage::Secure {
+                sender_id: self.store.get().device_id,
+                envelope: encrypt(&key, &secure)?,
+            },
+        )
+        .await?;
+        if let Some(bytes) = write_data {
+            write_secure_frame(&mut stream, &key, &bytes).await?;
+        }
+        let bytes = read_secure_frame(&mut stream, &key).await?;
+        let response: FsResponse = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+        if let FsResponse::Error { message } = &response {
+            self.logger.warn(
+                "filesystem_remote_request_failed",
+                format!("peer={} error={message}", peer.id),
+            );
+        }
+        Ok(response)
+    }
+
+    pub async fn filesystem_download(
+        self: &Arc<Self>,
+        peer_id: String,
+        paths: Vec<String>,
+    ) -> Result<String, String> {
+        self.wake_network();
+        let settings = self.store.get();
+        let peer = settings
+            .peers
+            .into_iter()
+            .find(|peer| peer.id == peer_id)
+            .ok_or("设备不存在")?;
+        if !peer.filesystem_allowed {
+            return Err("未授予这台电脑文件系统权限".into());
+        }
+        let seen = self
+            .discovered
+            .lock()
+            .expect("discovery lock")
+            .get(&peer.id)
+            .cloned()
+            .filter(|seen| now_ms().saturating_sub(seen.last_seen) < ONLINE_WINDOW_MS)
+            .ok_or("设备离线，无法下载文件")?;
+        let key = decode_secret(&peer.secret)?;
+        let mut stream = TcpStream::connect((seen.host, seen.packet.port))
+            .await
+            .map_err(|error| format!("无法连接远端文件系统：{error}"))?;
+        stream
+            .set_nodelay(true)
+            .map_err(|error| error.to_string())?;
+        write_json(
+            &mut stream,
+            &WireMessage::Secure {
+                sender_id: self.store.get().device_id,
+                envelope: encrypt(&key, &SecureMessage::FilesystemDownload { paths })?,
+            },
+        )
+        .await?;
+        let manifest_bytes = read_secure_frame(&mut stream, &key).await?;
+        let manifest: SecureMessage =
+            serde_json::from_slice(&manifest_bytes).map_err(|e| e.to_string())?;
+        let SecureMessage::Manifest { entries } = manifest else {
+            return Err("远端文件清单无效".into());
+        };
+        let total = entries.iter().map(|entry| entry.size).sum();
+        let transfer_id = Uuid::new_v4().to_string();
+        self.begin_transfer_progress(&transfer_id, "远端文件", "received", total);
+        let destination = unique_destination().await?;
+        let mut transferred = 0_u64;
+        for entry in entries {
+            let relative = safe_relative_path(&entry.path)?;
+            let target = destination.join(relative);
+            if entry.directory {
+                fs::create_dir_all(&target)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                continue;
+            }
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            let mut file = File::create(&target)
+                .await
+                .map_err(|error| error.to_string())?;
+            let mut remaining = entry.size;
+            while remaining > 0 {
+                let chunk = read_secure_frame(&mut stream, &key).await?;
+                if chunk.is_empty() || chunk.len() as u64 > remaining {
+                    return Err("远端文件数据损坏".into());
+                }
+                file.write_all(&chunk)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                remaining -= chunk.len() as u64;
+                transferred += chunk.len() as u64;
+                self.update_transfer_progress(transferred);
+            }
+            file.flush().await.map_err(|error| error.to_string())?;
+        }
+        self.complete_transfer_progress();
+        reveal_file(&destination);
+        Ok(destination.to_string_lossy().into_owned())
     }
 
     pub fn set_peer_mouse_dpi(&self, peer_id: String, dpi: u16) -> Result<(), String> {
@@ -806,16 +1013,19 @@ impl Core {
             .filter(|peer| now.saturating_sub(peer.last_seen) < ONLINE_WINDOW_MS)
             .count();
         let summary = format!(
-            "sync_enabled={}\nmouse_share_enabled={}\nmouse_position={:?}\nmouse_listener_started={}\nmouse_latency_ms={:?}\npaired_peers={}\nonline_peers={}\ndiscovery_port={}\ntransfer_port={}",
+            "sync_enabled={}\nmouse_share_enabled={}\nmouse_extreme_performance={}\nmouse_protocol={}\nmouse_position={:?}\nmouse_listener_started={}\nmouse_latency_ms={:?}\npaired_peers={}\nonline_peers={}\ndiscovery_port={}\ntransfer_port={}\nmouse_port={}",
             settings.sync_enabled,
             settings.mouse_share_enabled,
+            settings.mouse_extreme_performance,
+            MOUSE_PROTOCOL,
             settings.mouse_position,
             self.mouse.listener_started(),
             self.mouse.latency_ms(),
             settings.peers.len(),
             online,
             DISCOVERY_PORT,
-            TRANSFER_PORT
+            TRANSFER_PORT,
+            MOUSE_PORT
         );
         let directory = dirs::download_dir()
             .ok_or("无法找到下载目录")?
@@ -847,7 +1057,34 @@ impl Core {
             format!("port={DISCOVERY_PORT} multicast={MULTICAST} broadcast=true"),
         );
         let socket = Arc::new(socket);
-        *self.mouse_socket.lock().expect("mouse socket lock") = Some(Arc::clone(&socket));
+        let mouse_socket = Arc::new(
+            UdpSocket::bind(("0.0.0.0", MOUSE_PORT))
+                .await
+                .map_err(|error| format!("无法监听鼠标实时端口 {MOUSE_PORT}：{error}"))?,
+        );
+        *self.mouse_socket.lock().expect("mouse socket lock") = Some(Arc::clone(&mouse_socket));
+        self.logger.info(
+            "mouse_realtime_channel_started",
+            format!("port={MOUSE_PORT} isolated_from_discovery=true"),
+        );
+
+        let mouse_receive_core = Arc::clone(self);
+        tauri::async_runtime::spawn(async move {
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let Ok((size, source)) = mouse_socket.recv_from(&mut buffer).await else {
+                    continue;
+                };
+                let Ok(packet) = serde_json::from_slice::<UdpMousePacket>(&buffer[..size]) else {
+                    continue;
+                };
+                if let Err(error) = mouse_receive_core.handle_udp_mouse(source, packet).await {
+                    mouse_receive_core
+                        .logger
+                        .warn("mouse_packet_rejected", error);
+                }
+            }
+        });
 
         let receive_core = Arc::clone(self);
         let receive_socket = Arc::clone(&socket);
@@ -966,11 +1203,6 @@ impl Core {
                     });
                     continue;
                 }
-                if let Ok(packet) = serde_json::from_slice::<UdpMousePacket>(&buffer[..size]) {
-                    if let Err(error) = receive_core.handle_udp_mouse(source, packet).await {
-                        receive_core.logger.warn("mouse_packet_rejected", error);
-                    }
-                }
             }
         });
 
@@ -978,14 +1210,20 @@ impl Core {
         tauri::async_runtime::spawn(async move {
             let multicast_target = SocketAddr::new(IpAddr::V4(MULTICAST), DISCOVERY_PORT);
             loop {
-                let packet = beacon_core.discovery_packet();
-                if let Ok(bytes) = serde_json::to_vec(&packet) {
-                    let _ = socket.send_to(&bytes, multicast_target).await;
-                    for target in discovery_broadcast_targets() {
-                        let _ = socket.send_to(&bytes, target).await;
+                let realtime_active = beacon_core.store.get().mouse_extreme_performance
+                    && beacon_core.mouse.session_active();
+                if !realtime_active {
+                    let packet = beacon_core.discovery_packet();
+                    if let Ok(bytes) = serde_json::to_vec(&packet) {
+                        let _ = socket.send_to(&bytes, multicast_target).await;
+                        for target in discovery_broadcast_targets() {
+                            let _ = socket.send_to(&bytes, target).await;
+                        }
                     }
                 }
-                let delay = if now_ms() < beacon_core.awake_until.load(Ordering::Relaxed) {
+                let delay = if realtime_active {
+                    Duration::from_secs(5)
+                } else if now_ms() < beacon_core.awake_until.load(Ordering::Relaxed) {
                     Duration::from_secs(1)
                 } else {
                     Duration::from_secs(15)
@@ -1056,9 +1294,38 @@ impl Core {
             .filter(|peer| peer.mouse_allowed)
             .map(|peer| (peer.id.clone(), peer.mouse_receive_dpi))
             .collect();
+        let routes = if settings.mouse_share_enabled {
+            settings
+                .peers
+                .iter()
+                .filter(|peer| peer.mouse_allowed)
+                .filter_map(|peer| {
+                    let seen = discovered.get(&peer.id)?;
+                    if now.saturating_sub(seen.last_seen) >= ONLINE_WINDOW_MS
+                        || !seen.mouse_share_enabled()
+                    {
+                        return None;
+                    }
+                    Some((
+                        peer.id.clone(),
+                        MouseRoute {
+                            address: SocketAddr::new(seen.host, MOUSE_PORT),
+                            key: decode_secret(&peer.secret).ok()?.try_into().ok()?,
+                        },
+                    ))
+                })
+                .collect()
+        } else {
+            HashMap::new()
+        };
         drop(discovered);
-        self.mouse
-            .configure(settings.mouse_share_enabled, targets, receive_dpi);
+        *self.mouse_routes.lock().expect("mouse routes lock") = routes;
+        self.mouse.configure(
+            settings.mouse_share_enabled,
+            settings.mouse_extreme_performance,
+            targets,
+            receive_dpi,
+        );
     }
 
     fn peer_available_for_mouse(&self, peer_id: &str) -> bool {
@@ -1176,44 +1443,28 @@ impl Core {
     }
 
     async fn send_mouse_signal(&self, outbound: OutboundMouseSignal) -> Result<(), String> {
-        let settings = self.store.get();
-        if !settings.mouse_share_enabled {
-            return Ok(());
-        }
-        let peer = settings
-            .peers
-            .iter()
-            .find(|peer| peer.id == outbound.peer_id)
-            .ok_or("鼠标目标设备未配对")?;
-        if !peer.mouse_allowed {
-            return Err("没有目标设备的鼠标权限".into());
-        }
-        let seen = self
-            .discovered
+        let route = self
+            .mouse_routes
             .lock()
-            .expect("discovery lock")
-            .get(&peer.id)
+            .expect("mouse routes lock")
+            .get(&outbound.peer_id)
             .cloned()
-            .ok_or("鼠标目标设备不在线")?;
-        if now_ms().saturating_sub(seen.last_seen) >= ONLINE_WINDOW_MS {
-            return Err("鼠标目标设备已离线".into());
-        }
+            .ok_or("鼠标目标设备不在线、未授权或未开启共享")?;
         let socket = self
             .mouse_socket
             .lock()
             .expect("mouse socket lock")
             .clone()
             .ok_or("鼠标 UDP 通道尚未启动")?;
-        let key = decode_secret(&peer.secret)?;
         let packet = UdpMousePacket {
             app: "crosscopy".into(),
             protocol: MOUSE_PROTOCOL,
-            sender_id: settings.device_id,
-            envelope: encrypt(&key, &outbound.signal)?,
+            sender_id: self.device_id.clone(),
+            envelope: encrypt(&route.key, &outbound.signal)?,
         };
         let bytes = serde_json::to_vec(&packet).map_err(|error| error.to_string())?;
         socket
-            .send_to(&bytes, SocketAddr::new(seen.host, DISCOVERY_PORT))
+            .send_to(&bytes, route.address)
             .await
             .map_err(|error| error.to_string())?;
         Ok(())
@@ -1227,18 +1478,14 @@ impl Core {
         if packet.app != "crosscopy" || packet.protocol != MOUSE_PROTOCOL {
             return Err("鼠标协议不兼容".into());
         }
-        let peer = self
-            .store
-            .get()
-            .peers
-            .into_iter()
-            .find(|peer| peer.id == packet.sender_id)
-            .ok_or("鼠标数据来自未配对设备")?;
-        if !peer.mouse_allowed {
-            return Err("已拒绝该设备的鼠标控制".into());
-        }
-        let key = decode_secret(&peer.secret)?;
-        let signal: MouseSignal = decrypt(&key, &packet.envelope)?;
+        let route = self
+            .mouse_routes
+            .lock()
+            .expect("mouse routes lock")
+            .get(&packet.sender_id)
+            .cloned()
+            .ok_or("鼠标数据来自未授权、离线或未开启共享的设备")?;
+        let signal: MouseSignal = decrypt(&route.key, &packet.envelope)?;
         let publish_state = mouse_signal_changes_state(&signal);
         let now = now_ms();
         let previous_presence = self.last_mouse_presence_refresh.load(Ordering::Relaxed);
@@ -1253,22 +1500,40 @@ impl Core {
                 self.last_mouse_presence_refresh
                     .store(now, Ordering::Relaxed);
             }
+            if route.address.ip() != source.ip() {
+                if let Some(cached) = self
+                    .mouse_routes
+                    .lock()
+                    .expect("mouse routes lock")
+                    .get_mut(&packet.sender_id)
+                {
+                    cached.address = SocketAddr::new(source.ip(), MOUSE_PORT);
+                }
+            }
+            let peer_name = self
+                .store
+                .get()
+                .peers
+                .iter()
+                .find(|peer| peer.id == packet.sender_id)
+                .map(|peer| peer.name.clone())
+                .unwrap_or_else(|| packet.sender_id.clone());
             let mut discovered = self.discovered.lock().expect("discovery lock");
-            if let Some(seen) = discovered.get_mut(&peer.id) {
+            if let Some(seen) = discovered.get_mut(&packet.sender_id) {
                 seen.host = source.ip();
                 seen.last_seen = now;
                 seen.remote_mouse_enabled = Some(true);
             } else {
                 discovered.insert(
-                    peer.id.clone(),
+                    packet.sender_id.clone(),
                     SeenPeer {
                         packet: DiscoveryPacket {
                             app: "crosscopy".into(),
                             protocol: 1,
                             instance_id: String::new(),
                             displays: Vec::new(),
-                            id: peer.id.clone(),
-                            name: peer.name.clone(),
+                            id: packet.sender_id.clone(),
+                            name: peer_name,
                             port: TRANSFER_PORT,
                             pairing_salt: None,
                             pairing_expires_at: None,
@@ -1282,7 +1547,7 @@ impl Core {
                 );
             }
         }
-        let responses = self.mouse.apply_remote(&peer.id, signal);
+        let responses = self.mouse.apply_remote(&packet.sender_id, signal);
         let response_changes_state = responses
             .iter()
             .any(|response| mouse_signal_changes_state(&response.signal));
@@ -1588,6 +1853,7 @@ impl Core {
                         direct: false,
                         clipboard_allowed: true,
                         mouse_allowed: true,
+                        filesystem_allowed: false,
                         mouse_receive_dpi: default_mouse_receive_dpi(),
                         screen_number,
                         screen_position: default_screen_position(screen_number),
@@ -1645,6 +1911,7 @@ impl Core {
             direct: true,
             clipboard_allowed: true,
             mouse_allowed: true,
+            filesystem_allowed: false,
             mouse_receive_dpi: default_mouse_receive_dpi(),
             screen_number: 0,
             screen_position: ScreenPosition::Right,
@@ -1724,6 +1991,7 @@ impl Core {
             direct: true,
             clipboard_allowed: true,
             mouse_allowed: true,
+            filesystem_allowed: false,
             mouse_receive_dpi: default_mouse_receive_dpi(),
             screen_number: 0,
             screen_position: ScreenPosition::Right,
@@ -1801,6 +2069,7 @@ impl Core {
             direct: true,
             clipboard_allowed: true,
             mouse_allowed: true,
+            filesystem_allowed: false,
             mouse_receive_dpi: default_mouse_receive_dpi(),
             screen_number: 0,
             screen_position: ScreenPosition::Right,
@@ -1931,6 +2200,75 @@ impl Core {
                         self.merge_trust_snapshot(snapshot)?;
                         Ok(())
                     }
+                    SecureMessage::Filesystem { request } => {
+                        let response = if peer.filesystem_allowed {
+                            remote_fs::handle(request).await
+                        } else {
+                            FsResponse::Error {
+                                message: "对方未授予文件系统权限".into(),
+                            }
+                        };
+                        let bytes = serde_json::to_vec(&response).map_err(|e| e.to_string())?;
+                        write_secure_frame(&mut stream, &key, &bytes).await
+                    }
+                    SecureMessage::FilesystemWrite {
+                        path,
+                        expected_modified_at,
+                        size,
+                    } => {
+                        let response = if !peer.filesystem_allowed {
+                            FsResponse::Error {
+                                message: "对方未授予文件系统权限".into(),
+                            }
+                        } else if size > 16 * 1024 * 1024 {
+                            FsResponse::Error {
+                                message: "单次编辑保存不能超过 16 MB".into(),
+                            }
+                        } else {
+                            let bytes = read_secure_frame(&mut stream, &key).await?;
+                            if bytes.len() as u64 != size {
+                                return Err("远端文件写入数据不完整".into());
+                            }
+                            remote_fs::write_bytes(path, bytes, expected_modified_at).await
+                        };
+                        let bytes = serde_json::to_vec(&response).map_err(|e| e.to_string())?;
+                        write_secure_frame(&mut stream, &key, &bytes).await
+                    }
+                    SecureMessage::FilesystemDownload { paths } => {
+                        if !peer.filesystem_allowed {
+                            return Err("对方未授予文件系统权限".into());
+                        }
+                        let roots = remote_fs::checked_paths(paths)?;
+                        let entries = build_manifest(&roots)?;
+                        write_secure_frame(
+                            &mut stream,
+                            &key,
+                            &serde_json::to_vec(&SecureMessage::Manifest {
+                                entries: entries.clone(),
+                            })
+                            .map_err(|error| error.to_string())?,
+                        )
+                        .await?;
+                        let roots = root_map(&roots);
+                        let mut buffer = vec![0_u8; CHUNK_SIZE];
+                        for entry in entries.into_iter().filter(|entry| !entry.directory) {
+                            let source = resolve_manifest_source(&entry.path, &roots)?;
+                            let mut file = File::open(source)
+                                .await
+                                .map_err(|error| error.to_string())?;
+                            loop {
+                                let size = file
+                                    .read(&mut buffer)
+                                    .await
+                                    .map_err(|error| error.to_string())?;
+                                if size == 0 {
+                                    break;
+                                }
+                                write_secure_frame(&mut stream, &key, &buffer[..size]).await?;
+                            }
+                        }
+                        Ok(())
+                    }
                     _ => Err("无效请求".into()),
                 }
             }
@@ -1990,6 +2328,7 @@ impl Core {
             direct: true,
             clipboard_allowed: true,
             mouse_allowed: true,
+            filesystem_allowed: false,
             mouse_receive_dpi: default_mouse_receive_dpi(),
             screen_number: 0,
             screen_position: ScreenPosition::Right,
@@ -2225,6 +2564,7 @@ impl Core {
                 if let Some(existing) = settings.peers.iter().find(|value| value.id == peer.id) {
                     peer.clipboard_allowed = existing.clipboard_allowed;
                     peer.mouse_allowed = existing.mouse_allowed;
+                    peer.filesystem_allowed = existing.filesystem_allowed;
                     peer.mouse_receive_dpi = existing.mouse_receive_dpi;
                     peer.screen_number = existing.screen_number;
                     peer.screen_position = existing.screen_position;
@@ -2752,7 +3092,7 @@ async fn write_secure_frame(
 
 async fn read_secure_frame(stream: &mut TcpStream, key: &[u8]) -> Result<Vec<u8>, String> {
     let size = stream.read_u32().await.map_err(|e| e.to_string())? as usize;
-    if !(28..=CHUNK_SIZE + 64 * 1024).contains(&size) {
+    if !(28..=MAX_SECURE_FRAME_SIZE).contains(&size) {
         return Err("数据帧大小无效".into());
     }
     let mut frame = vec![0_u8; size];

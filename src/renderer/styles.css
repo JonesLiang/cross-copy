@@ -737,6 +737,30 @@ nav {
   max-width: 570px;
 }
 
+.performance-mode-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  transition:
+    border-color 160ms ease,
+    background 160ms ease;
+}
+
+.performance-mode-card .settings-intro {
+  max-width: 620px;
+  margin: 0;
+}
+
+.performance-mode-card.enabled {
+  background: color-mix(in srgb, var(--accent) 7%, var(--surface));
+  border-color: color-mix(in srgb, var(--accent) 38%, var(--line));
+}
+
+.performance-mode-card.enabled .settings-intro > svg {
+  color: var(--accent);
+}
+
 .topology-card {
   padding-bottom: 18px;
 }
@@ -1599,6 +1623,315 @@ nav {
   to {
     opacity: 0.55;
   }
+}
+
+.filesystem-page {
+  display: grid;
+  gap: 12px;
+  min-height: 480px;
+}
+
+.filesystem-toolbar,
+.filesystem-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.filesystem-toolbar select,
+.filesystem-toolbar button,
+.filesystem-actions button {
+  height: 34px;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.filesystem-toolbar select {
+  max-width: 170px;
+  padding: 0 28px 0 10px;
+}
+
+.filesystem-toolbar button,
+.filesystem-actions button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0 10px;
+  cursor: pointer;
+}
+
+.filesystem-toolbar button:disabled,
+.filesystem-actions button:disabled {
+  cursor: default;
+  opacity: 0.42;
+}
+
+.filesystem-address {
+  min-width: 0;
+  height: 34px;
+  flex: 1;
+  padding: 8px 11px;
+  overflow: hidden;
+  color: var(--muted);
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.filesystem-actions {
+  padding-bottom: 4px;
+}
+
+.filesystem-actions button:last-child {
+  margin-left: auto;
+  color: var(--accent);
+}
+
+.filesystem-browser {
+  display: grid;
+  grid-template-rows: minmax(300px, 1fr) 82px;
+  min-height: 410px;
+  overflow: hidden;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: 0 6px 22px rgb(36 43 55 / 5%);
+}
+
+.filesystem-list {
+  min-height: 0;
+  overflow: auto;
+}
+
+.filesystem-list-head,
+.filesystem-entry {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) 132px 86px;
+  align-items: center;
+}
+
+.filesystem-list-head {
+  position: sticky;
+  z-index: 1;
+  top: 0;
+  height: 34px;
+  padding: 0 13px;
+  color: var(--faint);
+  background: var(--surface-soft);
+  border-bottom: 1px solid var(--line);
+  font-size: 10px;
+}
+
+.filesystem-entry {
+  width: 100%;
+  min-height: 38px;
+  padding: 0 13px;
+  color: var(--text);
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid color-mix(in srgb, var(--line) 65%, transparent);
+  text-align: left;
+  cursor: default;
+}
+
+.filesystem-entry:hover {
+  background: color-mix(in srgb, var(--accent) 5%, transparent);
+}
+
+.filesystem-entry.selected {
+  background: var(--accent-soft);
+}
+
+.filesystem-entry > span:first-child {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+}
+
+.filesystem-entry svg {
+  flex: 0 0 auto;
+  color: var(--accent);
+}
+
+.filesystem-entry b {
+  overflow: hidden;
+  font-size: 11px;
+  font-weight: 560;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.filesystem-entry small {
+  padding: 2px 5px;
+  color: var(--faint);
+  background: var(--surface-soft);
+  border-radius: 4px;
+  font-size: 8px;
+}
+
+.filesystem-entry time,
+.filesystem-entry > span:last-child {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.filesystem-loading {
+  display: grid;
+  min-height: 250px;
+  place-items: center;
+  color: var(--faint);
+  font-size: 11px;
+}
+
+.filesystem-drop {
+  display: grid;
+  grid-template-columns: 34px 1fr;
+  grid-template-rows: 1fr 1fr;
+  align-items: center;
+  padding: 13px 18px;
+  color: var(--muted);
+  background: var(--surface-soft);
+  border-top: 1px dashed var(--line);
+}
+
+.filesystem-drop svg {
+  grid-row: 1 / 3;
+  color: var(--accent);
+}
+
+.filesystem-drop strong {
+  align-self: end;
+  font-size: 11px;
+}
+
+.filesystem-drop span {
+  align-self: start;
+  color: var(--faint);
+  font-size: 9px;
+}
+
+.filesystem-message {
+  min-height: 18px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.filesystem-empty {
+  display: grid;
+  min-height: 430px;
+  place-items: center;
+  align-content: center;
+  color: var(--muted);
+  text-align: center;
+}
+
+.filesystem-empty svg {
+  color: var(--accent);
+}
+
+.filesystem-empty h2 {
+  margin: 14px 0 5px;
+  color: var(--text);
+  font-size: 16px;
+}
+
+.filesystem-empty p {
+  margin: 0;
+  font-size: 11px;
+}
+
+.editor-backdrop {
+  position: fixed;
+  z-index: 20;
+  display: grid;
+  inset: 0;
+  padding: 54px;
+  place-items: center;
+  background: rgb(12 16 24 / 54%);
+  backdrop-filter: blur(3px);
+}
+
+.remote-editor {
+  display: grid;
+  grid-template-rows: 46px minmax(300px, 1fr) 58px;
+  width: min(780px, 90vw);
+  height: min(620px, 84vh);
+  overflow: hidden;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  box-shadow: 0 24px 80px rgb(0 0 0 / 28%);
+}
+
+.remote-editor header,
+.remote-editor footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 14px;
+}
+
+.remote-editor header {
+  border-bottom: 1px solid var(--line);
+}
+
+.remote-editor header span,
+.remote-editor footer button {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.remote-editor header strong {
+  font-size: 12px;
+}
+
+.remote-editor header button {
+  display: grid;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  place-items: center;
+  color: var(--muted);
+  background: transparent;
+  border: 0;
+  border-radius: 7px;
+  cursor: pointer;
+}
+
+.remote-editor textarea {
+  width: 100%;
+  height: 100%;
+  padding: 18px;
+  resize: none;
+  color: var(--text);
+  background: var(--surface-soft);
+  border: 0;
+  outline: 0;
+  font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.65;
+  tab-size: 2;
+}
+
+.remote-editor footer {
+  border-top: 1px solid var(--line);
+}
+
+.remote-editor footer small {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 9px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 @media (prefers-color-scheme: dark) {
