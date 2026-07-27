@@ -4,6 +4,7 @@ import {
   ArrowDownLeft,
   ArrowLeft,
   ArrowUpRight,
+  CaretDown,
   Check,
   Clipboard,
   Copy,
@@ -435,7 +436,7 @@ function App(): React.JSX.Element {
                   ? "直接浏览和管理已授权电脑上的文件"
                 : view === "mouse"
                   ? "把另一台电脑放到逻辑方位，鼠标即可跨越屏幕"
-                : "配置快捷键、后台启动、系统权限和诊断"}
+                : "管理设备权限、后台启动、系统权限和诊断"}
             </p>
           </div>
           {view === "clipboard" && (
@@ -502,6 +503,8 @@ function App(): React.JSX.Element {
                 <i aria-hidden="true" />
               </label>
             </section>
+
+            <ShortcutSettings mode="clipboard" state={state} />
 
             <section className="section-block">
               <div className="section-heading">
@@ -589,29 +592,6 @@ function App(): React.JSX.Element {
               )}
             </section>
 
-            <div className="footer-settings">
-              <div className="diagnostics-setting">
-                <button type="button" onClick={() => void exportDiagnostics()}>
-                  <FileText size={17} />
-                  导出诊断日志
-                </button>
-                {diagnosticsMessage && <small>{diagnosticsMessage}</small>}
-              </div>
-              <label className="login-setting">
-                <span>
-                  <strong>开机自动启动</strong>
-                  <small>保持后台运行，电脑上线后自动连接</small>
-                </span>
-                <input
-                  type="checkbox"
-                  checked={state.launchAtLogin}
-                  onChange={(event) =>
-                    void crosscopy.setLaunchAtLogin(event.target.checked)
-                  }
-                />
-                <i aria-hidden="true" />
-              </label>
-            </div>
           </>
         )}
       </section>
@@ -918,6 +898,70 @@ type RemoteEditor = {
   modifiedAt: number | null;
 };
 
+function DeviceSelect(props: {
+  value: string;
+  options: Array<{ value: string; label: string; detail: string }>;
+  onChange(value: string): void;
+}): React.JSX.Element {
+  const [open, setOpen] = useState(false);
+  const root = useRef<HTMLDivElement>(null);
+  const selected =
+    props.options.find((option) => option.value === props.value) ??
+    props.options[0];
+
+  useEffect(() => {
+    function close(event: MouseEvent): void {
+      if (!root.current?.contains(event.target as Node)) setOpen(false);
+    }
+    document.addEventListener("mousedown", close);
+    return () => document.removeEventListener("mousedown", close);
+  }, []);
+
+  return (
+    <div className="device-select" ref={root}>
+      <button
+        className="device-select-trigger"
+        type="button"
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        onClick={() => setOpen((value) => !value)}
+      >
+        <span className="device-select-icon">
+          <Desktop size={16} />
+        </span>
+        <span>
+          <strong>{selected?.label ?? "选择电脑"}</strong>
+          <small>{selected?.detail ?? "没有可用设备"}</small>
+        </span>
+        <CaretDown size={14} />
+      </button>
+      {open && (
+        <div className="device-select-menu" role="listbox">
+          {props.options.map((option) => (
+            <button
+              className={option.value === selected?.value ? "selected" : ""}
+              type="button"
+              role="option"
+              aria-selected={option.value === selected?.value}
+              key={option.value}
+              onClick={() => {
+                props.onChange(option.value);
+                setOpen(false);
+              }}
+            >
+              <span>
+                <strong>{option.label}</strong>
+                <small>{option.detail}</small>
+              </span>
+              {option.value === selected?.value && <Check size={15} weight="bold" />}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function FilesystemPanel(props: { state: UiState }): React.JSX.Element {
   const availablePeers = props.state.peers.filter(
     (peer) => peer.online && peer.filesystemAllowed
@@ -1155,13 +1199,15 @@ function FilesystemPanel(props: { state: UiState }): React.JSX.Element {
   return (
     <div className="filesystem-page">
       <div className="filesystem-toolbar">
-        <select value={peer?.id ?? ""} onChange={(event) => setPeerId(event.target.value)}>
-          {availablePeers.map((candidate) => (
-            <option key={candidate.id} value={candidate.id}>
-              {candidate.name}
-            </option>
-          ))}
-        </select>
+        <DeviceSelect
+          value={peer?.id ?? ""}
+          options={availablePeers.map((candidate) => ({
+            value: candidate.id,
+            label: candidate.name,
+            detail: `屏幕 ${candidate.screenNumber} · 已连接`
+          }))}
+          onChange={setPeerId}
+        />
         <button type="button" disabled={!path} onClick={() => setPath(path ? parentRemotePath(path) : null)}>
           <ArrowLeft size={16} /> 返回
         </button>
@@ -1437,54 +1483,61 @@ function MousePanel(props: { state: UiState }): React.JSX.Element {
 
   return (
     <div className="mouse-page">
-      <section className="settings-group mouse-toggle-card">
-        <div className="settings-intro">
-          <MouseSimple size={23} />
-          <div>
-            <h2>共享鼠标</h2>
-            <p>
-              移动到对应边缘，或按 Ctrl+Shift+屏幕编号，直接把本机鼠标切换过去。
-            </p>
+      <section className="settings-group preference-list feature-controls">
+        <div className="preference-row">
+          <div className="settings-intro">
+            <span className="preference-icon">
+              <MouseSimple size={20} />
+            </span>
+            <div>
+              <h2>共享鼠标</h2>
+              <p>
+                移动到对应边缘，或按 Ctrl+Shift+屏幕编号，直接把本机鼠标切换过去。
+              </p>
+            </div>
           </div>
+          <label className="login-setting">
+            <input
+              type="checkbox"
+              checked={props.state.mouseShareEnabled}
+              disabled={props.state.peers.length === 0}
+              onChange={(event) =>
+                void crosscopy.setMouseShareEnabled(event.target.checked)
+              }
+            />
+            <i aria-hidden="true" />
+          </label>
         </div>
-        <label className="login-setting">
-          <input
-            type="checkbox"
-            checked={props.state.mouseShareEnabled}
-            disabled={props.state.peers.length === 0}
-            onChange={(event) =>
-              void crosscopy.setMouseShareEnabled(event.target.checked)
-            }
-          />
-          <i aria-hidden="true" />
-        </label>
+        <div
+          className={`preference-row performance-mode-card ${
+            props.state.mouseExtremePerformance ? "enabled" : ""
+          }`}
+        >
+          <div className="settings-intro">
+            <span className="preference-icon">
+              <Lightning size={19} weight="fill" />
+            </span>
+            <div>
+              <h2>极致性能模式</h2>
+              <p>
+                优先保证跨屏流畅度；两端都开启效果最佳，控制期间会增加处理器、网络与电量消耗。
+              </p>
+            </div>
+          </div>
+          <label className="login-setting">
+            <input
+              type="checkbox"
+              checked={props.state.mouseExtremePerformance}
+              onChange={(event) =>
+                void crosscopy.setMouseExtremePerformance(event.target.checked)
+              }
+            />
+            <i aria-hidden="true" />
+          </label>
+        </div>
       </section>
 
-      <section
-        className={`settings-group performance-mode-card ${
-          props.state.mouseExtremePerformance ? "enabled" : ""
-        }`}
-      >
-        <div className="settings-intro">
-          <Lightning size={22} weight="fill" />
-          <div>
-            <h2>极致性能模式</h2>
-            <p>
-              优先保证跨屏流畅度，启用独立实时通道和即时鼠标更新；两端都开启效果最佳，活跃控制期间会增加处理器、网络与电量消耗。
-            </p>
-          </div>
-        </div>
-        <label className="login-setting">
-          <input
-            type="checkbox"
-            checked={props.state.mouseExtremePerformance}
-            onChange={(event) =>
-              void crosscopy.setMouseExtremePerformance(event.target.checked)
-            }
-          />
-          <i aria-hidden="true" />
-        </label>
-      </section>
+      <ShortcutSettings mode="mouse" state={props.state} />
 
       <section className="settings-group topology-card">
         <div className="topology-heading">
@@ -1715,16 +1768,14 @@ function PeerDpiControl(props: {
   );
 }
 
-function SettingsPanel(props: {
+function ShortcutSettings(props: {
+  mode: "clipboard" | "mouse";
   state: UiState;
-  diagnosticsMessage: string;
-  onDiagnostics(): Promise<void>;
 }): React.JSX.Element {
   const [copy, setCopy] = useState(props.state.copyShortcut);
   const [paste, setPaste] = useState(props.state.pasteShortcut);
   const [mouse, setMouse] = useState(props.state.mouseShortcut);
   const [message, setMessage] = useState("");
-  const isMac = navigator.userAgent.includes("Mac");
 
   useEffect(() => {
     setCopy(props.state.copyShortcut);
@@ -1747,32 +1798,55 @@ function SettingsPanel(props: {
   }
 
   return (
-    <div className="settings-page">
-      <section className="settings-group">
-        <div className="settings-intro">
-          <Keyboard size={22} />
-          <div>
-            <h2>跨设备快捷键</h2>
-            <p>点击输入框后按下组合键。普通复制和粘贴只保留在本机。</p>
-          </div>
+    <section className="settings-group shortcut-card">
+      <div className="settings-intro">
+        <span className="preference-icon">
+          <Keyboard size={19} />
+        </span>
+        <div>
+          <h2>
+            {props.mode === "clipboard" ? "剪贴板快捷键" : "鼠标共享快捷键"}
+          </h2>
+          <p>
+            {props.mode === "clipboard"
+              ? "专用组合键不会覆盖普通复制和粘贴。"
+              : "用于快速开启或关闭鼠标共享。"}
+          </p>
         </div>
-        <div className="shortcut-grid">
-          <ShortcutInput label="跨设备复制" value={copy} onChange={setCopy} />
-          <ShortcutInput label="跨设备粘贴" value={paste} onChange={setPaste} />
+      </div>
+      <div className={`shortcut-grid ${props.mode === "mouse" ? "single" : ""}`}>
+        {props.mode === "clipboard" ? (
+          <>
+            <ShortcutInput label="跨设备复制" value={copy} onChange={setCopy} />
+            <ShortcutInput label="跨设备粘贴" value={paste} onChange={setPaste} />
+          </>
+        ) : (
           <ShortcutInput
             label="开启或关闭鼠标共享"
             value={mouse}
             onChange={setMouse}
           />
-        </div>
-        <div className="settings-actions">
-          <button className="primary-button" type="button" onClick={() => void save()}>
-            保存快捷键
-          </button>
-          {message && <span>{message}</span>}
-        </div>
-      </section>
+        )}
+      </div>
+      <div className="settings-actions">
+        <button className="primary-button" type="button" onClick={() => void save()}>
+          保存快捷键
+        </button>
+        {message && <span>{message}</span>}
+      </div>
+    </section>
+  );
+}
 
+function SettingsPanel(props: {
+  state: UiState;
+  diagnosticsMessage: string;
+  onDiagnostics(): Promise<void>;
+}): React.JSX.Element {
+  const isMac = navigator.userAgent.includes("Mac");
+
+  return (
+    <div className="settings-page">
       <section className="settings-group">
         <div className="settings-intro">
           <ShieldCheck size={22} />
@@ -1856,52 +1930,55 @@ function SettingsPanel(props: {
         </div>
       </section>
 
-      <section className="settings-group settings-row">
-        <span>
-          <strong>开机自动启动</strong>
-          <small>关闭主窗口后仍在托盘低功耗运行</small>
-        </span>
-        <label className="login-setting">
-          <input
-            type="checkbox"
-            checked={props.state.launchAtLogin}
-            onChange={(event) =>
-              void crosscopy.setLaunchAtLogin(event.target.checked)
-            }
-          />
-          <i aria-hidden="true" />
-        </label>
-      </section>
-
-      {isMac && (
-        <section className="settings-group settings-row">
+      <section className="settings-group preference-list">
+        <div className="preference-row">
           <span>
-            <strong>辅助功能权限</strong>
-            <small>用于跨设备快捷键和鼠标控制，不会转发键盘输入</small>
+            <strong>开机自动启动</strong>
+            <small>关闭主窗口后仍在托盘低功耗运行</small>
           </span>
-          <div className="diagnostics-setting">
+          <label className="login-setting">
+            <input
+              type="checkbox"
+              checked={props.state.launchAtLogin}
+              onChange={(event) =>
+                void crosscopy.setLaunchAtLogin(event.target.checked)
+              }
+            />
+            <i aria-hidden="true" />
+          </label>
+        </div>
+        {isMac && (
+          <div className="preference-row">
+            <span>
+              <strong>辅助功能权限</strong>
+              <small>用于跨设备快捷键和鼠标控制，不会转发键盘输入</small>
+            </span>
             <button
+              className="secondary-button"
               type="button"
               onClick={() => void crosscopy.openInputPermissions()}
             >
-              <ShieldCheck size={17} />
+              <ShieldCheck size={16} />
               打开系统设置
             </button>
           </div>
-        </section>
-      )}
-
-      <section className="settings-group settings-row">
-        <span>
-          <strong>诊断日志</strong>
-          <small>不包含配对码、剪贴板内容或完整文件路径</small>
-        </span>
-        <div className="diagnostics-setting">
-          <button type="button" onClick={() => void props.onDiagnostics()}>
-            <FileText size={17} />
-            导出日志
-          </button>
-          {props.diagnosticsMessage && <small>{props.diagnosticsMessage}</small>}
+        )}
+        <div className="preference-row">
+          <span>
+            <strong>诊断日志</strong>
+            <small>不包含配对码、剪贴板内容或完整文件路径</small>
+          </span>
+          <div className="diagnostics-setting">
+            <button
+              className="secondary-button"
+              type="button"
+              onClick={() => void props.onDiagnostics()}
+            >
+              <FileText size={16} />
+              导出日志
+            </button>
+            {props.diagnosticsMessage && <small>{props.diagnosticsMessage}</small>}
+          </div>
         </div>
       </section>
     </div>

@@ -1,4 +1,3 @@
-use crate::mouse_hook::SYNTHETIC_INPUT_MARKER;
 use crate::{
     logger::Logger,
     model::ScreenPosition,
@@ -155,6 +154,7 @@ struct Runtime {
 struct Inner {
     enabled: AtomicBool,
     extreme_performance: Arc<AtomicBool>,
+    synthetic_input_until: Arc<AtomicU64>,
     listener_attempted: AtomicBool,
     listener_started: AtomicBool,
     latency_ms: AtomicU64,
@@ -175,6 +175,8 @@ impl MouseShare {
         let (injector, injection_receiver) = std_mpsc::sync_channel(128);
         let extreme_performance = Arc::new(AtomicBool::new(false));
         let injector_extreme_performance = Arc::clone(&extreme_performance);
+        let synthetic_input_until = Arc::new(AtomicU64::new(0));
+        let injector_synthetic_input_until = Arc::clone(&synthetic_input_until);
         let mut enigo = Enigo::new(&mouse_input_settings()).ok();
         let bounds = screen_bounds();
         let injection_logger = Arc::clone(&logger);
@@ -196,6 +198,16 @@ impl MouseShare {
                         set_realtime_priority(requested);
                         high_priority = requested;
                     }
+                    if matches!(
+                        event,
+                        HookMouseEvent::Button { .. } | HookMouseEvent::Scroll { .. }
+                    ) {
+                        // Enigo does not expose an OS event marker for buttons and
+                        // scrolling. Keep this narrow so real local movement still
+                        // takes control immediately.
+                        injector_synthetic_input_until
+                            .store(now_ms().saturating_add(24), Ordering::Release);
+                    }
                     if let Err(error) = inject_mouse_event(&mut enigo, event) {
                         let now = now_ms();
                         if now.saturating_sub(last_error_log) >= 1_000 {
@@ -209,6 +221,7 @@ impl MouseShare {
             inner: Arc::new(Inner {
                 enabled: AtomicBool::new(false),
                 extreme_performance,
+                synthetic_input_until,
                 listener_attempted: AtomicBool::new(false),
                 listener_started: AtomicBool::new(false),
                 latency_ms: AtomicU64::new(NO_LATENCY),
@@ -1052,7 +1065,11 @@ impl Inner {
     }
 
     fn handle_local_event(&self, event: HookMouseEvent) -> bool {
-        self.last_physical_at.store(now_ms(), Ordering::Relaxed);
+        let now = now_ms();
+        if now <= self.synthetic_input_until.load(Ordering::Acquire) {
+            return false;
+        }
+        self.last_physical_at.store(now, Ordering::Relaxed);
         if !self.enabled.load(Ordering::Acquire) {
             return false;
         }
@@ -1537,11 +1554,11 @@ fn event_kind(event: HookMouseEvent) -> &'static str {
 fn inject_mouse_event(enigo: &mut Enigo, event: HookMouseEvent) -> Result<(), String> {
     match event {
         HookMouseEvent::Move { x, y, .. } => {
-            #[cfg(target_os = "windows")]
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
             {
                 crate::mouse_hook::move_cursor_absolute(x, y)
             }
-            #[cfg(not(target_os = "windows"))]
+            #[cfg(not(any(target_os = "windows", target_os = "macos")))]
             {
                 enigo
                     .move_mouse(x, y, Coordinate::Abs)

@@ -38,7 +38,9 @@ body {
 }
 
 button,
-input {
+input,
+select,
+textarea {
   font: inherit;
 }
 
@@ -47,7 +49,9 @@ button {
 }
 
 button:focus-visible,
-input:focus-visible {
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible {
   outline: 3px solid color-mix(in srgb, var(--accent) 26%, transparent);
   outline-offset: 2px;
 }
@@ -293,6 +297,27 @@ nav {
 .primary-button:disabled {
   cursor: not-allowed;
   opacity: 0.52;
+}
+
+.secondary-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-height: 34px;
+  padding: 0 11px;
+  color: var(--text);
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  box-shadow: 0 1px 2px rgb(29 37 52 / 4%);
+  font-size: 11px;
+  font-weight: 590;
+  cursor: pointer;
+}
+
+.secondary-button:hover {
+  background: color-mix(in srgb, var(--surface-soft) 82%, var(--line));
 }
 
 .connection-panel {
@@ -628,7 +653,7 @@ nav {
 .settings-page {
   display: grid;
   gap: 16px;
-  max-width: 720px;
+  max-width: 820px;
 }
 
 .settings-group {
@@ -648,6 +673,17 @@ nav {
   color: var(--accent);
 }
 
+.preference-icon {
+  display: grid;
+  flex: 0 0 auto;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-radius: 9px;
+}
+
 .settings-intro h2 {
   margin: 0 0 5px;
   font-size: 15px;
@@ -664,6 +700,10 @@ nav {
   grid-template-columns: 1fr 1fr;
   gap: 14px;
   margin-top: 22px;
+}
+
+.shortcut-grid.single {
+  grid-template-columns: minmax(240px, 0.5fr);
 }
 
 .shortcut-input {
@@ -718,6 +758,57 @@ nav {
 .settings-row > span strong {
   margin-bottom: 4px;
   font-size: 12px;
+}
+
+.preference-list {
+  padding: 0;
+  overflow: hidden;
+}
+
+.preference-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 22px;
+  min-height: 68px;
+  padding: 16px 18px;
+}
+
+.preference-row + .preference-row {
+  border-top: 1px solid var(--line);
+}
+
+.preference-row > span:first-child,
+.preference-row > span:first-child strong,
+.preference-row > span:first-child small {
+  display: block;
+}
+
+.preference-row > span:first-child strong {
+  margin-bottom: 4px;
+  font-size: 12px;
+}
+
+.preference-row > span:first-child small {
+  color: var(--faint);
+  font-size: 10px;
+}
+
+.feature-controls .settings-intro {
+  min-width: 0;
+  flex: 1;
+}
+
+.feature-controls .performance-mode-card {
+  border-radius: 0;
+}
+
+.feature-controls .performance-mode-card.enabled {
+  background: color-mix(in srgb, var(--accent) 6%, var(--surface));
+}
+
+.shortcut-card {
+  max-width: 820px;
 }
 
 .mouse-page {
@@ -1094,7 +1185,7 @@ nav {
   align-items: center;
   gap: 12px;
   padding: 10px 12px;
-  background: color-mix(in srgb, var(--panel) 80%, var(--accent-soft));
+  background: color-mix(in srgb, var(--surface) 80%, var(--accent-soft));
   border: 1px solid var(--line);
   border-radius: 9px;
 }
@@ -1147,7 +1238,7 @@ nav {
 
 .permission-row {
   display: grid;
-  grid-template-columns: minmax(180px, 1fr) auto auto;
+  grid-template-columns: minmax(180px, 1fr) auto auto auto;
   align-items: center;
   gap: 18px;
   padding: 12px;
@@ -1380,6 +1471,11 @@ nav {
 .diagnostics-setting button:hover {
   color: var(--text);
   background: var(--surface);
+}
+
+.diagnostics-setting .secondary-button {
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
 }
 
 .diagnostics-setting small {
@@ -1638,7 +1734,6 @@ nav {
   gap: 8px;
 }
 
-.filesystem-toolbar select,
 .filesystem-toolbar button,
 .filesystem-actions button {
   height: 34px;
@@ -1648,11 +1743,6 @@ nav {
   border-radius: 8px;
 }
 
-.filesystem-toolbar select {
-  max-width: 170px;
-  padding: 0 28px 0 10px;
-}
-
 .filesystem-toolbar button,
 .filesystem-actions button {
   display: inline-flex;
@@ -1660,6 +1750,114 @@ nav {
   gap: 5px;
   padding: 0 10px;
   cursor: pointer;
+}
+
+.device-select {
+  position: relative;
+  z-index: 4;
+  width: 218px;
+  flex: 0 0 auto;
+}
+
+.device-select-trigger {
+  display: grid !important;
+  grid-template-columns: 30px minmax(0, 1fr) 14px;
+  align-items: center;
+  gap: 8px !important;
+  width: 100%;
+  height: 44px !important;
+  padding: 0 10px !important;
+  text-align: left;
+}
+
+.device-select-trigger > span:nth-child(2),
+.device-select-trigger strong,
+.device-select-trigger small {
+  display: block;
+  min-width: 0;
+}
+
+.device-select-trigger strong,
+.device-select-trigger small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.device-select-trigger strong {
+  font-size: 11px;
+}
+
+.device-select-trigger small {
+  margin-top: 2px;
+  color: var(--faint);
+  font-size: 8px;
+}
+
+.device-select-icon {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-radius: 8px;
+}
+
+.device-select-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  display: grid;
+  width: 100%;
+  padding: 5px;
+  background: color-mix(in srgb, var(--surface) 96%, transparent);
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  box-shadow: 0 16px 42px rgb(22 29 42 / 18%);
+  backdrop-filter: blur(18px);
+}
+
+.device-select-menu button {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-width: 0;
+  height: auto;
+  padding: 8px 9px;
+  color: var(--text);
+  background: transparent;
+  border: 0;
+  border-radius: 7px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.device-select-menu button:hover,
+.device-select-menu button.selected {
+  background: var(--accent-soft);
+}
+
+.device-select-menu button > span,
+.device-select-menu strong,
+.device-select-menu small {
+  display: block;
+  min-width: 0;
+}
+
+.device-select-menu strong {
+  font-size: 10px;
+}
+
+.device-select-menu small {
+  margin-top: 2px;
+  color: var(--faint);
+  font-size: 8px;
+}
+
+.device-select-menu svg {
+  flex: 0 0 auto;
+  color: var(--accent);
 }
 
 .filesystem-toolbar button:disabled,

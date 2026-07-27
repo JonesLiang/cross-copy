@@ -151,6 +151,31 @@ pub fn recenter_cursor(x: i32, y: i32, bounds: DesktopBounds) -> Result<(), Stri
     .map_err(|error| format!("macOS 鼠标回中失败：{error:?}"))
 }
 
+#[cfg(target_os = "macos")]
+pub fn move_cursor_absolute(x: i32, y: i32) -> Result<(), String> {
+    use core_graphics::{
+        event::{CGEvent, CGEventTapLocation, CGEventType, CGMouseButton, EventField},
+        event_source::{CGEventSource, CGEventSourceStateID},
+        geometry::CGPoint,
+    };
+
+    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+        .map_err(|_| "无法创建 macOS 鼠标事件源".to_string())?;
+    let event = CGEvent::new_mouse_event(
+        source,
+        CGEventType::MouseMoved,
+        CGPoint::new(f64::from(x), f64::from(y)),
+        CGMouseButton::Left,
+    )
+    .map_err(|_| "无法创建 macOS 鼠标移动事件".to_string())?;
+    event.set_integer_value_field(
+        EventField::EVENT_SOURCE_USER_DATA,
+        SYNTHETIC_INPUT_MARKER as i64,
+    );
+    event.post(CGEventTapLocation::HID);
+    Ok(())
+}
+
 #[cfg(target_os = "windows")]
 pub fn recenter_cursor(x: i32, y: i32, bounds: DesktopBounds) -> Result<(), String> {
     move_cursor_absolute(bounds.x.saturating_add(x), bounds.y.saturating_add(y))
