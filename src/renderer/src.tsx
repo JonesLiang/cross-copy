@@ -40,6 +40,10 @@ const crosscopy = {
     invoke<void>("set_launch_at_login", { value }),
   unpair: (peerId: string) => invoke<void>("unpair", { peerId }),
   exportDiagnostics: () => invoke<string>("export_diagnostics"),
+  getUpdateEnvironment: () =>
+    invoke<UpdateEnvironment>("get_update_environment"),
+  logUpdateEvent: (level: string, event: string, detail: string) =>
+    invoke<void>("log_update_event", { level, event, detail }),
   wakeNetwork: () => invoke<void>("wake_network"),
   openInputPermissions: () => invoke<void>("open_input_permissions"),
   setShortcuts: (copy: string, paste: string, mouse: string) =>
@@ -86,6 +90,10 @@ const EMPTY_STATE: UiState = {
 };
 
 type PairMode = "choose" | "show" | "enter" | null;
+type UpdateEnvironment = {
+  ready: boolean;
+  reason: string | null;
+};
 type UpdateState =
   | { kind: "idle" }
   | { kind: "checking" }
@@ -93,7 +101,7 @@ type UpdateState =
   | { kind: "downloading"; version: string; progress: number | null }
   | { kind: "installing"; version: string }
   | { kind: "current" }
-  | { kind: "error" };
+  | { kind: "error"; message: string };
 
 function App(): React.JSX.Element {
   const [state, setState] = useState<UiState>(EMPTY_STATE);
@@ -195,16 +203,33 @@ function App(): React.JSX.Element {
   async function checkForUpdate(showCurrent: boolean): Promise<void> {
     setUpdateState({ kind: "checking" });
     try {
+      const environment = await crosscopy.getUpdateEnvironment();
+      if (!environment.ready) {
+        const message = environment.reason ?? "当前安装位置不支持自动更新";
+        setUpdateState({ kind: "error", message });
+        return;
+      }
+      void crosscopy.logUpdateEvent("info", "check_started", "source=ui");
       const update = await check({ timeout: 12_000 });
       if (!update) {
+        void crosscopy.logUpdateEvent("info", "check_current", "available=false");
         setUpdateState(showCurrent ? { kind: "current" } : { kind: "idle" });
         return;
       }
       await availableUpdate.current?.close();
       availableUpdate.current = update;
+      void crosscopy.logUpdateEvent(
+        "info",
+        "check_available",
+        `version=${update.version}`
+      );
       setUpdateState({ kind: "available", version: update.version });
-    } catch {
-      setUpdateState(showCurrent ? { kind: "error" } : { kind: "idle" });
+    } catch (reason) {
+      const message = updateErrorMessage(reason, "连接更新服务器失败");
+      void crosscopy.logUpdateEvent("error", "check_failed", message);
+      setUpdateState(
+        showCurrent ? { kind: "error", message } : { kind: "idle" }
+      );
     }
   }
 
@@ -223,6 +248,11 @@ function App(): React.JSX.Element {
       version: update.version,
       progress: null
     });
+    void crosscopy.logUpdateEvent(
+      "info",
+      "download_started",
+      `version=${update.version}`
+    );
     for (let attempt = 1; attempt <= 3; attempt += 1) {
       const activeUpdate = update;
       received = 0;
@@ -249,17 +279,37 @@ function App(): React.JSX.Element {
             });
           }
         });
-        await relaunch();
+        void crosscopy.logUpdateEvent(
+          "info",
+          "install_completed",
+          `version=${activeUpdate.version}`
+        );
+        try {
+          await relaunch();
+        } catch (reason) {
+          const message = updateErrorMessage(
+            reason,
+            `v${activeUpdate.version} 已安装，请完全退出后从“应用程序”重新打开`
+          );
+          void crosscopy.logUpdateEvent("error", "relaunch_failed", message);
+          setUpdateState({ kind: "error", message });
+        }
         return;
-      } catch {
+      } catch (reason) {
+        const message = updateErrorMessage(reason, "更新包下载或安装失败");
+        void crosscopy.logUpdateEvent(
+          attempt === 3 ? "error" : "warn",
+          "download_install_failed",
+          `attempt=${attempt} error=${message}`
+        );
         if (attempt === 3) {
-          setUpdateState({ kind: "error" });
+          setUpdateState({ kind: "error", message });
           return;
         }
         await activeUpdate.close().catch(() => undefined);
         const retryUpdate = await check({ timeout: 15_000 }).catch(() => null);
         if (!retryUpdate) {
-          setUpdateState({ kind: "error" });
+          setUpdateState({ kind: "error", message });
           return;
         }
         update = retryUpdate;
@@ -590,8 +640,8 @@ function UpdateControl(props: {
       >
         <WarningCircle size={15} />
         <span>
-          <strong>更新检查失败</strong>
-          <small>点击重试</small>
+          <strong>更新失败</strong>
+          <small title={state.message}>{state.message}</small>
         </span>
       </button>
     );
@@ -627,6 +677,18 @@ function UpdateControl(props: {
       </span>
     </div>
   );
+}
+
+function updateErrorMessage(reason: unknown, fallback: string): string {
+  if (typeof reason === "string" && reason.trim()) return reason;
+  if (reason instanceof Error && reason.message.trim()) return reason.message;
+  try {
+    const serialized = JSON.stringify(reason);
+    if (serialized && serialized !== "{}") return serialized;
+  } catch {
+    // The updater can return non-serializable native errors.
+  }
+  return fallback;
 }
 
 function PairDialog(props: {

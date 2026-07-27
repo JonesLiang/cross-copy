@@ -275,6 +275,15 @@ impl Core {
         })
     }
 
+    pub fn log_update_event(&self, level: &str, event: &str, detail: &str) {
+        let event = format!("update_{event}");
+        match level {
+            "error" => self.logger.error(&event, detail),
+            "warn" => self.logger.warn(&event, detail),
+            _ => self.logger.info(&event, detail),
+        }
+    }
+
     pub async fn start(self: &Arc<Self>) -> Result<(), String> {
         self.logger.info(
             "service_start",

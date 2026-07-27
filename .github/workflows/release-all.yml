@@ -75,10 +75,13 @@ jobs:
 
       - name: 生成 DMG
         run: |
+          DMG_ROOT="$(mktemp -d)"
+          cp -R src-tauri/target/universal-apple-darwin/release/bundle/macos/CrossCopy.app "$DMG_ROOT/CrossCopy.app"
+          ln -s /Applications "$DMG_ROOT/Applications"
           mkdir -p src-tauri/target/universal-apple-darwin/release/bundle/dmg
           hdiutil create \
             -volname CrossCopy \
-            -srcfolder src-tauri/target/universal-apple-darwin/release/bundle/macos/CrossCopy.app \
+            -srcfolder "$DMG_ROOT" \
             -ov \
             -format UDZO \
             src-tauri/target/universal-apple-darwin/release/bundle/dmg/CrossCopy_Universal.dmg

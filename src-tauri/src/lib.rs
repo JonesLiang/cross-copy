@@ -9,6 +9,9 @@ mod mouse_share;
 mod store;
 
 use crate::core::Core;
+use serde::Serialize;
+#[cfg(target_os = "macos")]
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tauri::{
     menu::{Menu, MenuItem},
@@ -126,6 +129,29 @@ fn open_input_permissions() -> Result<(), String> {
             .map_err(|error| format!("无法打开辅助功能设置：{error}"))?;
     }
     Ok(())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateEnvironment {
+    ready: bool,
+    reason: Option<String>,
+}
+
+#[tauri::command]
+fn get_update_environment(core: State<'_, Arc<Core>>) -> UpdateEnvironment {
+    let (environment, location) = update_environment();
+    core.log_update_event(
+        if environment.ready { "info" } else { "warn" },
+        "environment",
+        &format!("ready={} location={location}", environment.ready),
+    );
+    environment
+}
+
+#[tauri::command]
+fn log_update_event(core: State<'_, Arc<Core>>, level: String, event: String, detail: String) {
+    core.log_update_event(&level, &event, &detail);
 }
 
 #[tauri::command]
@@ -270,12 +296,22 @@ pub fn run() {
                 .build(),
         )
         .setup(|app| {
+            use tauri_plugin_autostart::ManagerExt;
+
             let app_dir = app.path().app_data_dir()?;
             let store = Arc::new(store::Store::load(app_dir.clone())?);
             let logger = Arc::new(logger::Logger::new(&app_dir)?);
             let core = Core::new(store, Arc::clone(&logger), app.handle().clone());
             app.manage(Arc::clone(&core));
             let shortcuts = core.store.get();
+            if shortcuts.launch_at_login {
+                let _ = app.autolaunch().disable();
+                if let Err(error) = app.autolaunch().enable() {
+                    logger.warn("update_autostart_refresh_failed", error.to_string());
+                } else {
+                    logger.info("update_autostart_refreshed", "target=current_executable");
+                }
+            }
             let registered = [
                 shortcuts.copy_shortcut,
                 shortcuts.paste_shortcut,
@@ -355,10 +391,70 @@ pub fn run() {
             export_diagnostics,
             wake_network,
             open_input_permissions,
+            get_update_environment,
+            log_update_event,
             set_shortcuts
         ])
         .run(tauri::generate_context!())
         .expect("failed to run CrossCopy");
+}
+
+fn update_environment() -> (UpdateEnvironment, &'static str) {
+    #[cfg(target_os = "macos")]
+    {
+        let executable = std::env::current_exe().unwrap_or_default();
+        let bundle = macos_bundle_path(&executable);
+        let translocated = executable.to_string_lossy().contains("/AppTranslocation/");
+        let installed = bundle.as_ref().is_some_and(|path| {
+            path.starts_with("/Applications")
+                || dirs::home_dir()
+                    .map(|home| path.starts_with(home.join("Applications")))
+                    .unwrap_or(false)
+        });
+        let location = if translocated {
+            "app_translocation"
+        } else if installed {
+            "applications"
+        } else {
+            "portable"
+        };
+        if translocated || !installed {
+            return (
+                UpdateEnvironment {
+                    ready: false,
+                    reason: Some(
+                        "当前运行的是下载目录或 macOS 隔离副本。请完全退出 CrossCopy，将 DMG 中的 CrossCopy 拖入“应用程序”，再从“应用程序”启动后更新。"
+                            .into(),
+                    ),
+                },
+                location,
+            );
+        }
+        return (
+            UpdateEnvironment {
+                ready: true,
+                reason: None,
+            },
+            location,
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    (
+        UpdateEnvironment {
+            ready: true,
+            reason: None,
+        },
+        "installed",
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn macos_bundle_path(executable: &Path) -> Option<PathBuf> {
+    executable
+        .ancestors()
+        .find(|path| path.extension().is_some_and(|extension| extension == "app"))
+        .map(Path::to_path_buf)
 }
 
 fn screen_shortcuts() -> [&'static str; 9] {

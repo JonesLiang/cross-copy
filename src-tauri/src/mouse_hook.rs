@@ -1,5 +1,17 @@
 pub(crate) const SYNTHETIC_INPUT_MARKER: usize = 0x4352_4f53_5343_4f50;
 
+#[cfg(target_os = "windows")]
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+
+#[cfg(target_os = "windows")]
+static LAST_SYNTHETIC_X: AtomicI32 = AtomicI32::new(i32::MIN);
+#[cfg(target_os = "windows")]
+static LAST_SYNTHETIC_Y: AtomicI32 = AtomicI32::new(i32::MIN);
+#[cfg(target_os = "windows")]
+static LAST_SYNTHETIC_AT: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "windows")]
+const SYNTHETIC_ECHO_WINDOW_MS: u64 = 24;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DesktopBounds {
     pub x: i32,
@@ -122,6 +134,15 @@ pub fn move_cursor_absolute(x: i32, y: i32) -> Result<(), String> {
         i64::from(local_x.clamp(0, bounds.width - 1)) * 65_535 / i64::from(bounds.width - 1);
     let normalized_y =
         i64::from(local_y.clamp(0, bounds.height - 1)) * 65_535 / i64::from(bounds.height - 1);
+    LAST_SYNTHETIC_X.store(
+        bounds.x.saturating_add(local_x.clamp(0, bounds.width - 1)),
+        Ordering::Relaxed,
+    );
+    LAST_SYNTHETIC_Y.store(
+        bounds.y.saturating_add(local_y.clamp(0, bounds.height - 1)),
+        Ordering::Relaxed,
+    );
+    LAST_SYNTHETIC_AT.store(monotonic_ms(), Ordering::Release);
     let input = INPUT {
         r#type: INPUT_MOUSE,
         Anonymous: INPUT_0 {
@@ -288,10 +309,10 @@ pub fn run_mouse_hook(
     use windows::Win32::{
         Foundation::{LPARAM, LRESULT, WPARAM},
         UI::WindowsAndMessaging::{
-            CallNextHookEx, GetMessageW, SetWindowsHookExW, UnhookWindowsHookEx, HC_ACTION, MSG,
-            MSLLHOOKSTRUCT, WH_MOUSE_LL, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
-            WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN,
-            WM_RBUTTONUP,
+            CallNextHookEx, GetMessageW, SetWindowsHookExW, UnhookWindowsHookEx, HC_ACTION,
+            LLMHF_INJECTED, MSG, MSLLHOOKSTRUCT, WH_MOUSE_LL, WM_LBUTTONDOWN, WM_LBUTTONUP,
+            WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+            WM_RBUTTONDOWN, WM_RBUTTONUP,
         },
     };
 
@@ -301,9 +322,17 @@ pub fn run_mouse_hook(
     unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         if code == HC_ACTION as i32 {
             let data = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
-            if data.dwExtraInfo != SYNTHETIC_INPUT_MARKER {
+            let message = wparam.0 as u32;
+            let explicitly_injected =
+                data.dwExtraInfo == SYNTHETIC_INPUT_MARKER || data.flags & LLMHF_INJECTED != 0;
+            let synthetic_echo = message == WM_MOUSEMOVE
+                && monotonic_ms().saturating_sub(LAST_SYNTHETIC_AT.load(Ordering::Acquire))
+                    <= SYNTHETIC_ECHO_WINDOW_MS
+                && data.pt.x.abs_diff(LAST_SYNTHETIC_X.load(Ordering::Relaxed)) <= 1
+                && data.pt.y.abs_diff(LAST_SYNTHETIC_Y.load(Ordering::Relaxed)) <= 1;
+            if !explicitly_injected && !synthetic_echo {
                 let wheel_delta = || (data.mouseData >> 16) as u16 as i16 as i64;
-                let event = match wparam.0 as u32 {
+                let event = match message {
                     WM_MOUSEMOVE => Some(HookMouseEvent::Move {
                         x: data.pt.x,
                         y: data.pt.y,
@@ -364,4 +393,13 @@ pub fn run_mouse_hook(
     }
     unsafe { UnhookWindowsHookEx(hook) }
         .map_err(|error| format!("无法移除 Windows 鼠标事件监听：{error}"))
+}
+
+#[cfg(target_os = "windows")]
+fn monotonic_ms() -> u64 {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64
 }
