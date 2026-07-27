@@ -209,11 +209,12 @@ function App(): React.JSX.Element {
   }
 
   async function installUpdate(): Promise<void> {
-    let update = availableUpdate.current;
-    if (!update) {
+    const initialUpdate = availableUpdate.current;
+    if (!initialUpdate) {
       await checkForUpdate(true);
       return;
     }
+    let update: Update = initialUpdate;
 
     let received = 0;
     let total: number | undefined;
@@ -223,10 +224,11 @@ function App(): React.JSX.Element {
       progress: null
     });
     for (let attempt = 1; attempt <= 3; attempt += 1) {
+      const activeUpdate = update;
       received = 0;
       total = undefined;
       try {
-        await update.downloadAndInstall((event) => {
+        await activeUpdate.downloadAndInstall((event) => {
           if (event.event === "Started") {
             total = event.data.contentLength;
           } else if (event.event === "Progress") {
@@ -237,11 +239,14 @@ function App(): React.JSX.Element {
                 : null;
             setUpdateState({
               kind: "downloading",
-              version: update.version,
+              version: activeUpdate.version,
               progress
             });
           } else {
-            setUpdateState({ kind: "installing", version: update.version });
+            setUpdateState({
+              kind: "installing",
+              version: activeUpdate.version
+            });
           }
         });
         await relaunch();
@@ -251,7 +256,7 @@ function App(): React.JSX.Element {
           setUpdateState({ kind: "error" });
           return;
         }
-        await update.close().catch(() => undefined);
+        await activeUpdate.close().catch(() => undefined);
         const retryUpdate = await check({ timeout: 15_000 }).catch(() => null);
         if (!retryUpdate) {
           setUpdateState({ kind: "error" });
