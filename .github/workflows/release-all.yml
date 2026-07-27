@@ -46,6 +46,9 @@ jobs:
       - name: 安装前端依赖
         run: npm ci --prefer-offline --no-audit --no-fund
 
+      - name: 校验所有版本号一致
+        run: node scripts/check-version-sync.mjs
+
       - name: 检查更新签名密钥
         run: |
           if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
@@ -92,6 +95,7 @@ jobs:
           cp src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg release-assets/
           cp src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app.tar.gz release-assets/
           cp src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app.tar.gz.sig release-assets/
+          node scripts/check-version-sync.mjs release-assets mac
 
       - name: 上传 macOS 发布文件
         uses: actions/upload-artifact@v4
@@ -131,6 +135,9 @@ jobs:
       - name: 安装前端依赖
         run: npm ci --prefer-offline --no-audit --no-fund
 
+      - name: 校验所有版本号一致
+        run: node scripts/check-version-sync.mjs
+
       - name: 检查更新签名密钥
         shell: pwsh
         run: |
@@ -149,6 +156,7 @@ jobs:
           Copy-Item src-tauri/target/release/bundle/nsis/*.exe release-assets/
           Copy-Item src-tauri/target/release/bundle/nsis/*.exe.sig release-assets/
           Copy-Item src-tauri/target/release/bundle/msi/*.msi release-assets/
+          node scripts/check-version-sync.mjs release-assets windows
 
       - name: 上传 Windows 发布文件
         uses: actions/upload-artifact@v4
@@ -182,6 +190,7 @@ jobs:
 
       - name: 生成 latest.json
         run: |
+          node scripts/check-version-sync.mjs release-assets
           VERSION="$(node -p "require('./package.json').version")"
           node scripts/generate-update-manifest.mjs \
             release-assets \
@@ -195,12 +204,21 @@ jobs:
         run: |
           VERSION="$(node -p "require('./package.json').version")"
           TAG="v$VERSION"
-          if ! git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+          TAG_SHA="$(git ls-remote --tags origin "refs/tags/$TAG" | awk '{print $1}')"
+          if [ -z "$TAG_SHA" ]; then
             git tag "$TAG" "${{ github.sha }}"
             git push origin "refs/tags/$TAG"
+          elif [ "$TAG_SHA" != "${{ github.sha }}" ]; then
+            echo "::error::标签 $TAG 已指向 $TAG_SHA，但本次构建提交是 ${{ github.sha }}"
+            exit 1
           fi
           if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release view "$TAG" --json assets --jq '.assets[].name' |
+              while IFS= read -r asset; do
+                gh release delete-asset "$TAG" "$asset" --yes
+              done
             gh release upload "$TAG" release-assets/* --clobber
+            gh release edit "$TAG" --latest
           else
             gh release create "$TAG" release-assets/* \
               --verify-tag \
