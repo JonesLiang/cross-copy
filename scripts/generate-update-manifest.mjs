@@ -16,10 +16,6 @@ const macSignature = await readSignature(directory, macArchive);
 const windowsSignature = await readSignature(directory, windowsInstaller);
 const releaseBase = `https://github.com/${repository}/releases/download/${encodeURIComponent(tag)}`;
 
-const platform = (file, signature) => ({
-  signature,
-  url: `${releaseBase}/${encodeURIComponent(basename(file))}`
-});
 const proxiedPlatform = (file, signature) => {
   const direct = `${releaseBase}/${encodeURIComponent(basename(file))}`;
   return {
@@ -28,7 +24,7 @@ const proxiedPlatform = (file, signature) => {
   };
 };
 
-const windows = platform(windowsInstaller, windowsSignature);
+const windows = proxiedPlatform(windowsInstaller, windowsSignature);
 const manifest = {
   version,
   notes: `CrossCopy ${version} 多设备共享与稳定性更新`,
