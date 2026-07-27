@@ -216,7 +216,10 @@ pub fn run_mouse_hook(
                     Some(HookMouseEvent::Move {
                         x: point.x.round() as i32,
                         y: point.y.round() as i32,
-                        native_delta: None,
+                        native_delta: Some((
+                            event.get_integer_value_field(EventField::MOUSE_EVENT_DELTA_X) as i32,
+                            event.get_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y) as i32,
+                        )),
                     })
                 }
                 CGEventType::LeftMouseDown => Some(HookMouseEvent::Button {
