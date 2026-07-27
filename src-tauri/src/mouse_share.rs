@@ -30,6 +30,7 @@ const SESSION_TIMEOUT_MS: u64 = 5_000;
 const KEEP_ALIVE_MS: u64 = 400;
 const MOVE_SEND_INTERVAL_MS: u64 = 4;
 const EDGE_INSET_PIXELS: i32 = 8;
+const RETURN_ARM_DISTANCE_PIXELS: i32 = 32;
 const EDGE_TRANSITION_COOLDOWN_MS: u64 = 160;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -130,6 +131,7 @@ struct IncomingSession {
     last_total_scroll_x_milli: i64,
     last_total_scroll_y_milli: i64,
     last_keep_alive_at: u64,
+    return_armed: bool,
     held_buttons: [bool; 3],
     last_event_at: u64,
 }
@@ -358,6 +360,7 @@ impl MouseShare {
                     last_total_scroll_x_milli: 0,
                     last_total_scroll_y_milli: 0,
                     last_keep_alive_at: now_ms(),
+                    return_armed: false,
                     held_buttons: [false; 3],
                     last_event_at: now_ms(),
                 });
@@ -405,15 +408,22 @@ impl MouseShare {
                     .clamp(0, i64::from(height - 1) * LOGICAL_PIXEL_MILLI);
                 let next_x = milli_to_pixel(next_x_milli);
                 let next_y = milli_to_pixel(next_y_milli);
-                if crossed_return_edge(
-                    incoming.return_edge,
-                    next_x,
-                    next_y,
-                    delta_x_milli,
-                    delta_y_milli,
-                    width,
-                    height,
-                ) {
+                if distance_from_edge(incoming.return_edge, next_x, next_y, width, height)
+                    >= RETURN_ARM_DISTANCE_PIXELS
+                {
+                    incoming.return_armed = true;
+                }
+                if incoming.return_armed
+                    && crossed_return_edge(
+                        incoming.return_edge,
+                        next_x,
+                        next_y,
+                        delta_x_milli,
+                        delta_y_milli,
+                        width,
+                        height,
+                    )
+                {
                     let ratio = edge_ratio(incoming.return_edge, next_x, next_y, width, height);
                     let session_id = incoming.session_id.clone();
                     simulated_events.extend(release_held_buttons(incoming));
@@ -1019,6 +1029,15 @@ fn edge_point(edge: ScreenPosition, ratio: f64, width: i32, height: i32) -> (i32
 
 fn safe_source_point(edge: ScreenPosition, x: i32, y: i32, width: i32, height: i32) -> (i32, i32) {
     edge_point(edge, edge_ratio(edge, x, y, width, height), width, height)
+}
+
+fn distance_from_edge(edge: ScreenPosition, x: i32, y: i32, width: i32, height: i32) -> i32 {
+    match edge {
+        ScreenPosition::Left => x,
+        ScreenPosition::Right => width - 1 - x,
+        ScreenPosition::Up => y,
+        ScreenPosition::Down => height - 1 - y,
+    }
 }
 
 fn edge_ratio(edge: ScreenPosition, x: i32, y: i32, width: i32, height: i32) -> f64 {

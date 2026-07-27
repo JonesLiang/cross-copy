@@ -165,7 +165,13 @@ fn set_shortcuts(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let updater = tauri_plugin_updater::Builder::new();
+    #[cfg(target_os = "macos")]
+    let updater = updater.target("darwin-universal");
+
     tauri::Builder::default()
+        .plugin(tauri_plugin_process::init())
+        .plugin(updater.build())
         .plugin(tauri_plugin_single_instance::init(|app, _, _| {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.show();

@@ -1,6 +1,6 @@
 [package]
 name = "crosscopy"
-version = "2.0.1"
+version = "2.0.2"
 description = "Fast private LAN mouse sharing and clipboard sync"
 authors = ["CrossCopy"]
 edition = "2021"
@@ -30,7 +30,9 @@ subtle = "2"
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-autostart = "2"
 tauri-plugin-global-shortcut = "2"
+tauri-plugin-process = "2"
 tauri-plugin-single-instance = "2"
+tauri-plugin-updater = "2"
 tokio = { version = "1", features = ["full"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 walkdir = "2"

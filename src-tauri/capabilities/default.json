@@ -3,5 +3,10 @@
   "identifier": "default",
   "description": "Main window capabilities",
   "windows": ["main", "transfer"],
-  "permissions": ["core:default", "autostart:default"]
+  "permissions": [
+    "core:default",
+    "autostart:default",
+    "process:allow-restart",
+    "updater:default"
+  ]
 }

@@ -24,6 +24,7 @@
 - 文件下载到系统“下载/CrossCopy”目录
 - 空闲后自动降频，快捷键触发时立即唤醒设备发现
 - 托盘后台运行、暂停同步、开机启动、浅色和深色模式
+- 启动后自动检查签名更新，可在侧栏查看下载进度并一键安装重启
 - 本地滚动日志和一键导出诊断报告
 
 macOS 首次使用时，请在 CrossCopy 设置页点击“打开系统设置”，授予
@@ -61,10 +62,21 @@ npm test
 ### 一键同时打包 macOS 和 Windows
 
 将代码推送到 GitHub 后，打开仓库的 **Actions** 页面，选择
-**一键打包 Mac 和 Windows**，点击 **Run workflow**。完成后会得到：
+**一键发布 Mac 和 Windows**，点击 **Run workflow**。流水线会同时生成
+安装包、GitHub Release 和应用内更新所需的 `latest.json`。完成后会得到：
 
 - `CrossCopy-macOS-Universal`：同时支持 Intel 和 Apple Silicon 的 DMG
 - `CrossCopy-Windows-x64`：Windows NSIS EXE 和 MSI 安装包
+
+首次运行流水线前，只需配置一次更新签名密钥：
+
+1. 打开仓库 **Settings → Secrets and variables → Actions**
+2. 新建 Repository secret，名称为 `TAURI_SIGNING_PRIVATE_KEY`
+3. 值填写本机 `~/.config/crosscopy/updater.key` 的完整内容
+
+私钥只保存在本机和 GitHub Actions secret 中，不要提交到仓库。公钥已经
+写入应用配置；之后每次提高版本号并运行流水线，已安装的 CrossCopy 就会
+自动发现新版本，不需要先卸载。
 
 如果本机已安装并登录 GitHub CLI，也可以运行：
 

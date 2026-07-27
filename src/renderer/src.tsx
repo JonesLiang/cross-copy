@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   ArrowDownLeft,
@@ -7,6 +7,7 @@ import {
   Clipboard,
   Copy,
   Desktop,
+  DownloadSimple,
   FileText,
   Gear,
   Keyboard,
@@ -22,6 +23,8 @@ import {
 import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { relaunch } from "@tauri-apps/plugin-process";
+import { check, type Update } from "@tauri-apps/plugin-updater";
 import type { ScreenPosition, UiState } from "./types";
 import "./styles.css";
 
@@ -68,6 +71,14 @@ const EMPTY_STATE: UiState = {
 };
 
 type PairMode = "choose" | "show" | "enter" | null;
+type UpdateState =
+  | { kind: "idle" }
+  | { kind: "checking" }
+  | { kind: "available"; version: string }
+  | { kind: "downloading"; version: string; progress: number | null }
+  | { kind: "installing"; version: string }
+  | { kind: "current" }
+  | { kind: "error" };
 
 function App(): React.JSX.Element {
   const [state, setState] = useState<UiState>(EMPTY_STATE);
@@ -78,6 +89,8 @@ function App(): React.JSX.Element {
   const [submitting, setSubmitting] = useState(false);
   const [diagnosticsMessage, setDiagnosticsMessage] = useState("");
   const [appVersion, setAppVersion] = useState("");
+  const [updateState, setUpdateState] = useState<UpdateState>({ kind: "idle" });
+  const availableUpdate = useRef<Update | null>(null);
   const [view, setView] = useState<"clipboard" | "mouse" | "settings">(
     "clipboard"
   );
@@ -90,12 +103,19 @@ function App(): React.JSX.Element {
       .catch(() => setState(EMPTY_STATE))
       .finally(() => setReady(true));
     void getVersion().then(setAppVersion).catch(() => setAppVersion(""));
+    const updateTimer = window.setTimeout(() => {
+      void checkForUpdate(false);
+    }, 1800);
     void listen<UiState>("state", (event) => setState(event.payload))
       .then((stop) => {
         unlisten = stop;
       })
       .catch(() => undefined);
-    return () => unlisten?.();
+    return () => {
+      window.clearTimeout(updateTimer);
+      unlisten?.();
+      void availableUpdate.current?.close();
+    };
   }, []);
 
   useEffect(() => {
@@ -157,6 +177,59 @@ function App(): React.JSX.Element {
     }
   }
 
+  async function checkForUpdate(showCurrent: boolean): Promise<void> {
+    setUpdateState({ kind: "checking" });
+    try {
+      const update = await check({ timeout: 12_000 });
+      if (!update) {
+        setUpdateState(showCurrent ? { kind: "current" } : { kind: "idle" });
+        return;
+      }
+      await availableUpdate.current?.close();
+      availableUpdate.current = update;
+      setUpdateState({ kind: "available", version: update.version });
+    } catch {
+      setUpdateState(showCurrent ? { kind: "error" } : { kind: "idle" });
+    }
+  }
+
+  async function installUpdate(): Promise<void> {
+    const update = availableUpdate.current;
+    if (!update) {
+      await checkForUpdate(true);
+      return;
+    }
+
+    let received = 0;
+    let total: number | undefined;
+    setUpdateState({
+      kind: "downloading",
+      version: update.version,
+      progress: null
+    });
+    try {
+      await update.downloadAndInstall((event) => {
+        if (event.event === "Started") {
+          total = event.data.contentLength;
+        } else if (event.event === "Progress") {
+          received += event.data.chunkLength;
+          const progress =
+            total && total > 0 ? Math.min(100, (received / total) * 100) : null;
+          setUpdateState({
+            kind: "downloading",
+            version: update.version,
+            progress
+          });
+        } else {
+          setUpdateState({ kind: "installing", version: update.version });
+        }
+      });
+      await relaunch();
+    } catch {
+      setUpdateState({ kind: "error" });
+    }
+  }
+
   return (
     <main className="app-shell">
       <aside className="sidebar">
@@ -194,6 +267,11 @@ function App(): React.JSX.Element {
           </button>
         </nav>
 
+        <UpdateControl
+          state={updateState}
+          onCheck={() => void checkForUpdate(true)}
+          onInstall={() => void installUpdate()}
+        />
         <div className="device-label">
           <Desktop size={17} />
           <span>
@@ -413,6 +491,65 @@ function App(): React.JSX.Element {
         />
       )}
     </main>
+  );
+}
+
+function UpdateControl(props: {
+  state: UpdateState;
+  onCheck(): void;
+  onInstall(): void;
+}): React.JSX.Element {
+  const state = props.state;
+  if (state.kind === "idle") {
+    return (
+      <button className="update-link" type="button" onClick={props.onCheck}>
+        检查更新
+      </button>
+    );
+  }
+  if (state.kind === "checking") {
+    return <div className="update-link is-static">正在检查更新…</div>;
+  }
+  if (state.kind === "current") {
+    return <div className="update-link is-static">已是最新版本</div>;
+  }
+  if (state.kind === "error") {
+    return (
+      <button
+        className="update-link update-error"
+        type="button"
+        onClick={props.onCheck}
+      >
+        更新检查失败，重试
+      </button>
+    );
+  }
+  if (state.kind === "available") {
+    return (
+      <button className="update-card" type="button" onClick={props.onInstall}>
+        <DownloadSimple size={16} weight="bold" />
+        <span>
+          <strong>更新到 v{state.version}</strong>
+          <small>下载后自动安装并重启</small>
+        </span>
+      </button>
+    );
+  }
+
+  const label =
+    state.kind === "installing"
+      ? "正在安装更新…"
+      : state.progress === null
+        ? "正在下载更新…"
+        : `正在下载 ${Math.round(state.progress)}%`;
+  return (
+    <div className="update-card is-progress">
+      <DownloadSimple size={16} />
+      <span>
+        <strong>{label}</strong>
+        <small>v{state.version}</small>
+      </span>
+    </div>
   );
 }
 
