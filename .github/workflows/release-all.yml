@@ -17,6 +17,7 @@ jobs:
     timeout-minutes: 45
     env:
       TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
     steps:
       - name: 拉取代码
         uses: actions/checkout@v4
@@ -61,7 +62,7 @@ jobs:
           scripts/sign-macos-app.sh "$APP_PATH"
           find "$BUNDLE_DIR" -maxdepth 1 \( -name '*.app.tar.gz' -o -name '*.app.tar.gz.sig' \) -delete
           COPYFILE_DISABLE=1 tar -czf "$UPDATE_ARCHIVE" -C "$BUNDLE_DIR" CrossCopy.app
-          npx tauri signer sign "$UPDATE_ARCHIVE"
+          npx tauri signer sign --password "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" "$UPDATE_ARCHIVE"
 
       - name: 生成 DMG
         run: |
@@ -95,6 +96,7 @@ jobs:
     timeout-minutes: 45
     env:
       TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
     steps:
       - name: 拉取代码
         uses: actions/checkout@v4
