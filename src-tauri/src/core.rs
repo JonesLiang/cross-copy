@@ -29,7 +29,7 @@ use enigo::{
 use rand::RngCore;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Component, Path, PathBuf},
     sync::{
@@ -3303,6 +3303,7 @@ async fn read_secure_frame(stream: &mut TcpStream, key: &[u8]) -> Result<Vec<u8>
 
 fn build_manifest(roots: &[PathBuf]) -> Result<Vec<FileEntry>, String> {
     let mut entries = Vec::new();
+    let mut root_names = HashSet::new();
     for root in roots {
         let root_metadata = std::fs::symlink_metadata(root).map_err(|e| e.to_string())?;
         if root_metadata.file_type().is_symlink() {
@@ -3316,6 +3317,9 @@ fn build_manifest(roots: &[PathBuf]) -> Result<Vec<FileEntry>, String> {
             .ok_or("文件路径无效")?
             .to_string_lossy()
             .into_owned();
+        if !root_names.insert(name.clone()) {
+            return Err(format!("多个上传项目使用相同名称：{name}"));
+        }
         if root_metadata.is_dir() {
             for item in WalkDir::new(root).follow_links(false) {
                 let item = item.map_err(|e| e.to_string())?;
@@ -3402,10 +3406,36 @@ async fn receive_uploaded_entries(
     destination: &Path,
     entries: Vec<FileEntry>,
 ) -> Result<(), String> {
+    let mut root_targets = HashMap::new();
+    for entry in &entries {
+        let relative = safe_relative_path(&entry.path)?;
+        if relative.components().count() != 1 {
+            continue;
+        }
+        let root_name = relative
+            .file_name()
+            .ok_or("上传文件名称无效")?
+            .to_string_lossy()
+            .into_owned();
+        let target = unique_upload_root(destination, &root_name, entry.directory).await?;
+        root_targets.insert(root_name, target);
+    }
     let mut targets = Vec::with_capacity(entries.len());
     for entry in &entries {
         let relative = safe_relative_path(&entry.path)?;
-        let target = destination.join(relative);
+        let mut components = relative.components();
+        let root_name = components
+            .next()
+            .ok_or("上传文件名称无效")?
+            .as_os_str()
+            .to_string_lossy();
+        let mut target = root_targets
+            .get(root_name.as_ref())
+            .cloned()
+            .ok_or("上传文件清单缺少根项目")?;
+        for component in components {
+            target.push(component.as_os_str());
+        }
         ensure_no_symlink_ancestors(destination, &target).await?;
         targets.push(target);
     }
@@ -3440,6 +3470,46 @@ async fn receive_uploaded_entries(
             .map_err(|error| format!("无法保存远端文件：{error}"))?;
     }
     Ok(())
+}
+
+async fn unique_upload_root(
+    destination: &Path,
+    name: &str,
+    directory: bool,
+) -> Result<PathBuf, String> {
+    let original = destination.join(name);
+    if !fs::try_exists(&original)
+        .await
+        .map_err(|error| format!("无法检查远端文件：{error}"))?
+    {
+        return Ok(original);
+    }
+    let path = Path::new(name);
+    let stem = if directory {
+        name.to_string()
+    } else {
+        path.file_stem()
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string_lossy().into_owned())
+            .unwrap_or_else(|| name.to_string())
+    };
+    let extension = if directory {
+        String::new()
+    } else {
+        path.extension()
+            .map(|value| format!(".{}", value.to_string_lossy()))
+            .unwrap_or_default()
+    };
+    for index in 2..=9_999 {
+        let candidate = destination.join(format!("{stem} ({index}){extension}"));
+        if !fs::try_exists(&candidate)
+            .await
+            .map_err(|error| format!("无法检查远端文件：{error}"))?
+        {
+            return Ok(candidate);
+        }
+    }
+    Err("目标文件夹中同名项目过多".into())
 }
 
 async fn ensure_no_symlink_ancestors(root: &Path, target: &Path) -> Result<(), String> {
