@@ -6,6 +6,10 @@ on:
 permissions:
   contents: write
 
+env:
+  CARGO_PROFILE_RELEASE_LTO: thin
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "4"
+
 concurrency:
   group: crosscopy-release-${{ github.ref }}
   cancel-in-progress: false
@@ -37,9 +41,10 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
+          cache-on-failure: true
 
       - name: 安装前端依赖
-        run: npm ci
+        run: npm ci --prefer-offline --no-audit --no-fund
 
       - name: 检查更新签名密钥
         run: |
@@ -49,7 +54,11 @@ jobs:
           fi
 
       - name: 打包 macOS Intel 和 Apple Silicon 通用应用
-        run: npm run build -- --target universal-apple-darwin --bundles app
+        run: >-
+          npm run build --
+          --target universal-apple-darwin
+          --bundles app
+          --config '{"bundle":{"createUpdaterArtifacts":false}}'
 
       - name: 固定应用身份并重新签名更新包
         run: |
@@ -114,9 +123,10 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
+          cache-on-failure: true
 
       - name: 安装前端依赖
-        run: npm ci
+        run: npm ci --prefer-offline --no-audit --no-fund
 
       - name: 检查更新签名密钥
         shell: pwsh
