@@ -184,6 +184,9 @@ enum SecureMessage {
     FilesystemDownload {
         paths: Vec<String>,
     },
+    FilesystemUpload {
+        target_dir: String,
+    },
     Error {
         message: String,
     },
@@ -797,6 +800,144 @@ impl Core {
         self.complete_transfer_progress();
         reveal_file(&destination);
         Ok(destination.to_string_lossy().into_owned())
+    }
+
+    pub async fn filesystem_upload(
+        self: &Arc<Self>,
+        peer_id: String,
+        local_paths: Vec<String>,
+        target_dir: String,
+    ) -> Result<(), String> {
+        self.wake_network();
+        let settings = self.store.get();
+        let peer = settings
+            .peers
+            .into_iter()
+            .find(|peer| peer.id == peer_id)
+            .ok_or("设备不存在")?;
+        if !peer.filesystem_allowed {
+            return Err("未授予这台电脑文件系统权限".into());
+        }
+        let seen = self
+            .discovered
+            .lock()
+            .expect("discovery lock")
+            .get(&peer.id)
+            .cloned()
+            .filter(|seen| now_ms().saturating_sub(seen.last_seen) < ONLINE_WINDOW_MS)
+            .ok_or("设备离线，无法上传文件")?;
+        let roots = remote_fs::checked_paths(local_paths)?;
+        let entries = build_manifest(&roots)?;
+        if entries.len() > 250_000 {
+            return Err("一次最多上传 250000 个文件和文件夹".into());
+        }
+        let total = entries.iter().map(|entry| entry.size).sum();
+        let key = decode_secret(&peer.secret)?;
+        let mut stream = TcpStream::connect((seen.host, seen.packet.port))
+            .await
+            .map_err(|error| format!("无法连接远端文件系统：{error}"))?;
+        stream
+            .set_nodelay(true)
+            .map_err(|error| error.to_string())?;
+        write_json(
+            &mut stream,
+            &WireMessage::Secure {
+                sender_id: self.store.get().device_id,
+                envelope: encrypt(
+                    &key,
+                    &SecureMessage::FilesystemUpload {
+                        target_dir: target_dir.clone(),
+                    },
+                )?,
+            },
+        )
+        .await?;
+
+        let ready_bytes = read_secure_frame(&mut stream, &key).await?;
+        let ready: FsResponse =
+            serde_json::from_slice(&ready_bytes).map_err(|error| error.to_string())?;
+        if let FsResponse::Error { message } = ready {
+            return Err(message);
+        }
+
+        write_secure_frame(
+            &mut stream,
+            &key,
+            &serde_json::to_vec(&SecureMessage::Manifest {
+                entries: entries.clone(),
+            })
+            .map_err(|error| error.to_string())?,
+        )
+        .await?;
+
+        let transfer_id = Uuid::new_v4().to_string();
+        let label = roots
+            .first()
+            .and_then(|path| path.file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "本机文件".into());
+        self.begin_transfer_progress(&transfer_id, &label, "sent", total);
+        let result = async {
+            let roots = root_map(&roots);
+            let mut transferred = 0_u64;
+            let mut buffer = vec![0_u8; CHUNK_SIZE];
+            for entry in entries.into_iter().filter(|entry| !entry.directory) {
+                let source = resolve_manifest_source(&entry.path, &roots)?;
+                let mut file = File::open(source)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                loop {
+                    let size = file
+                        .read(&mut buffer)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    if size == 0 {
+                        break;
+                    }
+                    write_secure_frame(&mut stream, &key, &buffer[..size]).await?;
+                    transferred += size as u64;
+                    self.update_transfer_progress(transferred);
+                }
+            }
+            let response_bytes = read_secure_frame(&mut stream, &key).await?;
+            let response: FsResponse =
+                serde_json::from_slice(&response_bytes).map_err(|error| error.to_string())?;
+            match response {
+                FsResponse::Error { message } => Err(message),
+                _ => Ok(()),
+            }
+        }
+        .await;
+        match result {
+            Ok(()) => {
+                self.complete_transfer_progress();
+                self.logger.info(
+                    "filesystem_upload_completed",
+                    format!("peer={} target={target_dir} bytes={total}", peer.id),
+                );
+                Ok(())
+            }
+            Err(error) => {
+                self.fail_transfer_progress(&error);
+                Err(error)
+            }
+        }
+    }
+
+    pub async fn filesystem_upload_clipboard(
+        self: &Arc<Self>,
+        peer_id: String,
+        target_dir: String,
+    ) -> Result<(), String> {
+        let local_paths = match read_current_clipboard(&self.logger).await? {
+            LocalClipboard::Files(paths) => paths
+                .into_iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect(),
+            LocalClipboard::Text(_) => return Err("系统剪贴板中没有文件或文件夹".into()),
+        };
+        self.filesystem_upload(peer_id, local_paths, target_dir)
+            .await
     }
 
     pub fn set_peer_mouse_dpi(&self, peer_id: String, dpi: u16) -> Result<(), String> {
@@ -2269,6 +2410,60 @@ impl Core {
                         }
                         Ok(())
                     }
+                    SecureMessage::FilesystemUpload { target_dir } => {
+                        if !peer.filesystem_allowed {
+                            let response = FsResponse::Error {
+                                message: "对方未授予文件系统权限".into(),
+                            };
+                            return write_secure_frame(
+                                &mut stream,
+                                &key,
+                                &serde_json::to_vec(&response).map_err(|e| e.to_string())?,
+                            )
+                            .await;
+                        }
+                        let destination = match remote_fs::checked_directory(target_dir).await {
+                            Ok(path) => path,
+                            Err(message) => {
+                                let response = FsResponse::Error { message };
+                                return write_secure_frame(
+                                    &mut stream,
+                                    &key,
+                                    &serde_json::to_vec(&response).map_err(|e| e.to_string())?,
+                                )
+                                .await;
+                            }
+                        };
+                        write_secure_frame(
+                            &mut stream,
+                            &key,
+                            &serde_json::to_vec(&FsResponse::Done { entry: None })
+                                .map_err(|error| error.to_string())?,
+                        )
+                        .await?;
+                        let manifest_bytes = read_secure_frame(&mut stream, &key).await?;
+                        let manifest: SecureMessage = serde_json::from_slice(&manifest_bytes)
+                            .map_err(|error| error.to_string())?;
+                        let SecureMessage::Manifest { entries } = manifest else {
+                            return Err("上传文件清单无效".into());
+                        };
+                        if entries.len() > 250_000 {
+                            return Err("上传文件数量超过限制".into());
+                        }
+                        let response =
+                            receive_uploaded_entries(&mut stream, &key, &destination, entries)
+                                .await;
+                        let response = match response {
+                            Ok(()) => FsResponse::Done { entry: None },
+                            Err(message) => FsResponse::Error { message },
+                        };
+                        write_secure_frame(
+                            &mut stream,
+                            &key,
+                            &serde_json::to_vec(&response).map_err(|e| e.to_string())?,
+                        )
+                        .await
+                    }
                     _ => Err("无效请求".into()),
                 }
             }
@@ -3109,14 +3304,27 @@ async fn read_secure_frame(stream: &mut TcpStream, key: &[u8]) -> Result<Vec<u8>
 fn build_manifest(roots: &[PathBuf]) -> Result<Vec<FileEntry>, String> {
     let mut entries = Vec::new();
     for root in roots {
+        let root_metadata = std::fs::symlink_metadata(root).map_err(|e| e.to_string())?;
+        if root_metadata.file_type().is_symlink() {
+            return Err("暂不支持跨平台传输符号链接".into());
+        }
+        if !root_metadata.is_file() && !root_metadata.is_dir() {
+            return Err("只支持上传普通文件和文件夹".into());
+        }
         let name = root
             .file_name()
             .ok_or("文件路径无效")?
             .to_string_lossy()
             .into_owned();
-        if root.is_dir() {
+        if root_metadata.is_dir() {
             for item in WalkDir::new(root).follow_links(false) {
                 let item = item.map_err(|e| e.to_string())?;
+                if item.file_type().is_symlink() {
+                    return Err("文件夹包含符号链接，暂不支持跨平台传输".into());
+                }
+                if !item.file_type().is_file() && !item.file_type().is_dir() {
+                    return Err("文件夹包含不支持的特殊文件".into());
+                }
                 let suffix = item.path().strip_prefix(root).map_err(|e| e.to_string())?;
                 let relative = if suffix.as_os_str().is_empty() {
                     PathBuf::from(&name)
@@ -3137,7 +3345,7 @@ fn build_manifest(roots: &[PathBuf]) -> Result<Vec<FileEntry>, String> {
         } else {
             entries.push(FileEntry {
                 path: name,
-                size: root.metadata().map_err(|e| e.to_string())?.len(),
+                size: root_metadata.len(),
                 directory: false,
             });
         }
@@ -3186,6 +3394,71 @@ fn safe_relative_path(value: &str) -> Result<PathBuf, String> {
         return Err("文件路径不安全".into());
     }
     Ok(path.to_path_buf())
+}
+
+async fn receive_uploaded_entries(
+    stream: &mut TcpStream,
+    key: &[u8],
+    destination: &Path,
+    entries: Vec<FileEntry>,
+) -> Result<(), String> {
+    let mut targets = Vec::with_capacity(entries.len());
+    for entry in &entries {
+        let relative = safe_relative_path(&entry.path)?;
+        let target = destination.join(relative);
+        ensure_no_symlink_ancestors(destination, &target).await?;
+        targets.push(target);
+    }
+    for (entry, target) in entries.into_iter().zip(targets) {
+        if entry.directory {
+            fs::create_dir_all(&target)
+                .await
+                .map_err(|error| format!("无法创建远端文件夹：{error}"))?;
+            continue;
+        }
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)
+                .await
+                .map_err(|error| format!("无法创建远端文件夹：{error}"))?;
+        }
+        let mut file = File::create(&target)
+            .await
+            .map_err(|error| format!("无法创建远端文件：{error}"))?;
+        let mut remaining = entry.size;
+        while remaining > 0 {
+            let chunk = read_secure_frame(stream, key).await?;
+            if chunk.is_empty() || chunk.len() as u64 > remaining {
+                return Err("上传文件数据损坏".into());
+            }
+            file.write_all(&chunk)
+                .await
+                .map_err(|error| format!("无法写入远端文件：{error}"))?;
+            remaining -= chunk.len() as u64;
+        }
+        file.flush()
+            .await
+            .map_err(|error| format!("无法保存远端文件：{error}"))?;
+    }
+    Ok(())
+}
+
+async fn ensure_no_symlink_ancestors(root: &Path, target: &Path) -> Result<(), String> {
+    let relative = target
+        .strip_prefix(root)
+        .map_err(|_| "上传路径超出目标文件夹".to_string())?;
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current).await {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err("上传目标包含符号链接，已停止写入".into());
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("无法检查上传路径：{error}")),
+        }
+    }
+    Ok(())
 }
 
 fn scan_roots(paths: &[PathBuf]) -> Result<(u64, Vec<String>), String> {

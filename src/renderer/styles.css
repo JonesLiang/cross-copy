@@ -1886,12 +1886,26 @@ nav {
   padding-bottom: 4px;
 }
 
+.filesystem-upload-hint {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 2px;
+  color: var(--faint);
+  font-size: 9px;
+}
+
+.filesystem-upload-hint svg {
+  color: var(--accent);
+}
+
 .filesystem-actions button:last-child {
   margin-left: auto;
   color: var(--accent);
 }
 
 .filesystem-browser {
+  position: relative;
   display: grid;
   grid-template-rows: minmax(300px, 1fr) 82px;
   min-height: 410px;
@@ -1900,6 +1914,36 @@ nav {
   border: 1px solid var(--line);
   border-radius: var(--radius);
   box-shadow: 0 6px 22px rgb(36 43 55 / 5%);
+}
+
+.filesystem-upload-overlay {
+  position: absolute;
+  z-index: 5;
+  display: grid;
+  inset: 10px;
+  place-items: center;
+  align-content: center;
+  gap: 7px;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--surface) 92%, var(--accent-soft));
+  border: 2px dashed color-mix(in srgb, var(--accent) 58%, var(--line));
+  border-radius: 11px;
+  box-shadow: 0 10px 34px rgb(32 58 112 / 12%);
+  pointer-events: none;
+}
+
+.filesystem-upload-overlay strong {
+  color: var(--text);
+  font-size: 14px;
+}
+
+.filesystem-upload-overlay span {
+  max-width: 72%;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .filesystem-list {

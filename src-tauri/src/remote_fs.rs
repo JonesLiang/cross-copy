@@ -121,6 +121,19 @@ pub fn checked_paths(values: Vec<String>) -> Result<Vec<PathBuf>, String> {
     values.iter().map(|value| checked_absolute(value)).collect()
 }
 
+pub async fn checked_directory(value: String) -> Result<PathBuf, String> {
+    let path = checked_absolute(&value)?;
+    let metadata = fs::metadata(&path)
+        .await
+        .map_err(|error| friendly_io_error("无法打开上传位置", error))?;
+    if !metadata.is_dir() {
+        return Err("上传目标必须是文件夹".into());
+    }
+    fs::canonicalize(path)
+        .await
+        .map_err(|error| friendly_io_error("无法确认上传位置", error))
+}
+
 async fn handle_inner(request: FsRequest) -> Result<FsResponse, String> {
     match request {
         FsRequest::Roots => Ok(FsResponse::Entries {

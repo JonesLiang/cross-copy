@@ -32,6 +32,7 @@ import {
 import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import type {
@@ -88,6 +89,14 @@ const crosscopy = {
     invoke<FsResponse>("filesystem_request", { peerId, request }),
   filesystemDownload: (peerId: string, paths: string[]) =>
     invoke<string>("filesystem_download", { peerId, paths }),
+  filesystemUpload: (
+    peerId: string,
+    localPaths: string[],
+    targetDir: string
+  ) =>
+    invoke<void>("filesystem_upload", { peerId, localPaths, targetDir }),
+  filesystemUploadClipboard: (peerId: string, targetDir: string) =>
+    invoke<void>("filesystem_upload_clipboard", { peerId, targetDir }),
   setPeerMouseDpi: (peerId: string, dpi: number) =>
     invoke<void>("set_peer_mouse_dpi", { peerId, dpi }),
   switchMouseToScreen: (screenNumber: number) =>
@@ -974,6 +983,8 @@ function FilesystemPanel(props: { state: UiState }): React.JSX.Element {
   const [message, setMessage] = useState("");
   const [editor, setEditor] = useState<RemoteEditor | null>(null);
   const [saving, setSaving] = useState(false);
+  const [externalDragging, setExternalDragging] = useState(false);
+  const [uploading, setUploading] = useState(false);
 
   const peer =
     availablePeers.find((candidate) => candidate.id === peerId) ??
@@ -1021,6 +1032,73 @@ function FilesystemPanel(props: { state: UiState }): React.JSX.Element {
       cancelled = true;
     };
   }, [peer?.id, path]);
+
+  useEffect(() => {
+    let unlisten: UnlistenFn | undefined;
+    void getCurrentWebview()
+      .onDragDropEvent((event) => {
+        if (event.payload.type === "enter" || event.payload.type === "over") {
+          setExternalDragging(true);
+          return;
+        }
+        if (event.payload.type === "leave") {
+          setExternalDragging(false);
+          return;
+        }
+        setExternalDragging(false);
+        const localPaths = event.payload.paths;
+        if (!peer || !path || localPaths.length === 0 || uploading) {
+          if (!path) setMessage("请先打开 B 上的目标文件夹，再拖入本机文件");
+          return;
+        }
+        setUploading(true);
+        setMessage(`正在上传 ${localPaths.length} 个项目到 ${peer.name}…`);
+        void crosscopy
+          .filesystemUpload(peer.id, localPaths, path)
+          .then(async () => {
+            setMessage(`已上传到 ${peer.name}`);
+            await refresh();
+          })
+          .catch((reason) =>
+            setMessage(errorText(reason, "上传到远端电脑失败"))
+          )
+          .finally(() => setUploading(false));
+      })
+      .then((stop) => {
+        unlisten = stop;
+      })
+      .catch(() => undefined);
+    return () => unlisten?.();
+  }, [peer?.id, peer?.name, path, uploading]);
+
+  useEffect(() => {
+    function pasteFiles(event: ClipboardEvent): void {
+      const target = event.target as HTMLElement | null;
+      if (
+        !peer ||
+        !path ||
+        uploading ||
+        target?.matches("input, textarea, [contenteditable='true']")
+      ) {
+        return;
+      }
+      event.preventDefault();
+      setUploading(true);
+      setMessage(`正在从系统剪贴板复制到 ${peer.name}…`);
+      void crosscopy
+        .filesystemUploadClipboard(peer.id, path)
+        .then(async () => {
+          setMessage(`已粘贴到 ${peer.name}`);
+          await refresh();
+        })
+        .catch((reason) =>
+          setMessage(errorText(reason, "系统剪贴板中没有可上传的文件"))
+        )
+        .finally(() => setUploading(false));
+    }
+    window.addEventListener("paste", pasteFiles);
+    return () => window.removeEventListener("paste", pasteFiles);
+  }, [peer?.id, peer?.name, path, uploading]);
 
   async function refresh(): Promise<void> {
     if (!peer) return;
@@ -1240,8 +1318,16 @@ function FilesystemPanel(props: { state: UiState }): React.JSX.Element {
           <DownloadSimple size={16} /> 复制到本机
         </button>
       </div>
+      <div className="filesystem-upload-hint">
+        <ArrowUpRight size={14} />
+        打开目标文件夹后，可从 Finder 或文件资源管理器拖入，也可复制文件后在这里粘贴
+      </div>
 
-      <div className="filesystem-browser">
+      <div
+        className={`filesystem-browser ${
+          externalDragging ? "external-dragging" : ""
+        }`}
+      >
         <div className="filesystem-list" aria-busy={loading}>
           <div className="filesystem-list-head">
             <span>名称</span><span>修改时间</span><span>大小</span>
@@ -1291,6 +1377,13 @@ function FilesystemPanel(props: { state: UiState }): React.JSX.Element {
           <strong>拖到这里复制到本机</strong>
           <span>文件和文件夹会保存到“下载/CrossCopy”</span>
         </div>
+        {externalDragging && (
+          <div className="filesystem-upload-overlay">
+            <ArrowUpRight size={30} weight="light" />
+            <strong>{path ? `上传到 ${peer?.name}` : "请先打开目标文件夹"}</strong>
+            <span>{path ?? "当前位于系统位置，不能直接写入"}</span>
+          </div>
+        )}
       </div>
 
       {message && <div className="filesystem-message">{message}</div>}

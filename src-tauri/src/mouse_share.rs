@@ -3,10 +3,12 @@ use crate::{
     model::ScreenPosition,
     mouse_hook::{
         recenter_cursor, run_mouse_hook, screen_bounds, set_cursor_visible, set_realtime_priority,
-        DesktopBounds, HookMouseButton, HookMouseEvent,
+        DesktopBounds, HookMouseButton, HookMouseEvent, SYNTHETIC_INPUT_MARKER,
     },
 };
-use enigo::{Axis, Button, Coordinate, Direction, Enigo, Mouse, Settings as EnigoSettings};
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+use enigo::Coordinate;
+use enigo::{Axis, Button, Direction, Enigo, Mouse, Settings as EnigoSettings};
 use serde::{Deserialize, Serialize};
 use std::{
     sync::{

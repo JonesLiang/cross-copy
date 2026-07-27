@@ -119,6 +119,29 @@ async fn filesystem_download(
 }
 
 #[tauri::command]
+async fn filesystem_upload(
+    core: State<'_, Arc<Core>>,
+    peer_id: String,
+    local_paths: Vec<String>,
+    target_dir: String,
+) -> Result<(), String> {
+    Arc::clone(core.inner())
+        .filesystem_upload(peer_id, local_paths, target_dir)
+        .await
+}
+
+#[tauri::command]
+async fn filesystem_upload_clipboard(
+    core: State<'_, Arc<Core>>,
+    peer_id: String,
+    target_dir: String,
+) -> Result<(), String> {
+    Arc::clone(core.inner())
+        .filesystem_upload_clipboard(peer_id, target_dir)
+        .await
+}
+
+#[tauri::command]
 fn set_peer_mouse_dpi(core: State<'_, Arc<Core>>, peer_id: String, dpi: u16) -> Result<(), String> {
     core.set_peer_mouse_dpi(peer_id, dpi)
 }
@@ -427,6 +450,8 @@ pub fn run() {
             set_peer_permissions,
             filesystem_request,
             filesystem_download,
+            filesystem_upload,
+            filesystem_upload_clipboard,
             set_peer_mouse_dpi,
             switch_mouse_to_screen,
             set_launch_at_login,
