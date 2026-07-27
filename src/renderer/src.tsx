@@ -25,7 +25,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check, type Update } from "@tauri-apps/plugin-updater";
-import type { ScreenPosition, UiState } from "./types";
+import type { DisplayInfo, ScreenPosition, UiState } from "./types";
 import "./styles.css";
 
 const crosscopy = {
@@ -66,6 +66,7 @@ const crosscopy = {
 
 const EMPTY_STATE: UiState = {
   deviceName: "",
+  displays: [],
   syncEnabled: true,
   launchAtLogin: false,
   copyShortcut: "Ctrl+Shift+C",
@@ -305,19 +306,23 @@ function App(): React.JSX.Element {
           </button>
         </nav>
 
-        <UpdateControl
-          state={updateState}
-          onCheck={() => void checkForUpdate(true)}
-          onInstall={() => void installUpdate()}
-        />
-        <div className="device-label">
-          <Desktop size={17} />
-          <span>
-            <small>本机</small>
-            {state.deviceName || "正在读取"}
-          </span>
+        <div className="sidebar-status">
+          <div className="sidebar-device">
+            <span className="sidebar-device-icon">
+              <Desktop size={16} />
+            </span>
+            <span>
+              <strong>{state.deviceName || "正在读取本机"}</strong>
+              <small>CrossCopy v{appVersion || "—"}</small>
+            </span>
+            <i title="本机服务正在运行" />
+          </div>
+          <UpdateControl
+            state={updateState}
+            onCheck={() => void checkForUpdate(true)}
+            onInstall={() => void installUpdate()}
+          />
         </div>
-        <div className="app-version">v{appVersion || "—"}</div>
       </aside>
 
       <section className="content">
@@ -540,31 +545,59 @@ function UpdateControl(props: {
   const state = props.state;
   if (state.kind === "idle") {
     return (
-      <button className="update-link" type="button" onClick={props.onCheck}>
-        检查更新
+      <button className="sidebar-update" type="button" onClick={props.onCheck}>
+        <DownloadSimple size={15} />
+        <span>
+          <strong>检查更新</strong>
+          <small>获取最新稳定版本</small>
+        </span>
       </button>
     );
   }
   if (state.kind === "checking") {
-    return <div className="update-link is-static">正在检查更新…</div>;
+    return (
+      <div className="sidebar-update is-static">
+        <Lightning size={15} />
+        <span>
+          <strong>正在检查</strong>
+          <small>连接更新服务器…</small>
+        </span>
+      </div>
+    );
   }
   if (state.kind === "current") {
-    return <div className="update-link is-static">已是最新版本</div>;
+    return (
+      <button className="sidebar-update" type="button" onClick={props.onCheck}>
+        <Check size={15} />
+        <span>
+          <strong>已是最新版本</strong>
+          <small>点击重新检查</small>
+        </span>
+      </button>
+    );
   }
   if (state.kind === "error") {
     return (
       <button
-        className="update-link update-error"
+        className="sidebar-update update-error"
         type="button"
         onClick={props.onCheck}
       >
-        更新检查失败，重试
+        <WarningCircle size={15} />
+        <span>
+          <strong>更新检查失败</strong>
+          <small>点击重试</small>
+        </span>
       </button>
     );
   }
   if (state.kind === "available") {
     return (
-      <button className="update-card" type="button" onClick={props.onInstall}>
+      <button
+        className="sidebar-update has-update"
+        type="button"
+        onClick={props.onInstall}
+      >
         <DownloadSimple size={16} weight="bold" />
         <span>
           <strong>更新到 v{state.version}</strong>
@@ -581,7 +614,7 @@ function UpdateControl(props: {
         ? "正在下载更新…"
         : `正在下载 ${Math.round(state.progress)}%`;
   return (
-    <div className="update-card is-progress">
+    <div className="sidebar-update is-static is-progress">
       <DownloadSimple size={16} />
       <span>
         <strong>{label}</strong>
@@ -705,9 +738,69 @@ function PairDialog(props: {
 const SCREEN_OFFSETS: Record<ScreenPosition, { x: number; y: number }> = {
   left: { x: -150, y: 0 },
   right: { x: 150, y: 0 },
-  up: { x: 0, y: -82 },
-  down: { x: 0, y: 82 }
+  up: { x: 0, y: -96 },
+  down: { x: 0, y: 96 }
 };
+
+function PeerDisplayGlyph(props: {
+  displays: DisplayInfo[];
+}): React.JSX.Element {
+  const displays =
+    props.displays.length > 0
+      ? props.displays
+      : [
+          {
+            id: "unknown",
+            name: "屏幕",
+            x: 0,
+            y: 0,
+            width: 16,
+            height: 9,
+            primary: true,
+            mirroredCount: 1
+          }
+        ];
+  const bounds = displays.reduce(
+    (value, display) => ({
+      left: Math.min(value.left, display.x),
+      top: Math.min(value.top, display.y),
+      right: Math.max(value.right, display.x + display.width),
+      bottom: Math.max(value.bottom, display.y + display.height)
+    }),
+    {
+      left: Number.POSITIVE_INFINITY,
+      top: Number.POSITIVE_INFINITY,
+      right: Number.NEGATIVE_INFINITY,
+      bottom: Number.NEGATIVE_INFINITY
+    }
+  );
+  const scale = Math.min(
+    46 / Math.max(1, bounds.right - bounds.left),
+    26 / Math.max(1, bounds.bottom - bounds.top)
+  );
+  const offsetX = (46 - (bounds.right - bounds.left) * scale) / 2;
+  const offsetY = (26 - (bounds.bottom - bounds.top) * scale) / 2;
+  return (
+    <span className="peer-monitor-map">
+      {displays.map((display) => (
+        <i
+          className={display.primary ? "primary" : ""}
+          key={display.id}
+          style={{
+            left: offsetX + (display.x - bounds.left) * scale,
+            top: offsetY + (display.y - bounds.top) * scale,
+            width: Math.max(10, display.width * scale),
+            height: Math.max(7, display.height * scale)
+          }}
+          title={display.name}
+        />
+      ))}
+      {displays.some((display) => display.mirroredCount > 1) && (
+        <b>镜像</b>
+      )}
+    </span>
+  );
+}
 
 function MousePanel(props: { state: UiState }): React.JSX.Element {
   const [selectedPeerId, setSelectedPeerId] = useState("");
@@ -791,8 +884,8 @@ function MousePanel(props: { state: UiState }): React.JSX.Element {
         Math.min(175, dragOrigin.offsetX + event.clientX - dragOrigin.pointerX)
       ),
       y: Math.max(
-        -95,
-        Math.min(95, dragOrigin.offsetY + event.clientY - dragOrigin.pointerY)
+        -110,
+        Math.min(110, dragOrigin.offsetY + event.clientY - dragOrigin.pointerY)
       )
     });
   }
@@ -807,8 +900,8 @@ function MousePanel(props: { state: UiState }): React.JSX.Element {
         Math.min(175, dragOrigin.offsetX + event.clientX - dragOrigin.pointerX)
       ),
       y: Math.max(
-        -95,
-        Math.min(95, dragOrigin.offsetY + event.clientY - dragOrigin.pointerY)
+        -110,
+        Math.min(110, dragOrigin.offsetY + event.clientY - dragOrigin.pointerY)
       )
     };
     const position: ScreenPosition =
@@ -825,6 +918,46 @@ function MousePanel(props: { state: UiState }): React.JSX.Element {
   const availablePeers = props.state.peers.filter(
     (peer) => peer.online && peer.mouseAllowed && peer.mouseShareEnabled
   );
+  const localDisplays =
+    props.state.displays.length > 0
+      ? props.state.displays
+      : [
+          {
+            id: "local",
+            name: "本机屏幕",
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            primary: true,
+            mirroredCount: 1
+          }
+        ];
+  const localBounds = localDisplays.reduce(
+    (bounds, display) => ({
+      left: Math.min(bounds.left, display.x),
+      top: Math.min(bounds.top, display.y),
+      right: Math.max(bounds.right, display.x + display.width),
+      bottom: Math.max(bounds.bottom, display.y + display.height)
+    }),
+    {
+      left: Number.POSITIVE_INFINITY,
+      top: Number.POSITIVE_INFINITY,
+      right: Number.NEGATIVE_INFINITY,
+      bottom: Number.NEGATIVE_INFINITY
+    }
+  );
+  const localScale = Math.min(
+    118 / Math.max(1, localBounds.right - localBounds.left),
+    58 / Math.max(1, localBounds.bottom - localBounds.top)
+  );
+  const localMapOffset = {
+    x:
+      (118 - Math.max(1, localBounds.right - localBounds.left) * localScale) /
+      2,
+    y:
+      (58 - Math.max(1, localBounds.bottom - localBounds.top) * localScale) / 2
+  };
   const latencyLabel =
     props.state.mouseLatencyMs === null
       ? "完成一次鼠标穿越后显示"
@@ -859,7 +992,10 @@ function MousePanel(props: { state: UiState }): React.JSX.Element {
         <div className="topology-heading">
           <div>
             <h2>逻辑屏幕位置</h2>
-            <p>拖动任意电脑到本机四周；编号 1 永远是当前电脑。</p>
+            <p>
+              每台电脑是一个屏幕组；组内布局跟随系统设置，CrossCopy
+              只调整电脑之间的位置。
+            </p>
           </div>
           <span className={availablePeers.length > 0 ? "topology-online" : ""}>
             {props.state.peers.length === 0
@@ -869,11 +1005,36 @@ function MousePanel(props: { state: UiState }): React.JSX.Element {
         </div>
 
         <div className="screen-layout" aria-label="拖动调整逻辑屏幕位置">
-          <div className="screen-device local-screen">
+          <div className="local-display-group">
             <b className="screen-number">1</b>
-            <Desktop size={27} />
+            <div className="local-monitor-map">
+              {localDisplays.map((display) => (
+                <div
+                  className={`local-monitor ${display.primary ? "primary" : ""}`}
+                  key={display.id}
+                  style={{
+                    left:
+                      localMapOffset.x +
+                      (display.x - localBounds.left) * localScale,
+                    top:
+                      localMapOffset.y +
+                      (display.y - localBounds.top) * localScale,
+                    width: Math.max(30, display.width * localScale),
+                    height: Math.max(20, display.height * localScale)
+                  }}
+                  title={`${display.name} · ${display.width}×${display.height}`}
+                >
+                  <Desktop size={14} />
+                  {display.mirroredCount > 1 && (
+                    <em>镜像 ×{display.mirroredCount}</em>
+                  )}
+                </div>
+              ))}
+            </div>
             <strong>{props.state.deviceName || "本机"}</strong>
-            <small>当前电脑</small>
+            <small>
+              {localDisplays.length} 个逻辑屏幕 · 系统布局
+            </small>
           </div>
           {props.state.peers.map((peer) => {
             const offset = peerOffset(peer);
@@ -895,9 +1056,12 @@ function MousePanel(props: { state: UiState }): React.JSX.Element {
                 onPointerCancel={() => setDragging(false)}
               >
                 <b className="screen-number">{peer.screenNumber}</b>
-                <Desktop size={27} />
+                <PeerDisplayGlyph displays={peer.displays} />
                 <strong>{peer.name}</strong>
-                <small>{peer.online ? "在线" : "离线"}</small>
+                <small>
+                  {peer.online ? "在线" : "离线"} ·{" "}
+                  {Math.max(1, peer.displays.length)} 个逻辑屏幕
+                </small>
               </button>
             );
           })}
@@ -985,7 +1149,7 @@ function MousePanel(props: { state: UiState }): React.JSX.Element {
       </div>
 
       <section className="mouse-support-note">
-        当前仅转发鼠标移动、左键、右键、滚轮滚动和滚轮按下；键盘不会跨设备发送。
+        扩展屏会作为同一电脑的固定屏幕组；镜像屏自动合并为一个逻辑屏幕。当前仅转发鼠标移动、左键、右键、滚轮滚动和滚轮按下。
       </section>
     </div>
   );

@@ -5,7 +5,7 @@ use crate::{
     },
     logger::{masked_ip, Logger},
     model::{
-        Activity, ClipboardPayload, DiscoveryPacket, Peer, PeerView, ScreenPosition,
+        Activity, ClipboardPayload, DiscoveryPacket, DisplayView, Peer, PeerView, ScreenPosition,
         TransferProgress, UiState,
     },
     mouse_hook::SYNTHETIC_INPUT_MARKER,
@@ -236,6 +236,7 @@ pub struct Core {
     last_progress_emit: AtomicU64,
     last_mouse_state_emit: AtomicU64,
     last_trust_sync: Mutex<HashMap<String, String>>,
+    display_cache: Mutex<(u64, Vec<DisplayView>)>,
     discovery_wake: Notify,
     port: AtomicU64,
     instance_id: String,
@@ -246,7 +247,7 @@ pub struct Core {
 
 impl Core {
     pub fn new(store: Arc<Store>, logger: Arc<Logger>, app: AppHandle) -> Arc<Self> {
-        let (mouse_sender, mouse_receiver) = mpsc::channel(512);
+        let (mouse_sender, mouse_receiver) = mpsc::channel(64);
         let mouse = MouseShare::new(Arc::clone(&logger), mouse_sender);
         Arc::new(Self {
             store,
@@ -264,6 +265,7 @@ impl Core {
             last_progress_emit: AtomicU64::new(0),
             last_mouse_state_emit: AtomicU64::new(0),
             last_trust_sync: Mutex::new(HashMap::new()),
+            display_cache: Mutex::new((0, Vec::new())),
             discovery_wake: Notify::new(),
             port: AtomicU64::new(0),
             instance_id: Uuid::new_v4().to_string(),
@@ -333,6 +335,7 @@ impl Core {
         let pairing = self.pairing.lock().expect("pairing lock");
         UiState {
             device_name: settings.device_name,
+            displays: self.display_views(now),
             sync_enabled: settings.sync_enabled,
             launch_at_login: settings.launch_at_login,
             copy_shortcut: settings.copy_shortcut,
@@ -373,6 +376,9 @@ impl Core {
                         mouse_share_enabled: seen.is_some_and(SeenPeer::mouse_share_enabled),
                         screen_number: peer.screen_number,
                         screen_position: peer.screen_position,
+                        displays: seen
+                            .map(|value| value.packet.displays.clone())
+                            .unwrap_or_default(),
                     }
                 })
                 .collect(),
@@ -382,6 +388,14 @@ impl Core {
 
     pub fn publish(&self) {
         let _ = self.app.emit("state", self.ui_state());
+    }
+
+    fn display_views(&self, now: u64) -> Vec<DisplayView> {
+        let mut cache = self.display_cache.lock().expect("display cache lock");
+        if cache.1.is_empty() || now.saturating_sub(cache.0) >= 5_000 {
+            *cache = (now, read_display_views(&self.app));
+        }
+        cache.1.clone()
     }
 
     pub fn begin_pairing(&self) {
@@ -1188,6 +1202,7 @@ impl Core {
                     app: "crosscopy".into(),
                     protocol: 1,
                     instance_id: String::new(),
+                    displays: Vec::new(),
                     id: peer.id.clone(),
                     name: peer.name.clone(),
                     port: TRANSFER_PORT,
@@ -1230,6 +1245,7 @@ impl Core {
             app: "crosscopy".into(),
             protocol: 1,
             instance_id: self.instance_id.clone(),
+            displays: self.display_views(now_ms()),
             id: settings.device_id,
             name: settings.device_name,
             port: self.port.load(Ordering::Relaxed) as u16,
@@ -1787,6 +1803,7 @@ impl Core {
                             app: "crosscopy".into(),
                             protocol: 1,
                             instance_id: String::new(),
+                            displays: Vec::new(),
                             id: peer.id.clone(),
                             name: peer.name.clone(),
                             port: TRANSFER_PORT,
@@ -2271,6 +2288,55 @@ fn default_screen_position(screen_number: u8) -> ScreenPosition {
         2 => ScreenPosition::Left,
         _ => ScreenPosition::Up,
     }
+}
+
+fn read_display_views(app: &AppHandle) -> Vec<DisplayView> {
+    let primary = app.primary_monitor().ok().flatten().map(|monitor| {
+        (
+            monitor.position().x,
+            monitor.position().y,
+            monitor.size().width,
+            monitor.size().height,
+        )
+    });
+    let mut displays = Vec::<DisplayView>::new();
+    for (index, monitor) in app
+        .available_monitors()
+        .unwrap_or_default()
+        .into_iter()
+        .enumerate()
+    {
+        let key = (
+            monitor.position().x,
+            monitor.position().y,
+            monitor.size().width,
+            monitor.size().height,
+        );
+        if let Some(existing) = displays
+            .iter_mut()
+            .find(|display| (display.x, display.y, display.width, display.height) == key)
+        {
+            existing.mirrored_count = existing.mirrored_count.saturating_add(1);
+            existing.primary |= primary == Some(key);
+            continue;
+        }
+        displays.push(DisplayView {
+            id: format!("{}:{}:{}:{}", key.0, key.1, key.2, key.3),
+            name: monitor
+                .name()
+                .cloned()
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| format!("显示器 {}", index + 1)),
+            x: key.0,
+            y: key.1,
+            width: key.2,
+            height: key.3,
+            primary: primary == Some(key),
+            mirrored_count: 1,
+        });
+    }
+    displays.sort_by_key(|display| (!display.primary, display.x, display.y));
+    displays
 }
 
 async fn read_current_clipboard(logger: &Logger) -> Result<LocalClipboard, String> {

@@ -1,7 +1,19 @@
 export type ScreenPosition = "left" | "right" | "up" | "down";
 
+export type DisplayInfo = {
+  id: string;
+  name: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  primary: boolean;
+  mirroredCount: number;
+};
+
 export type UiState = {
   deviceName: string;
+  displays: DisplayInfo[];
   syncEnabled: boolean;
   launchAtLogin: boolean;
   copyShortcut: string;
@@ -26,6 +38,7 @@ export type UiState = {
     mouseShareEnabled: boolean;
     screenNumber: number;
     screenPosition: ScreenPosition;
+    displays: DisplayInfo[];
   }>;
   activity: Array<{
     id: string;

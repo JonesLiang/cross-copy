@@ -93,6 +93,20 @@ pub struct PeerView {
     pub mouse_share_enabled: bool,
     pub screen_number: u8,
     pub screen_position: ScreenPosition,
+    pub displays: Vec<DisplayView>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DisplayView {
+    pub id: String,
+    pub name: String,
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+    pub primary: bool,
+    pub mirrored_count: u32,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -121,6 +135,7 @@ pub struct TransferProgress {
 #[serde(rename_all = "camelCase")]
 pub struct UiState {
     pub device_name: String,
+    pub displays: Vec<DisplayView>,
     pub sync_enabled: bool,
     pub launch_at_login: bool,
     pub copy_shortcut: String,
@@ -163,6 +178,8 @@ pub struct DiscoveryPacket {
     pub protocol: u8,
     #[serde(default)]
     pub instance_id: String,
+    #[serde(default)]
+    pub displays: Vec<DisplayView>,
     pub id: String,
     pub name: String,
     pub port: u16,

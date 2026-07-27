@@ -3,8 +3,8 @@ use crate::{
     logger::Logger,
     model::ScreenPosition,
     mouse_hook::{
-        recenter_cursor, run_mouse_hook, screen_size, set_cursor_visible, HookMouseButton,
-        HookMouseEvent,
+        recenter_cursor, run_mouse_hook, screen_bounds, set_cursor_visible, DesktopBounds,
+        HookMouseButton, HookMouseEvent,
     },
 };
 use enigo::{Axis, Button, Coordinate, Direction, Enigo, Mouse, Settings as EnigoSettings};
@@ -23,12 +23,11 @@ const NO_LATENCY: u64 = u64::MAX;
 const PHYSICAL_INPUT_PRIORITY_MS: u64 = 180;
 const HELD_BUTTON_SAFETY_TIMEOUT_MS: u64 = 10_000;
 const LOGICAL_PIXEL_MILLI: i64 = 1_000;
-const LOGICAL_500_DPI_GAIN_MILLI: i64 = 500;
 const MAX_PHYSICAL_DELTA_PER_EVENT: i32 = 256;
 const ENTER_RETRY_MS: u64 = 120;
 const SESSION_TIMEOUT_MS: u64 = 5_000;
 const KEEP_ALIVE_MS: u64 = 400;
-const MOVE_SEND_INTERVAL_MS: u64 = 4;
+const MOVE_SEND_INTERVAL_MS: u64 = 2;
 const EDGE_INSET_PIXELS: i32 = 8;
 const RETURN_ARM_DISTANCE_PIXELS: i32 = 32;
 const EDGE_TRANSITION_COOLDOWN_MS: u64 = 160;
@@ -156,8 +155,7 @@ struct Inner {
     outbound: mpsc::Sender<OutboundMouseSignal>,
     injector: std_mpsc::SyncSender<HookMouseEvent>,
     logger: Arc<Logger>,
-    screen_width: i32,
-    screen_height: i32,
+    bounds: Mutex<DesktopBounds>,
 }
 
 pub struct MouseShare {
@@ -166,9 +164,9 @@ pub struct MouseShare {
 
 impl MouseShare {
     pub fn new(logger: Arc<Logger>, outbound: mpsc::Sender<OutboundMouseSignal>) -> Arc<Self> {
-        let (injector, injection_receiver) = std_mpsc::sync_channel(512);
+        let (injector, injection_receiver) = std_mpsc::sync_channel(32);
         let mut enigo = Enigo::new(&mouse_input_settings()).ok();
-        let (screen_width, screen_height) = screen_size();
+        let bounds = screen_bounds();
         let injection_logger = Arc::clone(&logger);
         let _ = std::thread::Builder::new()
             .name("crosscopy-mouse-injector".into())
@@ -209,8 +207,7 @@ impl MouseShare {
                 outbound,
                 injector,
                 logger,
-                screen_width,
-                screen_height,
+                bounds: Mutex::new(bounds),
             }),
         });
         mouse_share.start_session_maintenance();
@@ -218,6 +215,13 @@ impl MouseShare {
     }
 
     pub fn configure(&self, enabled: bool, targets: Vec<(String, ScreenPosition)>) {
+        let latest_bounds = screen_bounds();
+        let bounds_changed = {
+            let mut bounds = self.inner.bounds.lock().expect("desktop bounds lock");
+            let changed = *bounds != latest_bounds;
+            *bounds = latest_bounds;
+            changed
+        };
         let was_enabled = self.inner.enabled.swap(enabled, Ordering::AcqRel);
         if enabled && !was_enabled {
             self.inner
@@ -226,12 +230,14 @@ impl MouseShare {
         }
         let mut runtime = self.inner.runtime.lock().expect("mouse runtime lock");
         let outgoing_invalid = !enabled
+            || bounds_changed
             || runtime.outgoing.as_ref().is_some_and(|session| {
                 !targets
                     .iter()
                     .any(|(peer_id, _)| peer_id == &session.peer_id)
             });
         let incoming_invalid = !enabled
+            || bounds_changed
             || runtime.incoming.as_ref().is_some_and(|session| {
                 !targets
                     .iter()
@@ -291,7 +297,8 @@ impl MouseShare {
         if !self.inner.enabled.load(Ordering::Acquire) {
             return Err("请先开启鼠标共享".into());
         }
-        let (width, height) = (self.inner.screen_width, self.inner.screen_height);
+        let bounds = self.inner.desktop_bounds();
+        let (width, height) = (bounds.width, bounds.height);
         let mut runtime = self.inner.runtime.lock().expect("mouse runtime lock");
         if !runtime.targets.iter().any(|(id, _)| id == &peer_id) {
             return Err("目标屏幕当前不可用".into());
@@ -346,7 +353,7 @@ impl MouseShare {
         set_cursor_visible(false)?;
         #[cfg(target_os = "windows")]
         self.inject(HookMouseEvent::CursorVisible(false));
-        recenter_cursor(anchor_x, anchor_y, width, height)?;
+        recenter_cursor(anchor_x, anchor_y, bounds)?;
         self.inner.logger.info(
             "mouse_screen_switched",
             format!("target={peer_id} position={position:?}"),
@@ -382,10 +389,8 @@ impl MouseShare {
         drop(runtime);
         if outgoing.is_some() {
             self.inject(HookMouseEvent::CursorVisible(true));
-            self.inject(absolute_move(
-                self.inner.screen_width / 2,
-                self.inner.screen_height / 2,
-            ));
+            let bounds = self.inner.desktop_bounds();
+            self.inject(absolute_move(bounds.width / 2, bounds.height / 2));
         }
         for event in releases {
             self.inject(event);
@@ -406,12 +411,13 @@ impl MouseShare {
             return;
         };
         runtime.outgoing = None;
+        let bounds = self.inner.desktop_bounds();
         let point = safe_source_point(
             exit_edge,
             runtime.last_x,
             runtime.last_y,
-            self.inner.screen_width,
-            self.inner.screen_height,
+            bounds.width,
+            bounds.height,
         );
         runtime.last_x = point.0;
         runtime.last_y = point.1;
@@ -447,7 +453,8 @@ impl MouseShare {
         if !self.inner.enabled.load(Ordering::Acquire) {
             return responses;
         }
-        let (width, height) = (self.inner.screen_width, self.inner.screen_height);
+        let bounds = self.inner.desktop_bounds();
+        let (width, height) = (bounds.width, bounds.height);
         let mut runtime = self.inner.runtime.lock().expect("mouse runtime lock");
         let mut simulated_events = Vec::new();
         match signal {
@@ -827,10 +834,11 @@ impl MouseShare {
         let _ = std::thread::Builder::new()
             .name("crosscopy-mouse-maintenance".into())
             .spawn(move || loop {
-                std::thread::sleep(std::time::Duration::from_millis(50));
                 let Some(mouse_share) = mouse_share.upgrade() else {
                     return;
                 };
+                let delay = if mouse_share.session_active() { 2 } else { 50 };
+                std::thread::sleep(std::time::Duration::from_millis(delay));
                 mouse_share.expire_unresponsive_outgoing();
 
                 let now = now_ms();
@@ -929,13 +937,19 @@ impl MouseShare {
 }
 
 impl Inner {
+    fn desktop_bounds(&self) -> DesktopBounds {
+        *self.bounds.lock().expect("desktop bounds lock")
+    }
+
     fn handle_local_event(&self, event: HookMouseEvent) -> bool {
         self.last_physical_at.store(now_ms(), Ordering::Relaxed);
         if !self.enabled.load(Ordering::Acquire) {
             return false;
         }
 
-        let (width, height) = (self.screen_width, self.screen_height);
+        let bounds = self.desktop_bounds();
+        let (width, height) = (bounds.width, bounds.height);
+        let event = localize_move(event, bounds);
         let mut runtime = self.runtime.lock().expect("mouse runtime lock");
         if let Some(incoming) = runtime.incoming.take() {
             self.logger.warn(
@@ -981,10 +995,10 @@ impl Inner {
                         }
                         outgoing.total_x_milli = outgoing
                             .total_x_milli
-                            .saturating_add(i64::from(delta_x) * LOGICAL_500_DPI_GAIN_MILLI);
+                            .saturating_add(scaled_pointer_delta(delta_x));
                         outgoing.total_y_milli = outgoing
                             .total_y_milli
-                            .saturating_add(i64::from(delta_y) * LOGICAL_500_DPI_GAIN_MILLI);
+                            .saturating_add(scaled_pointer_delta(delta_y));
                         let now = now_ms();
                         if outgoing.acknowledged
                             && now.saturating_sub(outgoing.last_move_sent_at)
@@ -1056,7 +1070,7 @@ impl Inner {
             let anchor = (outgoing.anchor_x, outgoing.anchor_y);
             drop(runtime);
             if should_recenter {
-                let _ = recenter_cursor(anchor.0, anchor.1, width, height);
+                let _ = recenter_cursor(anchor.0, anchor.1, bounds);
             }
             return true;
         }
@@ -1123,7 +1137,7 @@ impl Inner {
                     }
                     #[cfg(target_os = "windows")]
                     self.inject(HookMouseEvent::CursorVisible(false));
-                    let _ = recenter_cursor(anchor_x, anchor_y, width, height);
+                    let _ = recenter_cursor(anchor_x, anchor_y, bounds);
                     return true;
                 }
             }
@@ -1132,6 +1146,7 @@ impl Inner {
     }
 
     fn inject(&self, event: HookMouseEvent) {
+        let event = globalize_move(event, self.desktop_bounds());
         if matches!(event, HookMouseEvent::Move { .. }) {
             // Movement is absolute and cumulative, so a saturated injector may
             // drop an intermediate frame; the next frame catches up instantly.
@@ -1318,8 +1333,40 @@ fn absolute_move(x: i32, y: i32) -> HookMouseEvent {
     }
 }
 
+fn localize_move(event: HookMouseEvent, bounds: DesktopBounds) -> HookMouseEvent {
+    match event {
+        HookMouseEvent::Move { x, y, native_delta } => HookMouseEvent::Move {
+            x: x.saturating_sub(bounds.x),
+            y: y.saturating_sub(bounds.y),
+            native_delta,
+        },
+        other => other,
+    }
+}
+
+fn globalize_move(event: HookMouseEvent, bounds: DesktopBounds) -> HookMouseEvent {
+    match event {
+        HookMouseEvent::Move { x, y, native_delta } => HookMouseEvent::Move {
+            x: bounds.x.saturating_add(x),
+            y: bounds.y.saturating_add(y),
+            native_delta,
+        },
+        other => other,
+    }
+}
+
 fn clamp_physical_delta(value: i32) -> i32 {
     value.clamp(-MAX_PHYSICAL_DELTA_PER_EVENT, MAX_PHYSICAL_DELTA_PER_EVENT)
+}
+
+fn scaled_pointer_delta(value: i32) -> i64 {
+    let magnitude = value.unsigned_abs();
+    let gain_milli = match magnitude {
+        0..=2 => 1_000,
+        3..=8 => 750,
+        _ => 500,
+    };
+    i64::from(value) * gain_milli
 }
 
 fn milli_to_pixel(value: i64) -> i32 {
@@ -1360,9 +1407,18 @@ fn event_kind(event: HookMouseEvent) -> &'static str {
 
 fn inject_mouse_event(enigo: &mut Enigo, event: HookMouseEvent) -> Result<(), String> {
     match event {
-        HookMouseEvent::Move { x, y, .. } => enigo
-            .move_mouse(x, y, Coordinate::Abs)
-            .map_err(|error| error.to_string()),
+        HookMouseEvent::Move { x, y, .. } => {
+            #[cfg(target_os = "windows")]
+            {
+                crate::mouse_hook::move_cursor_absolute(x, y)
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                enigo
+                    .move_mouse(x, y, Coordinate::Abs)
+                    .map_err(|error| error.to_string())
+            }
+        }
         HookMouseEvent::Button { button, pressed } => enigo
             .button(
                 match button {

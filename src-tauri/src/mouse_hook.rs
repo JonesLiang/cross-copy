@@ -1,5 +1,13 @@
 pub(crate) const SYNTHETIC_INPUT_MARKER: usize = 0x4352_4f53_5343_4f50;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DesktopBounds {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum HookMouseButton {
     Left,
@@ -26,50 +34,94 @@ pub enum HookMouseEvent {
 }
 
 #[cfg(target_os = "macos")]
-pub fn screen_size() -> (i32, i32) {
+pub fn screen_bounds() -> DesktopBounds {
     use core_graphics::display::CGDisplay;
-    let bounds = CGDisplay::main().bounds();
-    (
-        (bounds.size.width.round() as i32).max(2),
-        (bounds.size.height.round() as i32).max(2),
-    )
+    let displays = CGDisplay::active_displays().unwrap_or_default();
+    let bounds: Option<(i32, i32, i32, i32)> = displays
+        .into_iter()
+        .map(|id| CGDisplay::new(id).bounds())
+        .fold(None, |combined, bounds| {
+            let left = bounds.origin.x.floor() as i32;
+            let top = bounds.origin.y.floor() as i32;
+            let right = (bounds.origin.x + bounds.size.width).ceil() as i32;
+            let bottom = (bounds.origin.y + bounds.size.height).ceil() as i32;
+            Some(match combined {
+                None => (left, top, right, bottom),
+                Some((min_x, min_y, max_x, max_y)) => (
+                    min_x.min(left),
+                    min_y.min(top),
+                    max_x.max(right),
+                    max_y.max(bottom),
+                ),
+            })
+        });
+    let (x, y, right, bottom) = bounds.unwrap_or_else(|| {
+        let main = CGDisplay::main().bounds();
+        (
+            main.origin.x.floor() as i32,
+            main.origin.y.floor() as i32,
+            (main.origin.x + main.size.width).ceil() as i32,
+            (main.origin.y + main.size.height).ceil() as i32,
+        )
+    });
+    DesktopBounds {
+        x,
+        y,
+        width: (right - x).max(2),
+        height: (bottom - y).max(2),
+    }
 }
 
 #[cfg(target_os = "windows")]
-pub fn screen_size() -> (i32, i32) {
-    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
+pub fn screen_bounds() -> DesktopBounds {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+        SM_YVIRTUALSCREEN,
+    };
     unsafe {
-        (
-            GetSystemMetrics(SM_CXSCREEN).max(2),
-            GetSystemMetrics(SM_CYSCREEN).max(2),
-        )
+        DesktopBounds {
+            x: GetSystemMetrics(SM_XVIRTUALSCREEN),
+            y: GetSystemMetrics(SM_YVIRTUALSCREEN),
+            width: GetSystemMetrics(SM_CXVIRTUALSCREEN).max(2),
+            height: GetSystemMetrics(SM_CYVIRTUALSCREEN).max(2),
+        }
     }
 }
 
 #[cfg(target_os = "macos")]
-pub fn recenter_cursor(x: i32, y: i32, width: i32, height: i32) -> Result<(), String> {
+pub fn recenter_cursor(x: i32, y: i32, bounds: DesktopBounds) -> Result<(), String> {
     use core_graphics::{display::CGDisplay, geometry::CGPoint};
 
     // Warping does not generate a mouse event, so the event tap only observes
     // real hardware deltas while the hidden source cursor remains away from
     // the screen edge.
     CGDisplay::warp_mouse_cursor_position(CGPoint::new(
-        f64::from(x.clamp(0, width - 1)),
-        f64::from(y.clamp(0, height - 1)),
+        f64::from(bounds.x + x.clamp(0, bounds.width - 1)),
+        f64::from(bounds.y + y.clamp(0, bounds.height - 1)),
     ))
     .map_err(|error| format!("macOS 鼠标回中失败：{error:?}"))
 }
 
 #[cfg(target_os = "windows")]
-pub fn recenter_cursor(x: i32, y: i32, width: i32, height: i32) -> Result<(), String> {
+pub fn recenter_cursor(x: i32, y: i32, bounds: DesktopBounds) -> Result<(), String> {
+    move_cursor_absolute(bounds.x.saturating_add(x), bounds.y.saturating_add(y))
+}
+
+#[cfg(target_os = "windows")]
+pub fn move_cursor_absolute(x: i32, y: i32) -> Result<(), String> {
     use std::mem::size_of;
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_MOVE,
-        MOUSEEVENTF_MOVE_NOCOALESCE, MOUSEINPUT,
+        MOUSEEVENTF_MOVE_NOCOALESCE, MOUSEEVENTF_VIRTUALDESK, MOUSEINPUT,
     };
 
-    let normalized_x = i64::from(x.clamp(0, width - 1)) * 65_535 / i64::from(width - 1);
-    let normalized_y = i64::from(y.clamp(0, height - 1)) * 65_535 / i64::from(height - 1);
+    let bounds = screen_bounds();
+    let local_x = x.saturating_sub(bounds.x);
+    let local_y = y.saturating_sub(bounds.y);
+    let normalized_x =
+        i64::from(local_x.clamp(0, bounds.width - 1)) * 65_535 / i64::from(bounds.width - 1);
+    let normalized_y =
+        i64::from(local_y.clamp(0, bounds.height - 1)) * 65_535 / i64::from(bounds.height - 1);
     let input = INPUT {
         r#type: INPUT_MOUSE,
         Anonymous: INPUT_0 {
@@ -77,7 +129,10 @@ pub fn recenter_cursor(x: i32, y: i32, width: i32, height: i32) -> Result<(), St
                 dx: normalized_x as i32,
                 dy: normalized_y as i32,
                 mouseData: 0,
-                dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE_NOCOALESCE,
+                dwFlags: MOUSEEVENTF_MOVE
+                    | MOUSEEVENTF_ABSOLUTE
+                    | MOUSEEVENTF_MOVE_NOCOALESCE
+                    | MOUSEEVENTF_VIRTUALDESK,
                 time: 0,
                 dwExtraInfo: SYNTHETIC_INPUT_MARKER,
             },
@@ -88,7 +143,7 @@ pub fn recenter_cursor(x: i32, y: i32, width: i32, height: i32) -> Result<(), St
         Ok(())
     } else {
         Err(format!(
-            "Windows 鼠标回中失败：{}",
+            "Windows 鼠标移动失败：{}",
             std::io::Error::last_os_error()
         ))
     }
