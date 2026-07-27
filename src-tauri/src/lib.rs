@@ -85,6 +85,11 @@ async fn set_peer_permissions(
 }
 
 #[tauri::command]
+fn set_peer_mouse_dpi(core: State<'_, Arc<Core>>, peer_id: String, dpi: u16) -> Result<(), String> {
+    core.set_peer_mouse_dpi(peer_id, dpi)
+}
+
+#[tauri::command]
 fn switch_mouse_to_screen(core: State<'_, Arc<Core>>, screen_number: u8) -> Result<(), String> {
     core.switch_mouse_to_screen(screen_number)
 }
@@ -385,6 +390,7 @@ pub fn run() {
             set_mouse_position,
             set_peer_screen_position,
             set_peer_permissions,
+            set_peer_mouse_dpi,
             switch_mouse_to_screen,
             set_launch_at_login,
             unpair,

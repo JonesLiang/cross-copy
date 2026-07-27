@@ -34,6 +34,8 @@ pub struct Peer {
     pub clipboard_allowed: bool,
     #[serde(default = "default_true")]
     pub mouse_allowed: bool,
+    #[serde(default = "default_mouse_receive_dpi")]
+    pub mouse_receive_dpi: u16,
     #[serde(default)]
     pub screen_number: u8,
     #[serde(default)]
@@ -76,6 +78,10 @@ pub fn default_mouse_shortcut() -> String {
     "Ctrl+Shift+M".into()
 }
 
+pub fn default_mouse_receive_dpi() -> u16 {
+    500
+}
+
 pub fn default_true() -> bool {
     true
 }
@@ -90,6 +96,7 @@ pub struct PeerView {
     pub direct: bool,
     pub clipboard_allowed: bool,
     pub mouse_allowed: bool,
+    pub mouse_receive_dpi: u16,
     pub mouse_share_enabled: bool,
     pub screen_number: u8,
     pub screen_position: ScreenPosition,

@@ -5,8 +5,8 @@ use crate::{
     },
     logger::{masked_ip, Logger},
     model::{
-        Activity, ClipboardPayload, DiscoveryPacket, DisplayView, Peer, PeerView, ScreenPosition,
-        TransferProgress, UiState,
+        default_mouse_receive_dpi, Activity, ClipboardPayload, DiscoveryPacket, DisplayView, Peer,
+        PeerView, ScreenPosition, TransferProgress, UiState,
     },
     mouse_hook::SYNTHETIC_INPUT_MARKER,
     mouse_share::{MouseShare, MouseSignal, OutboundMouseSignal},
@@ -234,7 +234,7 @@ pub struct Core {
     awake_until: AtomicU64,
     last_discovery_response: AtomicU64,
     last_progress_emit: AtomicU64,
-    last_mouse_state_emit: AtomicU64,
+    last_mouse_presence_refresh: AtomicU64,
     last_trust_sync: Mutex<HashMap<String, String>>,
     display_cache: Mutex<(u64, Vec<DisplayView>)>,
     discovery_wake: Notify,
@@ -263,7 +263,7 @@ impl Core {
             awake_until: AtomicU64::new(now_ms() + ACTIVE_DISCOVERY_MS),
             last_discovery_response: AtomicU64::new(0),
             last_progress_emit: AtomicU64::new(0),
-            last_mouse_state_emit: AtomicU64::new(0),
+            last_mouse_presence_refresh: AtomicU64::new(0),
             last_trust_sync: Mutex::new(HashMap::new()),
             display_cache: Mutex::new((0, Vec::new())),
             discovery_wake: Notify::new(),
@@ -382,6 +382,7 @@ impl Core {
                         direct: peer.direct,
                         clipboard_allowed: peer.clipboard_allowed,
                         mouse_allowed: peer.mouse_allowed,
+                        mouse_receive_dpi: peer.mouse_receive_dpi,
                         mouse_share_enabled: seen.is_some_and(SeenPeer::mouse_share_enabled),
                         screen_number: peer.screen_number,
                         screen_position: peer.screen_position,
@@ -587,6 +588,31 @@ impl Core {
             format!(
                 "peer={peer_id} clipboard_allowed={clipboard_allowed} mouse_allowed={mouse_allowed}"
             ),
+        );
+        Ok(())
+    }
+
+    pub fn set_peer_mouse_dpi(&self, peer_id: String, dpi: u16) -> Result<(), String> {
+        if !(100..=2_000).contains(&dpi) {
+            return Err("DPI 必须在 100 到 2000 之间".into());
+        }
+        let mut found = false;
+        self.store
+            .update(|settings| {
+                if let Some(peer) = settings.peers.iter_mut().find(|peer| peer.id == peer_id) {
+                    peer.mouse_receive_dpi = dpi;
+                    found = true;
+                }
+            })
+            .map_err(|error| error.to_string())?;
+        if !found {
+            return Err("设备不存在".into());
+        }
+        self.refresh_mouse_runtime();
+        self.publish();
+        self.logger.info(
+            "mouse_receive_dpi_changed",
+            format!("peer={peer_id} dpi={dpi}"),
         );
         Ok(())
     }
@@ -993,6 +1019,7 @@ impl Core {
         tauri::async_runtime::spawn(async move {
             let mut last_error_log = 0_u64;
             while let Some(outbound) = receiver.recv().await {
+                let publish_state = mouse_signal_changes_state(&outbound.signal);
                 if let Err(error) = core.send_mouse_signal(outbound).await {
                     let now = now_ms();
                     if now.saturating_sub(last_error_log) >= 1_000 {
@@ -1000,8 +1027,9 @@ impl Core {
                         core.logger.warn("mouse_send_failed", error);
                     }
                 }
-                core.mouse.expire_unresponsive_outgoing();
-                core.publish_mouse_state_throttled();
+                if publish_state {
+                    core.publish();
+                }
             }
         });
     }
@@ -1022,8 +1050,15 @@ impl Core {
             })
             .map(|peer| (peer.id.clone(), peer.screen_position))
             .collect();
+        let receive_dpi = settings
+            .peers
+            .iter()
+            .filter(|peer| peer.mouse_allowed)
+            .map(|peer| (peer.id.clone(), peer.mouse_receive_dpi))
+            .collect();
         drop(discovered);
-        self.mouse.configure(settings.mouse_share_enabled, targets);
+        self.mouse
+            .configure(settings.mouse_share_enabled, targets, receive_dpi);
     }
 
     fn peer_available_for_mouse(&self, peer_id: &str) -> bool {
@@ -1204,41 +1239,60 @@ impl Core {
         }
         let key = decode_secret(&peer.secret)?;
         let signal: MouseSignal = decrypt(&key, &packet.envelope)?;
-        self.discovered.lock().expect("discovery lock").insert(
-            peer.id.clone(),
-            SeenPeer {
-                packet: DiscoveryPacket {
-                    app: "crosscopy".into(),
-                    protocol: 1,
-                    instance_id: String::new(),
-                    displays: Vec::new(),
-                    id: peer.id.clone(),
-                    name: peer.name.clone(),
-                    port: TRANSFER_PORT,
-                    pairing_salt: None,
-                    pairing_expires_at: None,
-                    mouse_share_enabled: true,
-                    mouse_position: ScreenPosition::Right,
-                },
-                host: source.ip(),
-                last_seen: now_ms(),
-                remote_mouse_enabled: Some(true),
-            },
-        );
-        for response in self.mouse.apply_remote(&peer.id, signal) {
+        let publish_state = mouse_signal_changes_state(&signal);
+        let now = now_ms();
+        let previous_presence = self.last_mouse_presence_refresh.load(Ordering::Relaxed);
+        let refresh_presence = publish_state
+            || (now.saturating_sub(previous_presence) >= 1_000
+                && self
+                    .last_mouse_presence_refresh
+                    .compare_exchange(previous_presence, now, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok());
+        if refresh_presence {
+            if publish_state {
+                self.last_mouse_presence_refresh
+                    .store(now, Ordering::Relaxed);
+            }
+            let mut discovered = self.discovered.lock().expect("discovery lock");
+            if let Some(seen) = discovered.get_mut(&peer.id) {
+                seen.host = source.ip();
+                seen.last_seen = now;
+                seen.remote_mouse_enabled = Some(true);
+            } else {
+                discovered.insert(
+                    peer.id.clone(),
+                    SeenPeer {
+                        packet: DiscoveryPacket {
+                            app: "crosscopy".into(),
+                            protocol: 1,
+                            instance_id: String::new(),
+                            displays: Vec::new(),
+                            id: peer.id.clone(),
+                            name: peer.name.clone(),
+                            port: TRANSFER_PORT,
+                            pairing_salt: None,
+                            pairing_expires_at: None,
+                            mouse_share_enabled: true,
+                            mouse_position: ScreenPosition::Right,
+                        },
+                        host: source.ip(),
+                        last_seen: now,
+                        remote_mouse_enabled: Some(true),
+                    },
+                );
+            }
+        }
+        let responses = self.mouse.apply_remote(&peer.id, signal);
+        let response_changes_state = responses
+            .iter()
+            .any(|response| mouse_signal_changes_state(&response.signal));
+        for response in responses {
             self.send_mouse_signal(response).await?;
         }
-        self.publish_mouse_state_throttled();
-        Ok(())
-    }
-
-    fn publish_mouse_state_throttled(&self) {
-        let now = now_ms();
-        let previous = self.last_mouse_state_emit.load(Ordering::Relaxed);
-        if now.saturating_sub(previous) >= 100 {
-            self.last_mouse_state_emit.store(now, Ordering::Relaxed);
+        if publish_state || response_changes_state {
             self.publish();
         }
+        Ok(())
     }
 
     fn discovery_packet(&self) -> DiscoveryPacket {
@@ -1534,6 +1588,7 @@ impl Core {
                         direct: false,
                         clipboard_allowed: true,
                         mouse_allowed: true,
+                        mouse_receive_dpi: default_mouse_receive_dpi(),
                         screen_number,
                         screen_position: default_screen_position(screen_number),
                     });
@@ -1590,6 +1645,7 @@ impl Core {
             direct: true,
             clipboard_allowed: true,
             mouse_allowed: true,
+            mouse_receive_dpi: default_mouse_receive_dpi(),
             screen_number: 0,
             screen_position: ScreenPosition::Right,
         })?;
@@ -1668,6 +1724,7 @@ impl Core {
             direct: true,
             clipboard_allowed: true,
             mouse_allowed: true,
+            mouse_receive_dpi: default_mouse_receive_dpi(),
             screen_number: 0,
             screen_position: ScreenPosition::Right,
         })?;
@@ -1744,6 +1801,7 @@ impl Core {
             direct: true,
             clipboard_allowed: true,
             mouse_allowed: true,
+            mouse_receive_dpi: default_mouse_receive_dpi(),
             screen_number: 0,
             screen_position: ScreenPosition::Right,
         })?;
@@ -1932,6 +1990,7 @@ impl Core {
             direct: true,
             clipboard_allowed: true,
             mouse_allowed: true,
+            mouse_receive_dpi: default_mouse_receive_dpi(),
             screen_number: 0,
             screen_position: ScreenPosition::Right,
         })?;
@@ -2166,6 +2225,7 @@ impl Core {
                 if let Some(existing) = settings.peers.iter().find(|value| value.id == peer.id) {
                     peer.clipboard_allowed = existing.clipboard_allowed;
                     peer.mouse_allowed = existing.mouse_allowed;
+                    peer.mouse_receive_dpi = existing.mouse_receive_dpi;
                     peer.screen_number = existing.screen_number;
                     peer.screen_position = existing.screen_position;
                     peer.direct |= existing.direct;
@@ -2828,6 +2888,13 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+fn mouse_signal_changes_state(signal: &MouseSignal) -> bool {
+    !matches!(
+        signal,
+        MouseSignal::Move { .. } | MouseSignal::Scroll { .. } | MouseSignal::KeepAlive { .. }
+    )
 }
 
 fn ellipsize(value: &str, max: usize) -> String {

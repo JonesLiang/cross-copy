@@ -35,6 +35,7 @@ export type UiState = {
     direct: boolean;
     clipboardAllowed: boolean;
     mouseAllowed: boolean;
+    mouseReceiveDpi: number;
     mouseShareEnabled: boolean;
     screenNumber: number;
     screenPosition: ScreenPosition;

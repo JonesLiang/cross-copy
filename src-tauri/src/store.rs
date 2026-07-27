@@ -42,6 +42,7 @@ impl Store {
         }
         let mut used_screens = HashSet::new();
         for peer in &mut value.peers {
+            peer.mouse_receive_dpi = peer.mouse_receive_dpi.clamp(100, 2_000);
             if peer.screen_number < 2 || used_screens.contains(&peer.screen_number) {
                 peer.screen_number = (2_u8..=u8::MAX)
                     .find(|number| !used_screens.contains(number))

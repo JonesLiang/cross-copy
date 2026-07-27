@@ -14,7 +14,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc as std_mpsc, Arc, Mutex,
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -29,9 +29,6 @@ const ENTER_RETRY_MS: u64 = 120;
 const SESSION_TIMEOUT_MS: u64 = 5_000;
 const KEEP_ALIVE_MS: u64 = 400;
 const MOVE_SEND_INTERVAL_MS: u64 = 2;
-#[cfg(target_os = "macos")]
-const TARGET_FRAME_INTERVAL_MS: u64 = 8;
-#[cfg(target_os = "windows")]
 const TARGET_FRAME_INTERVAL_MS: u64 = 4;
 const EDGE_INSET_PIXELS: i32 = 8;
 const RETURN_ARM_DISTANCE_PIXELS: i32 = 32;
@@ -127,9 +124,10 @@ struct IncomingSession {
     return_edge: ScreenPosition,
     x_milli: i64,
     y_milli: i64,
+    receive_dpi: u16,
     last_injected_x: i32,
     last_injected_y: i32,
-    last_injected_at: u64,
+    last_injected_at: Instant,
     last_move_sequence: u64,
     last_total_x_milli: i64,
     last_total_y_milli: i64,
@@ -146,6 +144,7 @@ struct IncomingSession {
 
 struct Runtime {
     targets: Vec<(String, ScreenPosition)>,
+    receive_dpi: Vec<(String, u16)>,
     last_x: i32,
     last_y: i32,
     crossing_blocked_until: u64,
@@ -206,6 +205,7 @@ impl MouseShare {
                 last_physical_at: AtomicU64::new(0),
                 runtime: Mutex::new(Runtime {
                     targets: Vec::new(),
+                    receive_dpi: Vec::new(),
                     last_x: 0,
                     last_y: 0,
                     crossing_blocked_until: 0,
@@ -222,7 +222,12 @@ impl MouseShare {
         mouse_share
     }
 
-    pub fn configure(&self, enabled: bool, targets: Vec<(String, ScreenPosition)>) {
+    pub fn configure(
+        &self,
+        enabled: bool,
+        targets: Vec<(String, ScreenPosition)>,
+        receive_dpi: Vec<(String, u16)>,
+    ) {
         let latest_bounds = screen_bounds();
         let bounds_changed = {
             let mut bounds = self.inner.bounds.lock().expect("desktop bounds lock");
@@ -252,6 +257,25 @@ impl MouseShare {
                     .any(|(peer_id, _)| peer_id == &session.peer_id)
             });
         runtime.targets = targets;
+        runtime.receive_dpi = receive_dpi;
+        let active_receive_dpi = runtime.incoming.as_ref().map(|incoming| {
+            (
+                incoming.peer_id.clone(),
+                runtime
+                    .receive_dpi
+                    .iter()
+                    .find(|(peer_id, _)| peer_id == &incoming.peer_id)
+                    .map(|(_, dpi)| *dpi)
+                    .unwrap_or(500),
+            )
+        });
+        if let (Some(incoming), Some((peer_id, dpi))) =
+            (runtime.incoming.as_mut(), active_receive_dpi)
+        {
+            if incoming.peer_id == peer_id {
+                incoming.receive_dpi = dpi;
+            }
+        }
         let should_start_listener = enabled && !runtime.targets.is_empty();
         let mut release_events = Vec::new();
         let mut cancelled = Vec::new();
@@ -510,15 +534,22 @@ impl MouseShare {
                     ));
                 }
                 let (x, y) = edge_point(entry_edge, ratio, width, height);
+                let receive_dpi = runtime
+                    .receive_dpi
+                    .iter()
+                    .find(|(configured_peer, _)| configured_peer == peer_id)
+                    .map(|(_, dpi)| *dpi)
+                    .unwrap_or(500);
                 runtime.incoming = Some(IncomingSession {
                     peer_id: peer_id.to_string(),
                     session_id: session_id.clone(),
                     return_edge: entry_edge,
                     x_milli: i64::from(x) * LOGICAL_PIXEL_MILLI,
                     y_milli: i64::from(y) * LOGICAL_PIXEL_MILLI,
+                    receive_dpi,
                     last_injected_x: x,
                     last_injected_y: y,
-                    last_injected_at: now_ms(),
+                    last_injected_at: Instant::now(),
                     last_move_sequence: 0,
                     last_total_x_milli: 0,
                     last_total_y_milli: 0,
@@ -542,7 +573,7 @@ impl MouseShare {
                 ));
                 self.inner.logger.info(
                     "mouse_remote_enter",
-                    format!("edge={entry_edge:?} ratio={ratio:.3}"),
+                    format!("edge={entry_edge:?} ratio={ratio:.3} dpi={receive_dpi}"),
                 );
             }
             MouseSignal::Move {
@@ -562,8 +593,14 @@ impl MouseShare {
                 }
                 let is_first_move = incoming.last_move_sequence == 0;
                 incoming.last_event_at = now_ms();
-                let delta_x_milli = total_x_milli.saturating_sub(incoming.last_total_x_milli);
-                let delta_y_milli = total_y_milli.saturating_sub(incoming.last_total_y_milli);
+                let delta_x_milli = scale_receive_delta(
+                    total_x_milli.saturating_sub(incoming.last_total_x_milli),
+                    incoming.receive_dpi,
+                );
+                let delta_y_milli = scale_receive_delta(
+                    total_y_milli.saturating_sub(incoming.last_total_y_milli),
+                    incoming.receive_dpi,
+                );
                 incoming.last_move_sequence = sequence;
                 incoming.last_total_x_milli = total_x_milli;
                 incoming.last_total_y_milli = total_y_milli;
@@ -581,7 +618,8 @@ impl MouseShare {
                     self.inner.logger.info(
                         "mouse_incoming_first_move",
                         format!(
-                            "delta_x_milli={delta_x_milli} delta_y_milli={delta_y_milli} next_x={next_x} next_y={next_y}"
+                            "delta_x_milli={delta_x_milli} delta_y_milli={delta_y_milli} dpi={} next_x={next_x} next_y={next_y}",
+                            incoming.receive_dpi
                         ),
                     );
                 }
@@ -626,7 +664,7 @@ impl MouseShare {
                     if x != incoming.last_injected_x || y != incoming.last_injected_y {
                         incoming.last_injected_x = x;
                         incoming.last_injected_y = y;
-                        incoming.last_injected_at = now_ms();
+                        incoming.last_injected_at = Instant::now();
                         simulated_events.push(absolute_move(x, y));
                     }
                     incoming.held_buttons[button_index(button)] = pressed;
@@ -855,7 +893,7 @@ impl MouseShare {
                 let Some(mouse_share) = mouse_share.upgrade() else {
                     return;
                 };
-                let delay = if mouse_share.session_active() { 2 } else { 50 };
+                let delay = if mouse_share.session_active() { 1 } else { 50 };
                 std::thread::sleep(std::time::Duration::from_millis(delay));
                 mouse_share.expire_unresponsive_outgoing();
 
@@ -921,13 +959,15 @@ impl MouseShare {
                     }
                 }
                 if let Some(incoming) = runtime.incoming.as_mut() {
-                    if now.saturating_sub(incoming.last_injected_at) >= TARGET_FRAME_INTERVAL_MS {
+                    if incoming.last_injected_at.elapsed()
+                        >= Duration::from_millis(TARGET_FRAME_INTERVAL_MS)
+                    {
                         let x = milli_to_pixel(incoming.x_milli);
                         let y = milli_to_pixel(incoming.y_milli);
                         if x != incoming.last_injected_x || y != incoming.last_injected_y {
                             incoming.last_injected_x = x;
                             incoming.last_injected_y = y;
-                            incoming.last_injected_at = now;
+                            incoming.last_injected_at = Instant::now();
                             movement = Some(absolute_move(x, y));
                         }
                     }
@@ -1408,6 +1448,11 @@ fn scaled_pointer_delta(value: i32) -> i64 {
         _ => 500,
     };
     i64::from(value) * gain_milli
+}
+
+fn scale_receive_delta(value: i64, dpi: u16) -> i64 {
+    let scaled = i128::from(value) * i128::from(dpi) / 500;
+    scaled.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
 }
 
 fn milli_to_pixel(value: i64) -> i32 {

@@ -64,6 +64,8 @@ const crosscopy = {
       clipboardAllowed,
       mouseAllowed
     }),
+  setPeerMouseDpi: (peerId: string, dpi: number) =>
+    invoke<void>("set_peer_mouse_dpi", { peerId, dpi }),
   switchMouseToScreen: (screenNumber: number) =>
     invoke<void>("switch_mouse_to_screen", { screenNumber })
 };
@@ -1160,29 +1162,36 @@ function MousePanel(props: { state: UiState }): React.JSX.Element {
           ))}
         </div>
         {selectedPeer && (
-          <div className="screen-switch-row">
-            <span>
-              已选择：屏幕 {selectedPeer.screenNumber} · {selectedPeer.name}
-            </span>
-            <button
-              type="button"
-              disabled={
-                !props.state.mouseShareEnabled ||
-                !selectedPeer.online ||
-                !selectedPeer.mouseAllowed ||
-                !selectedPeer.mouseShareEnabled
-              }
-              onClick={() =>
-                void crosscopy.switchMouseToScreen(selectedPeer.screenNumber)
-              }
-            >
-              立即切换
-              <kbd>
-                {selectedPeer.screenNumber <= 9
-                  ? `Ctrl Shift ${selectedPeer.screenNumber}`
-                  : `屏幕 ${selectedPeer.screenNumber}`}
-              </kbd>
-            </button>
+          <div className="selected-screen-settings">
+            <div className="screen-switch-row">
+              <span>
+                已选择：屏幕 {selectedPeer.screenNumber} · {selectedPeer.name}
+              </span>
+              <button
+                type="button"
+                disabled={
+                  !props.state.mouseShareEnabled ||
+                  !selectedPeer.online ||
+                  !selectedPeer.mouseAllowed ||
+                  !selectedPeer.mouseShareEnabled
+                }
+                onClick={() =>
+                  void crosscopy.switchMouseToScreen(selectedPeer.screenNumber)
+                }
+              >
+                立即切换
+                <kbd>
+                  {selectedPeer.screenNumber <= 9
+                    ? `Ctrl Shift ${selectedPeer.screenNumber}`
+                    : `屏幕 ${selectedPeer.screenNumber}`}
+                </kbd>
+              </button>
+            </div>
+            <PeerDpiControl
+              peerId={selectedPeer.id}
+              peerName={selectedPeer.name}
+              dpi={selectedPeer.mouseReceiveDpi}
+            />
           </div>
         )}
         {message && <small className="topology-message">{message}</small>}
@@ -1218,6 +1227,61 @@ function MousePanel(props: { state: UiState }): React.JSX.Element {
       <section className="mouse-support-note">
         扩展屏会作为同一电脑的固定屏幕组；镜像屏自动合并为一个逻辑屏幕。当前仅转发鼠标移动、左键、右键、滚轮滚动和滚轮按下。
       </section>
+    </div>
+  );
+}
+
+function PeerDpiControl(props: {
+  peerId: string;
+  peerName: string;
+  dpi: number;
+}): React.JSX.Element {
+  const [draft, setDraft] = useState(String(props.dpi));
+  const [message, setMessage] = useState("");
+
+  useEffect(() => {
+    setDraft(String(props.dpi));
+    setMessage("");
+  }, [props.peerId, props.dpi]);
+
+  async function save(): Promise<void> {
+    const parsed = Number.parseInt(draft, 10);
+    if (!Number.isFinite(parsed) || parsed < 100 || parsed > 2000) {
+      setMessage("请输入 100–2000");
+      return;
+    }
+    const dpi = Math.round(parsed);
+    setDraft(String(dpi));
+    try {
+      await crosscopy.setPeerMouseDpi(props.peerId, dpi);
+      setMessage("已生效");
+    } catch (reason) {
+      setMessage(typeof reason === "string" ? reason : "保存失败");
+    }
+  }
+
+  return (
+    <div className="peer-dpi-row">
+      <span>
+        <strong>{props.peerName} 进入本机后的逻辑 DPI</strong>
+        <small>500 为默认速度，仅影响这台设备控制本机。</small>
+      </span>
+      <label>
+        <input
+          type="number"
+          min="100"
+          max="2000"
+          step="50"
+          value={draft}
+          onChange={(event) => setDraft(event.target.value)}
+          onBlur={() => void save()}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") event.currentTarget.blur();
+          }}
+        />
+        <b>DPI</b>
+      </label>
+      <em>{message}</em>
     </div>
   );
 }
