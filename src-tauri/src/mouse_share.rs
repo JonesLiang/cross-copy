@@ -138,8 +138,7 @@ struct IncomingSession {
 }
 
 struct Runtime {
-    target_peer: Option<String>,
-    position: ScreenPosition,
+    targets: Vec<(String, ScreenPosition)>,
     last_x: i32,
     last_y: i32,
     crossing_blocked_until: u64,
@@ -200,8 +199,7 @@ impl MouseShare {
                 latency_ms: AtomicU64::new(NO_LATENCY),
                 last_physical_at: AtomicU64::new(0),
                 runtime: Mutex::new(Runtime {
-                    target_peer: None,
-                    position: ScreenPosition::Right,
+                    targets: Vec::new(),
                     last_x: 0,
                     last_y: 0,
                     crossing_blocked_until: 0,
@@ -219,7 +217,7 @@ impl MouseShare {
         mouse_share
     }
 
-    pub fn configure(&self, enabled: bool, position: ScreenPosition, target_peer: Option<String>) {
+    pub fn configure(&self, enabled: bool, targets: Vec<(String, ScreenPosition)>) {
         let was_enabled = self.inner.enabled.swap(enabled, Ordering::AcqRel);
         if enabled && !was_enabled {
             self.inner
@@ -227,21 +225,44 @@ impl MouseShare {
                 .store(false, Ordering::Release);
         }
         let mut runtime = self.inner.runtime.lock().expect("mouse runtime lock");
-        let target_changed = runtime.target_peer != target_peer;
-        runtime.position = position;
-        runtime.target_peer = target_peer;
-        let should_start_listener = enabled && runtime.target_peer.is_some();
+        let outgoing_invalid = !enabled
+            || runtime.outgoing.as_ref().is_some_and(|session| {
+                !targets
+                    .iter()
+                    .any(|(peer_id, _)| peer_id == &session.peer_id)
+            });
+        let incoming_invalid = !enabled
+            || runtime.incoming.as_ref().is_some_and(|session| {
+                !targets
+                    .iter()
+                    .any(|(peer_id, _)| peer_id == &session.peer_id)
+            });
+        runtime.targets = targets;
+        let should_start_listener = enabled && !runtime.targets.is_empty();
         let mut release_events = Vec::new();
-        if !enabled || target_changed {
-            if runtime.outgoing.take().is_some() {
+        let mut cancelled = Vec::new();
+        if outgoing_invalid {
+            if let Some(session) = runtime.outgoing.take() {
+                cancelled.push((session.peer_id, session.session_id));
                 release_events.push(HookMouseEvent::CursorVisible(true));
             }
-            if let Some(incoming) = runtime.incoming.take() {
-                release_events = release_held_buttons(&incoming);
+        }
+        if incoming_invalid {
+            if let Some(session) = runtime.incoming.take() {
+                cancelled.push((session.peer_id.clone(), session.session_id.clone()));
+                release_events.extend(release_held_buttons(&session));
             }
+        }
+        if outgoing_invalid || incoming_invalid {
             self.inner.latency_ms.store(NO_LATENCY, Ordering::Relaxed);
         }
         drop(runtime);
+        for (peer_id, session_id) in cancelled {
+            let _ = self
+                .inner
+                .outbound
+                .try_send(outbound(&peer_id, MouseSignal::Cancel { session_id }));
+        }
         for event in release_events {
             self.inject(event);
         }
@@ -264,6 +285,114 @@ impl MouseShare {
     pub fn session_active(&self) -> bool {
         let runtime = self.inner.runtime.lock().expect("mouse runtime lock");
         runtime.outgoing.is_some() || runtime.incoming.is_some()
+    }
+
+    pub fn switch_to_peer(&self, peer_id: String, position: ScreenPosition) -> Result<(), String> {
+        if !self.inner.enabled.load(Ordering::Acquire) {
+            return Err("请先开启鼠标共享".into());
+        }
+        let (width, height) = (self.inner.screen_width, self.inner.screen_height);
+        let mut runtime = self.inner.runtime.lock().expect("mouse runtime lock");
+        if !runtime.targets.iter().any(|(id, _)| id == &peer_id) {
+            return Err("目标屏幕当前不可用".into());
+        }
+        if let Some(previous) = runtime.outgoing.take() {
+            let _ = self.inner.outbound.blocking_send(outbound(
+                &previous.peer_id,
+                MouseSignal::Cancel {
+                    session_id: previous.session_id,
+                },
+            ));
+        }
+        let releases = if let Some(previous) = runtime.incoming.take() {
+            let _ = self.inner.outbound.blocking_send(outbound(
+                &previous.peer_id,
+                MouseSignal::Cancel {
+                    session_id: previous.session_id.clone(),
+                },
+            ));
+            release_held_buttons(&previous)
+        } else {
+            Vec::new()
+        };
+        let session_id = Uuid::new_v4().to_string();
+        let ratio = edge_ratio(position, runtime.last_x, runtime.last_y, width, height);
+        let sent_at = now_ms();
+        let anchor_x = width / 2;
+        let anchor_y = height / 2;
+        runtime.outgoing = Some(new_outgoing_session(
+            peer_id.clone(),
+            session_id.clone(),
+            position,
+            ratio,
+            sent_at,
+            anchor_x,
+            anchor_y,
+        ));
+        drop(runtime);
+        for event in releases {
+            self.inject(event);
+        }
+        let _ = self.inner.outbound.blocking_send(outbound(
+            &peer_id,
+            MouseSignal::Enter {
+                session_id,
+                entry_edge: position.opposite(),
+                ratio,
+                sent_at,
+            },
+        ));
+        #[cfg(target_os = "macos")]
+        set_cursor_visible(false)?;
+        #[cfg(target_os = "windows")]
+        self.inject(HookMouseEvent::CursorVisible(false));
+        recenter_cursor(anchor_x, anchor_y, width, height)?;
+        self.inner.logger.info(
+            "mouse_screen_switched",
+            format!("target={peer_id} position={position:?}"),
+        );
+        Ok(())
+    }
+
+    pub fn focus_local(&self) {
+        let mut runtime = self.inner.runtime.lock().expect("mouse runtime lock");
+        let outgoing = runtime.outgoing.take();
+        let incoming = runtime.incoming.take();
+        if let Some(session) = &outgoing {
+            let _ = self.inner.outbound.blocking_send(outbound(
+                &session.peer_id,
+                MouseSignal::Cancel {
+                    session_id: session.session_id.clone(),
+                },
+            ));
+        }
+        if let Some(session) = &incoming {
+            let _ = self.inner.outbound.blocking_send(outbound(
+                &session.peer_id,
+                MouseSignal::Cancel {
+                    session_id: session.session_id.clone(),
+                },
+            ));
+        }
+        let releases = incoming
+            .as_ref()
+            .map(release_held_buttons)
+            .unwrap_or_default();
+        runtime.crossing_blocked_until = now_ms() + EDGE_TRANSITION_COOLDOWN_MS;
+        drop(runtime);
+        if outgoing.is_some() {
+            self.inject(HookMouseEvent::CursorVisible(true));
+            self.inject(absolute_move(
+                self.inner.screen_width / 2,
+                self.inner.screen_height / 2,
+            ));
+        }
+        for event in releases {
+            self.inject(event);
+        }
+        self.inner
+            .logger
+            .info("mouse_screen_switched", "target=local");
     }
 
     pub fn expire_unresponsive_outgoing(&self) {
@@ -344,7 +473,27 @@ impl MouseShare {
                     responses.push(outbound(peer_id, MouseSignal::Cancel { session_id }));
                     return responses;
                 }
-                runtime.outgoing = None;
+                if let Some(previous) = runtime.incoming.take() {
+                    simulated_events.extend(release_held_buttons(&previous));
+                    responses.push(outbound(
+                        &previous.peer_id,
+                        MouseSignal::Cancel {
+                            session_id: previous.session_id,
+                        },
+                    ));
+                    self.inner.logger.info(
+                        "mouse_control_preempted",
+                        format!("new_controller={peer_id}"),
+                    );
+                }
+                if let Some(previous) = runtime.outgoing.take() {
+                    responses.push(outbound(
+                        &previous.peer_id,
+                        MouseSignal::Cancel {
+                            session_id: previous.session_id,
+                        },
+                    ));
+                }
                 let (x, y) = edge_point(entry_edge, ratio, width, height);
                 runtime.incoming = Some(IncomingSession {
                     peer_id: peer_id.to_string(),
@@ -917,12 +1066,15 @@ impl Inner {
             let previous_y = runtime.last_y;
             runtime.last_x = x;
             runtime.last_y = y;
-            let position = runtime.position;
-            let target = runtime.target_peer.clone();
-            if let Some(peer_id) = target {
-                if now_ms() >= runtime.crossing_blocked_until
-                    && reached_exit_edge(position, x, y, previous_x, previous_y, width, height)
-                {
+            let target = runtime
+                .targets
+                .iter()
+                .find(|(_, position)| {
+                    reached_exit_edge(*position, x, y, previous_x, previous_y, width, height)
+                })
+                .cloned();
+            if let Some((peer_id, position)) = target {
+                if now_ms() >= runtime.crossing_blocked_until {
                     let session_id = Uuid::new_v4().to_string();
                     let ratio = edge_ratio(position, x, y, width, height);
                     let anchor_x = width / 2;
@@ -997,6 +1149,40 @@ fn outbound(peer_id: &str, signal: MouseSignal) -> OutboundMouseSignal {
     OutboundMouseSignal {
         peer_id: peer_id.to_string(),
         signal,
+    }
+}
+
+fn new_outgoing_session(
+    peer_id: String,
+    session_id: String,
+    exit_edge: ScreenPosition,
+    enter_ratio: f64,
+    sent_at: u64,
+    anchor_x: i32,
+    anchor_y: i32,
+) -> OutgoingSession {
+    OutgoingSession {
+        peer_id,
+        session_id,
+        exit_edge,
+        anchor_x,
+        anchor_y,
+        enter_ratio,
+        last_enter_retry_at: sent_at,
+        acknowledged: false,
+        move_sequence: 0,
+        total_x_milli: 0,
+        total_y_milli: 0,
+        last_move_sent_at: 0,
+        last_sent_x_milli: 0,
+        last_sent_y_milli: 0,
+        first_move_logged: false,
+        scroll_sequence: 0,
+        total_scroll_x_milli: 0,
+        total_scroll_y_milli: 0,
+        last_sent_scroll_x_milli: 0,
+        last_sent_scroll_y_milli: 0,
+        last_remote_at: sent_at,
     }
 }
 

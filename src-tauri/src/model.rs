@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ScreenPosition {
     Left,
@@ -28,6 +28,16 @@ pub struct Peer {
     pub name: String,
     pub secret: String,
     pub paired_at: u64,
+    #[serde(default = "default_true")]
+    pub direct: bool,
+    #[serde(default = "default_true")]
+    pub clipboard_allowed: bool,
+    #[serde(default = "default_true")]
+    pub mouse_allowed: bool,
+    #[serde(default)]
+    pub screen_number: u8,
+    #[serde(default)]
+    pub screen_position: ScreenPosition,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -35,6 +45,10 @@ pub struct Peer {
 pub struct Settings {
     pub device_id: String,
     pub device_name: String,
+    #[serde(default)]
+    pub group_id: String,
+    #[serde(default)]
+    pub group_secret: String,
     pub peers: Vec<Peer>,
     pub sync_enabled: bool,
     pub launch_at_login: bool,
@@ -62,6 +76,10 @@ pub fn default_mouse_shortcut() -> String {
     "Ctrl+Shift+M".into()
 }
 
+pub fn default_true() -> bool {
+    true
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PeerView {
@@ -69,6 +87,12 @@ pub struct PeerView {
     pub name: String,
     pub online: bool,
     pub last_seen: Option<u64>,
+    pub direct: bool,
+    pub clipboard_allowed: bool,
+    pub mouse_allowed: bool,
+    pub mouse_share_enabled: bool,
+    pub screen_number: u8,
+    pub screen_position: ScreenPosition,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -137,6 +161,8 @@ pub enum ClipboardPayload {
 pub struct DiscoveryPacket {
     pub app: String,
     pub protocol: u8,
+    #[serde(default)]
+    pub instance_id: String,
     pub id: String,
     pub name: String,
     pub port: u16,

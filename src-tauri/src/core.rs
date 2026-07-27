@@ -1,6 +1,7 @@
 use crate::{
     crypto::{
-        decode_secret, decrypt, encrypt, fingerprint, pairing_key, proof, random_secret, Envelope,
+        decode_secret, decrypt, derived_peer_secret, encrypt, fingerprint, pairing_key, proof,
+        random_secret, Envelope,
     },
     logger::{masked_ip, Logger},
     model::{
@@ -66,6 +67,13 @@ struct SeenPeer {
     packet: DiscoveryPacket,
     host: IpAddr,
     last_seen: u64,
+    remote_mouse_enabled: Option<bool>,
+}
+
+impl SeenPeer {
+    fn mouse_share_enabled(&self) -> bool {
+        self.packet.mouse_share_enabled && self.remote_mouse_enabled.unwrap_or(true)
+    }
 }
 
 struct PairSession {
@@ -73,6 +81,22 @@ struct PairSession {
     salt: String,
     expires_at: u64,
     attempts: HashMap<IpAddr, u8>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TrustMember {
+    id: String,
+    name: String,
+    paired_at: u64,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TrustSnapshot {
+    group_id: String,
+    group_secret: String,
+    members: Vec<TrustMember>,
 }
 
 #[derive(Clone)]
@@ -136,6 +160,9 @@ enum SecureMessage {
     MouseConfig {
         enabled: bool,
         position: ScreenPosition,
+    },
+    TrustSync {
+        snapshot: TrustSnapshot,
     },
     Error {
         message: String,
@@ -208,8 +235,10 @@ pub struct Core {
     last_discovery_response: AtomicU64,
     last_progress_emit: AtomicU64,
     last_mouse_state_emit: AtomicU64,
+    last_trust_sync: Mutex<HashMap<String, String>>,
     discovery_wake: Notify,
     port: AtomicU64,
+    instance_id: String,
     mouse: Arc<MouseShare>,
     mouse_receiver: Mutex<Option<mpsc::Receiver<OutboundMouseSignal>>>,
     mouse_socket: Mutex<Option<Arc<UdpSocket>>>,
@@ -234,8 +263,10 @@ impl Core {
             last_discovery_response: AtomicU64::new(0),
             last_progress_emit: AtomicU64::new(0),
             last_mouse_state_emit: AtomicU64::new(0),
+            last_trust_sync: Mutex::new(HashMap::new()),
             discovery_wake: Notify::new(),
             port: AtomicU64::new(0),
+            instance_id: Uuid::new_v4().to_string(),
             mouse,
             mouse_receiver: Mutex::new(Some(mouse_receiver)),
             mouse_socket: Mutex::new(None),
@@ -336,6 +367,12 @@ impl Core {
                             now.saturating_sub(value.last_seen) < ONLINE_WINDOW_MS
                         }),
                         last_seen: seen.map(|value| value.last_seen),
+                        direct: peer.direct,
+                        clipboard_allowed: peer.clipboard_allowed,
+                        mouse_allowed: peer.mouse_allowed,
+                        mouse_share_enabled: seen.is_some_and(SeenPeer::mouse_share_enabled),
+                        screen_number: peer.screen_number,
+                        screen_position: peer.screen_position,
                     }
                 })
                 .collect(),
@@ -456,7 +493,12 @@ impl Core {
         position: ScreenPosition,
     ) -> Result<(), String> {
         self.store
-            .update(|settings| settings.mouse_position = position)
+            .update(|settings| {
+                settings.mouse_position = position;
+                if let Some(peer) = settings.peers.first_mut() {
+                    peer.screen_position = position;
+                }
+            })
             .map_err(|error| error.to_string())?;
         self.refresh_mouse_runtime();
         self.publish();
@@ -464,6 +506,64 @@ impl Core {
         self.logger.info(
             "mouse_position_changed",
             format!("position={position:?} source=local"),
+        );
+        Ok(())
+    }
+
+    pub async fn set_peer_screen_position(
+        self: &Arc<Self>,
+        peer_id: String,
+        position: ScreenPosition,
+    ) -> Result<(), String> {
+        let mut found = false;
+        self.store
+            .update(|settings| {
+                if let Some(peer) = settings.peers.iter_mut().find(|peer| peer.id == peer_id) {
+                    peer.screen_position = position;
+                    found = true;
+                }
+            })
+            .map_err(|error| error.to_string())?;
+        if !found {
+            return Err("设备不存在".into());
+        }
+        self.refresh_mouse_runtime();
+        self.publish();
+        self.broadcast_mouse_config().await;
+        self.logger.info(
+            "mouse_position_changed",
+            format!("peer={peer_id} position={position:?} source=local"),
+        );
+        Ok(())
+    }
+
+    pub async fn set_peer_permissions(
+        self: &Arc<Self>,
+        peer_id: String,
+        clipboard_allowed: bool,
+        mouse_allowed: bool,
+    ) -> Result<(), String> {
+        let mut found = false;
+        self.store
+            .update(|settings| {
+                if let Some(peer) = settings.peers.iter_mut().find(|peer| peer.id == peer_id) {
+                    peer.clipboard_allowed = clipboard_allowed;
+                    peer.mouse_allowed = mouse_allowed;
+                    found = true;
+                }
+            })
+            .map_err(|error| error.to_string())?;
+        if !found {
+            return Err("设备不存在".into());
+        }
+        self.refresh_mouse_runtime();
+        self.publish();
+        self.broadcast_mouse_config().await;
+        self.logger.info(
+            "peer_permissions_changed",
+            format!(
+                "peer={peer_id} clipboard_allowed={clipboard_allowed} mouse_allowed={mouse_allowed}"
+            ),
         );
         Ok(())
     }
@@ -718,6 +818,7 @@ impl Core {
                     let packet_port = packet.port;
                     let packet_pairing = packet.pairing_salt.is_some();
                     let packet_id = packet.id.clone();
+                    let packet_instance_id = packet.instance_id.clone();
                     let peer_mouse_enabled = packet.mouse_share_enabled;
                     let peer_mouse_position = packet.mouse_position;
                     let is_paired = receive_core
@@ -726,18 +827,22 @@ impl Core {
                         .peers
                         .iter()
                         .any(|peer| peer.id == packet_id);
-                    let previous = receive_core
-                        .discovered
-                        .lock()
-                        .expect("discovery lock")
-                        .insert(
-                            packet_id,
+                    let previous = {
+                        let mut discovered =
+                            receive_core.discovered.lock().expect("discovery lock");
+                        let remote_mouse_enabled = discovered
+                            .get(&packet_id)
+                            .and_then(|seen| seen.remote_mouse_enabled);
+                        discovered.insert(
+                            packet_id.clone(),
                             SeenPeer {
                                 packet,
                                 host: source.ip(),
                                 last_seen: now_ms(),
+                                remote_mouse_enabled,
                             },
-                        );
+                        )
+                    };
                     if previous.is_none() {
                         receive_core.logger.info(
                             "peer_discovered",
@@ -764,6 +869,41 @@ impl Core {
                                 .last_discovery_response
                                 .store(now, Ordering::Relaxed);
                             receive_core.discovery_wake.notify_one();
+                        }
+                        let trust_token =
+                            format!("{}:{}", packet_instance_id, receive_core.trust_digest());
+                        let should_sync = {
+                            let mut synced = receive_core
+                                .last_trust_sync
+                                .lock()
+                                .expect("trust sync lock");
+                            if synced.get(&packet_id) != Some(&trust_token) {
+                                synced.insert(packet_id.clone(), trust_token.clone());
+                                true
+                            } else {
+                                false
+                            }
+                        };
+                        if should_sync {
+                            let core = Arc::clone(&receive_core);
+                            tauri::async_runtime::spawn(async move {
+                                let mut retry = false;
+                                if let Err(error) = core.send_trust_sync(&packet_id).await {
+                                    core.logger.warn("trust_sync_failed", error);
+                                    retry = true;
+                                }
+                                if let Err(error) = core.send_mouse_config(&packet_id).await {
+                                    core.logger.warn("mouse_config_send_failed", error);
+                                    retry = true;
+                                }
+                                if retry {
+                                    let mut synced =
+                                        core.last_trust_sync.lock().expect("trust sync lock");
+                                    if synced.get(&packet_id) == Some(&trust_token) {
+                                        synced.remove(&packet_id);
+                                    }
+                                }
+                            });
                         }
                     }
                     receive_core.publish();
@@ -847,91 +987,134 @@ impl Core {
         let settings = self.store.get();
         let now = now_ms();
         let discovered = self.discovered.lock().expect("discovery lock");
-        let target_peer = settings
+        let targets = settings
             .peers
             .iter()
-            .find(|peer| {
-                discovered
-                    .get(&peer.id)
-                    .is_some_and(|seen| now.saturating_sub(seen.last_seen) < ONLINE_WINDOW_MS)
+            .filter(|peer| {
+                peer.mouse_allowed
+                    && discovered.get(&peer.id).is_some_and(|seen| {
+                        now.saturating_sub(seen.last_seen) < ONLINE_WINDOW_MS
+                            && seen.mouse_share_enabled()
+                    })
             })
-            .map(|peer| peer.id.clone());
+            .map(|peer| (peer.id.clone(), peer.screen_position))
+            .collect();
         drop(discovered);
-        self.mouse.configure(
-            settings.mouse_share_enabled,
-            settings.mouse_position,
-            target_peer,
+        self.mouse.configure(settings.mouse_share_enabled, targets);
+    }
+
+    fn peer_available_for_mouse(&self, peer_id: &str) -> bool {
+        let settings = self.store.get();
+        let now = now_ms();
+        settings.peers.iter().any(|peer| {
+            peer.id == peer_id
+                && peer.mouse_allowed
+                && self
+                    .discovered
+                    .lock()
+                    .expect("discovery lock")
+                    .get(&peer.id)
+                    .is_some_and(|seen| {
+                        now.saturating_sub(seen.last_seen) < ONLINE_WINDOW_MS
+                            && seen.mouse_share_enabled()
+                    })
+        })
+    }
+
+    pub fn switch_mouse_to_screen(&self, screen_number: u8) -> Result<(), String> {
+        if screen_number == 1 {
+            self.mouse.focus_local();
+            self.publish();
+            return Ok(());
+        }
+        let peer = self
+            .store
+            .get()
+            .peers
+            .into_iter()
+            .find(|peer| peer.screen_number == screen_number)
+            .ok_or("没有对应编号的屏幕")?;
+        if !self.peer_available_for_mouse(&peer.id) {
+            return Err("目标屏幕离线、未开启鼠标共享或没有鼠标权限".into());
+        }
+        self.mouse.switch_to_peer(peer.id, peer.screen_position)?;
+        self.publish();
+        Ok(())
+    }
+
+    pub fn log_mouse_shortcut_error(&self, screen_number: u8, error: &str) {
+        self.logger.warn(
+            "mouse_screen_shortcut_failed",
+            format!("screen={screen_number} error={error}"),
+        );
+        self.add_activity(
+            "system",
+            "无法切换鼠标屏幕",
+            &format!("屏幕 {screen_number}：{error}"),
+            "error",
         );
     }
 
-    fn reconcile_mouse_discovery(&self, peer_enabled: bool, _peer_position: ScreenPosition) {
-        let settings = self.store.get();
-        if settings.mouse_share_enabled && !peer_enabled {
-            if self
-                .store
-                .update(|value| value.mouse_share_enabled = false)
-                .is_ok()
-            {
-                self.logger.info(
-                    "mouse_share_toggled",
-                    "enabled=false source=paired_peer_beacon",
-                );
-                self.refresh_mouse_runtime();
-                self.publish();
-            }
-        }
+    fn reconcile_mouse_discovery(&self, _peer_enabled: bool, _peer_position: ScreenPosition) {
+        self.refresh_mouse_runtime();
     }
 
     async fn broadcast_mouse_config(&self) {
         self.wake_network();
         let settings = self.store.get();
-        let discovered = self.discovered.lock().expect("discovery lock").clone();
         let mut delivered = 0_u32;
         for peer in &settings.peers {
-            let Some(seen) = discovered.get(&peer.id) else {
-                continue;
-            };
-            if now_ms().saturating_sub(seen.last_seen) >= ONLINE_WINDOW_MS {
-                continue;
-            }
-            let Ok(key) = decode_secret(&peer.secret) else {
-                continue;
-            };
-            let Ok(envelope) = encrypt(
-                &key,
-                &SecureMessage::MouseConfig {
-                    enabled: settings.mouse_share_enabled,
-                    position: settings.mouse_position,
-                },
-            ) else {
-                continue;
-            };
-            let address = SocketAddr::new(seen.host, seen.packet.port);
-            let Ok(Ok(mut stream)) =
-                tokio::time::timeout(Duration::from_millis(800), TcpStream::connect(address)).await
-            else {
-                continue;
-            };
-            if write_json(
-                &mut stream,
-                &WireMessage::Secure {
-                    sender_id: settings.device_id.clone(),
-                    envelope,
-                },
-            )
-            .await
-            .is_ok()
-            {
+            if self.send_mouse_config(&peer.id).await.is_ok() {
                 delivered += 1;
             }
         }
         self.logger.info(
             "mouse_config_broadcast",
             format!(
-                "enabled={} position={:?} delivered={delivered}",
-                settings.mouse_share_enabled, settings.mouse_position
+                "enabled={} delivered={delivered}",
+                settings.mouse_share_enabled
             ),
         );
+    }
+
+    async fn send_mouse_config(&self, peer_id: &str) -> Result<(), String> {
+        let settings = self.store.get();
+        let peer = settings
+            .peers
+            .iter()
+            .find(|peer| peer.id == peer_id)
+            .ok_or("鼠标配置目标不存在")?;
+        let seen = self
+            .discovered
+            .lock()
+            .expect("discovery lock")
+            .get(peer_id)
+            .cloned()
+            .ok_or("鼠标配置目标离线")?;
+        if now_ms().saturating_sub(seen.last_seen) >= ONLINE_WINDOW_MS {
+            return Err("鼠标配置目标离线".into());
+        }
+        let envelope = encrypt(
+            &decode_secret(&peer.secret)?,
+            &SecureMessage::MouseConfig {
+                enabled: settings.mouse_share_enabled && peer.mouse_allowed,
+                position: peer.screen_position,
+            },
+        )?;
+        let address = SocketAddr::new(seen.host, seen.packet.port);
+        let mut stream =
+            tokio::time::timeout(Duration::from_millis(800), TcpStream::connect(address))
+                .await
+                .map_err(|_| "鼠标配置连接超时".to_string())?
+                .map_err(|error| error.to_string())?;
+        write_json(
+            &mut stream,
+            &WireMessage::Secure {
+                sender_id: settings.device_id,
+                envelope,
+            },
+        )
+        .await
     }
 
     async fn send_mouse_signal(&self, outbound: OutboundMouseSignal) -> Result<(), String> {
@@ -944,6 +1127,9 @@ impl Core {
             .iter()
             .find(|peer| peer.id == outbound.peer_id)
             .ok_or("鼠标目标设备未配对")?;
+        if !peer.mouse_allowed {
+            return Err("没有目标设备的鼠标权限".into());
+        }
         let seen = self
             .discovered
             .lock()
@@ -990,6 +1176,9 @@ impl Core {
             .into_iter()
             .find(|peer| peer.id == packet.sender_id)
             .ok_or("鼠标数据来自未配对设备")?;
+        if !peer.mouse_allowed {
+            return Err("已拒绝该设备的鼠标控制".into());
+        }
         let key = decode_secret(&peer.secret)?;
         let signal: MouseSignal = decrypt(&key, &packet.envelope)?;
         self.discovered.lock().expect("discovery lock").insert(
@@ -998,6 +1187,7 @@ impl Core {
                 packet: DiscoveryPacket {
                     app: "crosscopy".into(),
                     protocol: 1,
+                    instance_id: String::new(),
                     id: peer.id.clone(),
                     name: peer.name.clone(),
                     port: TRANSFER_PORT,
@@ -1008,6 +1198,7 @@ impl Core {
                 },
                 host: source.ip(),
                 last_seen: now_ms(),
+                remote_mouse_enabled: Some(true),
             },
         );
         for response in self.mouse.apply_remote(&peer.id, signal) {
@@ -1038,6 +1229,7 @@ impl Core {
         DiscoveryPacket {
             app: "crosscopy".into(),
             protocol: 1,
+            instance_id: self.instance_id.clone(),
             id: settings.device_id,
             name: settings.device_name,
             port: self.port.load(Ordering::Relaxed) as u16,
@@ -1128,6 +1320,13 @@ impl Core {
         let mut online = 0_u32;
         let mut delivered = 0_u32;
         for peer in settings.peers {
+            if !peer.clipboard_allowed {
+                self.logger.info(
+                    "clipboard_peer_skipped",
+                    format!("kind={kind} reason=permission_denied peer={}", peer.id),
+                );
+                continue;
+            }
             let Some(seen) = discovered.get(&peer.id) else {
                 self.logger.info(
                     "clipboard_peer_skipped",
@@ -1189,6 +1388,143 @@ impl Core {
         delivered
     }
 
+    fn trust_snapshot(&self) -> TrustSnapshot {
+        let settings = self.store.get();
+        let mut members = Vec::with_capacity(settings.peers.len() + 1);
+        members.push(TrustMember {
+            id: settings.device_id,
+            name: settings.device_name,
+            paired_at: now_ms(),
+        });
+        members.extend(settings.peers.into_iter().map(|peer| TrustMember {
+            id: peer.id,
+            name: peer.name,
+            paired_at: peer.paired_at,
+        }));
+        TrustSnapshot {
+            group_id: settings.group_id,
+            group_secret: settings.group_secret,
+            members,
+        }
+    }
+
+    fn trust_digest(&self) -> String {
+        let settings = self.store.get();
+        let mut members = settings
+            .peers
+            .iter()
+            .map(|peer| peer.id.as_str())
+            .collect::<Vec<_>>();
+        members.push(&settings.device_id);
+        members.sort_unstable();
+        fingerprint(format!("{}:{}", settings.group_id, members.join(",")))
+    }
+
+    async fn send_trust_sync(&self, peer_id: &str) -> Result<(), String> {
+        let settings = self.store.get();
+        let peer = settings
+            .peers
+            .iter()
+            .find(|peer| peer.id == peer_id)
+            .ok_or("可信同步目标不存在")?;
+        let seen = self
+            .discovered
+            .lock()
+            .expect("discovery lock")
+            .get(peer_id)
+            .cloned()
+            .ok_or("可信同步目标离线")?;
+        let key = decode_secret(&peer.secret)?;
+        let envelope = encrypt(
+            &key,
+            &SecureMessage::TrustSync {
+                snapshot: self.trust_snapshot(),
+            },
+        )?;
+        let mut stream = tokio::time::timeout(
+            Duration::from_secs(2),
+            TcpStream::connect((seen.host, seen.packet.port)),
+        )
+        .await
+        .map_err(|_| "可信同步连接超时".to_string())?
+        .map_err(|error| error.to_string())?;
+        write_json(
+            &mut stream,
+            &WireMessage::Secure {
+                sender_id: settings.device_id,
+                envelope,
+            },
+        )
+        .await?;
+        self.logger
+            .info("trust_sync_sent", format!("peer={peer_id}"));
+        Ok(())
+    }
+
+    fn merge_trust_snapshot(&self, snapshot: TrustSnapshot) -> Result<(), String> {
+        if decode_secret(&snapshot.group_secret)?.len() != 32 {
+            return Err("可信组密钥无效".into());
+        }
+        let mut added = 0_u32;
+        self.store
+            .update(|settings| {
+                let adopt_incoming =
+                    settings.group_id.is_empty() || snapshot.group_id < settings.group_id;
+                if adopt_incoming {
+                    settings.group_id = snapshot.group_id.clone();
+                    settings.group_secret = snapshot.group_secret.clone();
+                    for peer in &mut settings.peers {
+                        if !peer.direct {
+                            if let Ok(secret) = derived_peer_secret(
+                                &settings.group_secret,
+                                &settings.device_id,
+                                &peer.id,
+                            ) {
+                                peer.secret = secret;
+                            }
+                        }
+                    }
+                }
+                let group_secret = settings.group_secret.clone();
+                let device_id = settings.device_id.clone();
+                for member in &snapshot.members {
+                    if member.id == device_id {
+                        continue;
+                    }
+                    if let Some(peer) = settings.peers.iter_mut().find(|peer| peer.id == member.id)
+                    {
+                        peer.name = member.name.clone();
+                        continue;
+                    }
+                    let Ok(secret) = derived_peer_secret(&group_secret, &device_id, &member.id)
+                    else {
+                        continue;
+                    };
+                    let screen_number = next_screen_number(&settings.peers);
+                    settings.peers.push(Peer {
+                        id: member.id.clone(),
+                        name: member.name.clone(),
+                        secret,
+                        paired_at: member.paired_at,
+                        direct: false,
+                        clipboard_allowed: true,
+                        mouse_allowed: true,
+                        screen_number,
+                        screen_position: default_screen_position(screen_number),
+                    });
+                    added += 1;
+                }
+            })
+            .map_err(|error| error.to_string())?;
+        self.refresh_mouse_runtime();
+        self.publish();
+        self.logger.info(
+            "trust_sync_merged",
+            format!("group={} added={added}", snapshot.group_id),
+        );
+        Ok(())
+    }
+
     async fn try_pair(&self, seen: &SeenPeer, code: &str) -> Result<(), String> {
         self.logger.info(
             "pairing_tcp_start",
@@ -1226,6 +1562,11 @@ impl Core {
             name: name.clone(),
             secret,
             paired_at: now_ms(),
+            direct: true,
+            clipboard_allowed: true,
+            mouse_allowed: true,
+            screen_number: 0,
+            screen_position: ScreenPosition::Right,
         })?;
         self.add_activity(
             "system",
@@ -1299,6 +1640,11 @@ impl Core {
             name: name.clone(),
             secret,
             paired_at: now_ms(),
+            direct: true,
+            clipboard_allowed: true,
+            mouse_allowed: true,
+            screen_number: 0,
+            screen_position: ScreenPosition::Right,
         })?;
         self.add_activity(
             "system",
@@ -1370,6 +1716,11 @@ impl Core {
             name: name.clone(),
             secret,
             paired_at: now_ms(),
+            direct: true,
+            clipboard_allowed: true,
+            mouse_allowed: true,
+            screen_number: 0,
+            screen_position: ScreenPosition::Right,
         })?;
         socket
             .send_to(
@@ -1423,12 +1774,19 @@ impl Core {
                     .into_iter()
                     .find(|peer| peer.id == sender_id)
                     .ok_or("设备未配对")?;
+                let remote_mouse_enabled = self
+                    .discovered
+                    .lock()
+                    .expect("discovery lock")
+                    .get(&peer.id)
+                    .and_then(|seen| seen.remote_mouse_enabled);
                 self.discovered.lock().expect("discovery lock").insert(
                     peer.id.clone(),
                     SeenPeer {
                         packet: DiscoveryPacket {
                             app: "crosscopy".into(),
                             protocol: 1,
+                            instance_id: String::new(),
                             id: peer.id.clone(),
                             name: peer.name.clone(),
                             port: TRANSFER_PORT,
@@ -1439,6 +1797,7 @@ impl Core {
                         },
                         host: source.ip(),
                         last_seen: now_ms(),
+                        remote_mouse_enabled,
                     },
                 );
                 let key = decode_secret(&peer.secret)?;
@@ -1455,10 +1814,22 @@ impl Core {
                         result
                     }
                     SecureMessage::MouseConfig { enabled, position } => {
+                        if let Some(seen) = self
+                            .discovered
+                            .lock()
+                            .expect("discovery lock")
+                            .get_mut(&peer.id)
+                        {
+                            seen.packet.mouse_share_enabled = enabled;
+                            seen.remote_mouse_enabled = Some(enabled);
+                        }
                         self.store
                             .update(|settings| {
-                                settings.mouse_share_enabled = enabled;
-                                settings.mouse_position = position.opposite();
+                                if let Some(value) =
+                                    settings.peers.iter_mut().find(|value| value.id == peer.id)
+                                {
+                                    value.screen_position = position.opposite();
+                                }
                             })
                             .map_err(|error| error.to_string())?;
                         self.refresh_mouse_runtime();
@@ -1466,10 +1837,14 @@ impl Core {
                         self.logger.info(
                             "mouse_config_received",
                             format!(
-                                "enabled={enabled} peer_position={position:?} local_position={:?}",
-                                position.opposite()
+                                "peer={} enabled={enabled} peer_position={position:?} local_position={:?}",
+                                peer.id, position.opposite()
                             ),
                         );
+                        Ok(())
+                    }
+                    SecureMessage::TrustSync { snapshot } => {
+                        self.merge_trust_snapshot(snapshot)?;
                         Ok(())
                     }
                     _ => Err("无效请求".into()),
@@ -1528,6 +1903,11 @@ impl Core {
             name: name.clone(),
             secret,
             paired_at: now_ms(),
+            direct: true,
+            clipboard_allowed: true,
+            mouse_allowed: true,
+            screen_number: 0,
+            screen_position: ScreenPosition::Right,
         })?;
         *self.pairing.lock().expect("pairing lock") = None;
         self.add_activity(
@@ -1544,7 +1924,11 @@ impl Core {
         peer: Peer,
         payload: ClipboardPayload,
     ) -> Result<(), String> {
-        if !self.store.get().sync_enabled {
+        if !self.store.get().sync_enabled || !peer.clipboard_allowed {
+            self.logger.info(
+                "clipboard_peer_skipped",
+                format!("reason=inbound_permission_denied peer={}", peer.id),
+            );
             return Ok(());
         }
         match payload {
@@ -1750,9 +2134,20 @@ impl Core {
         Ok(())
     }
 
-    fn upsert_peer(&self, peer: Peer) -> Result<(), String> {
+    fn upsert_peer(&self, mut peer: Peer) -> Result<(), String> {
         self.store
             .update(|settings| {
+                if let Some(existing) = settings.peers.iter().find(|value| value.id == peer.id) {
+                    peer.clipboard_allowed = existing.clipboard_allowed;
+                    peer.mouse_allowed = existing.mouse_allowed;
+                    peer.screen_number = existing.screen_number;
+                    peer.screen_position = existing.screen_position;
+                    peer.direct |= existing.direct;
+                }
+                if peer.screen_number < 2 {
+                    peer.screen_number = next_screen_number(&settings.peers);
+                    peer.screen_position = default_screen_position(peer.screen_number);
+                }
                 settings.peers.retain(|value| value.id != peer.id);
                 settings.peers.push(peer);
             })
@@ -1860,6 +2255,21 @@ impl Core {
         }
         self.logger.error("file_transfer_failed", error);
         self.publish();
+    }
+}
+
+fn next_screen_number(peers: &[Peer]) -> u8 {
+    (2_u8..=u8::MAX)
+        .find(|number| !peers.iter().any(|peer| peer.screen_number == *number))
+        .unwrap_or(u8::MAX)
+}
+
+fn default_screen_position(screen_number: u8) -> ScreenPosition {
+    match screen_number.saturating_sub(2) % 4 {
+        0 => ScreenPosition::Right,
+        1 => ScreenPosition::Down,
+        2 => ScreenPosition::Left,
+        _ => ScreenPosition::Up,
     }
 }
 

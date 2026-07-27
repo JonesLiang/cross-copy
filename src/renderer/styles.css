@@ -799,6 +799,20 @@ nav {
   user-select: none;
 }
 
+.screen-number {
+  position: absolute;
+  top: 6px;
+  left: 7px;
+  display: grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-radius: 6px;
+  font-size: 9px;
+}
+
 .screen-device strong {
   max-width: 104px;
   overflow: hidden;
@@ -838,6 +852,10 @@ nav {
   transition: none;
 }
 
+.peer-screen.selected {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--line));
+}
+
 .direction-picker {
   display: flex;
   justify-content: center;
@@ -871,6 +889,147 @@ nav {
 .topology-message {
   display: block;
   margin-top: 10px;
+  color: var(--faint);
+  font-size: 10px;
+  text-align: center;
+}
+
+.screen-switch-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  margin-top: 12px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.screen-switch-row button {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  color: var(--accent);
+  background: var(--accent-soft);
+  border: 1px solid color-mix(in srgb, var(--accent) 30%, var(--line));
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.screen-switch-row button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.screen-switch-row kbd {
+  color: var(--muted);
+  font: inherit;
+  font-size: 9px;
+}
+
+.device-permissions {
+  display: grid;
+  margin-top: 15px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+
+.permission-row {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) auto auto;
+  align-items: center;
+  gap: 18px;
+  padding: 12px;
+}
+
+.permission-row + .permission-row {
+  border-top: 1px solid var(--line);
+}
+
+.permission-device {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.permission-device > b {
+  display: grid;
+  flex: 0 0 auto;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-radius: 8px;
+  font-size: 10px;
+}
+
+.permission-device > span,
+.permission-device strong,
+.permission-device small {
+  display: block;
+  min-width: 0;
+}
+
+.permission-device strong {
+  overflow: hidden;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.permission-device small {
+  margin-top: 3px;
+  color: var(--faint);
+  font-size: 9px;
+}
+
+.permission-row > label {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--muted);
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.permission-row > label input {
+  position: absolute;
+  opacity: 0;
+}
+
+.permission-row > label i {
+  position: relative;
+  width: 28px;
+  height: 16px;
+  background: var(--line);
+  border-radius: 999px;
+  transition: background 150ms ease;
+}
+
+.permission-row > label i::after {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 10px;
+  height: 10px;
+  background: white;
+  border-radius: 50%;
+  content: "";
+  transition: transform 150ms ease;
+}
+
+.permission-row > label input:checked + i {
+  background: var(--accent);
+}
+
+.permission-row > label input:checked + i::after {
+  transform: translateX(12px);
+}
+
+.permissions-empty {
+  padding: 18px;
   color: var(--faint);
   font-size: 10px;
   text-align: center;

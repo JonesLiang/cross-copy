@@ -59,6 +59,34 @@ async fn set_mouse_position(
 }
 
 #[tauri::command]
+async fn set_peer_screen_position(
+    core: State<'_, Arc<Core>>,
+    peer_id: String,
+    position: model::ScreenPosition,
+) -> Result<(), String> {
+    Arc::clone(core.inner())
+        .set_peer_screen_position(peer_id, position)
+        .await
+}
+
+#[tauri::command]
+async fn set_peer_permissions(
+    core: State<'_, Arc<Core>>,
+    peer_id: String,
+    clipboard_allowed: bool,
+    mouse_allowed: bool,
+) -> Result<(), String> {
+    Arc::clone(core.inner())
+        .set_peer_permissions(peer_id, clipboard_allowed, mouse_allowed)
+        .await
+}
+
+#[tauri::command]
+fn switch_mouse_to_screen(core: State<'_, Arc<Core>>, screen_number: u8) -> Result<(), String> {
+    core.switch_mouse_to_screen(screen_number)
+}
+
+#[tauri::command]
 fn set_launch_at_login(
     app: tauri::AppHandle,
     core: State<'_, Arc<Core>>,
@@ -137,6 +165,12 @@ fn set_shortcuts(
     {
         return Err("不能占用系统原生复制或粘贴快捷键，请增加 Shift 或 Alt".into());
     }
+    if [copy.as_str(), paste.as_str(), mouse.as_str()]
+        .iter()
+        .any(|value| screen_shortcuts().iter().any(|screen| screen == value))
+    {
+        return Err("Ctrl+Shift+1 至 Ctrl+Shift+9 已用于切换逻辑屏幕".into());
+    }
 
     let previous = core.store.get();
     let _ = app.global_shortcut().unregister_multiple([
@@ -202,6 +236,16 @@ pub fn run() {
                         .mouse_shortcut
                         .parse::<Shortcut>()
                         .is_ok_and(|value| &value == shortcut);
+                    let screen_number =
+                        screen_shortcuts()
+                            .iter()
+                            .enumerate()
+                            .find_map(|(index, value)| {
+                                value
+                                    .parse::<Shortcut>()
+                                    .is_ok_and(|parsed| &parsed == shortcut)
+                                    .then_some((index + 1) as u8)
+                            });
                     if is_copy {
                         let core = Arc::clone(core.inner());
                         tauri::async_runtime::spawn(async move {
@@ -217,6 +261,10 @@ pub fn run() {
                         tauri::async_runtime::spawn(async move {
                             core.toggle_mouse_share().await;
                         });
+                    } else if let Some(screen_number) = screen_number {
+                        if let Err(error) = core.switch_mouse_to_screen(screen_number) {
+                            core.log_mouse_shortcut_error(screen_number, &error);
+                        }
                     }
                 })
                 .build(),
@@ -228,12 +276,24 @@ pub fn run() {
             let core = Core::new(store, Arc::clone(&logger), app.handle().clone());
             app.manage(Arc::clone(&core));
             let shortcuts = core.store.get();
-            if let Err(error) = app.global_shortcut().register_multiple([
-                shortcuts.copy_shortcut.as_str(),
-                shortcuts.paste_shortcut.as_str(),
-                shortcuts.mouse_shortcut.as_str(),
-            ]) {
+            let registered = [
+                shortcuts.copy_shortcut,
+                shortcuts.paste_shortcut,
+                shortcuts.mouse_shortcut,
+            ];
+            if let Err(error) = app
+                .global_shortcut()
+                .register_multiple(registered.iter().map(String::as_str))
+            {
                 logger.error("shortcut_registration_failed", error.to_string());
+            }
+            for shortcut in screen_shortcuts() {
+                if let Err(error) = app.global_shortcut().register(shortcut) {
+                    logger.warn(
+                        "mouse_screen_shortcut_registration_failed",
+                        format!("shortcut={shortcut} error={error}"),
+                    );
+                }
             }
             let service_logger = Arc::clone(&logger);
             tauri::async_runtime::spawn(async move {
@@ -287,6 +347,9 @@ pub fn run() {
             set_sync_enabled,
             set_mouse_share_enabled,
             set_mouse_position,
+            set_peer_screen_position,
+            set_peer_permissions,
+            switch_mouse_to_screen,
             set_launch_at_login,
             unpair,
             export_diagnostics,
@@ -296,6 +359,20 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("failed to run CrossCopy");
+}
+
+fn screen_shortcuts() -> [&'static str; 9] {
+    [
+        "Ctrl+Shift+1",
+        "Ctrl+Shift+2",
+        "Ctrl+Shift+3",
+        "Ctrl+Shift+4",
+        "Ctrl+Shift+5",
+        "Ctrl+Shift+6",
+        "Ctrl+Shift+7",
+        "Ctrl+Shift+8",
+        "Ctrl+Shift+9",
+    ]
 }
 
 fn show_or_create_window(app: &tauri::AppHandle) {

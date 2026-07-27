@@ -20,6 +20,12 @@ export type UiState = {
     name: string;
     online: boolean;
     lastSeen?: number;
+    direct: boolean;
+    clipboardAllowed: boolean;
+    mouseAllowed: boolean;
+    mouseShareEnabled: boolean;
+    screenNumber: number;
+    screenPosition: ScreenPosition;
   }>;
   activity: Array<{
     id: string;

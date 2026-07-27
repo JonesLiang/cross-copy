@@ -20,14 +20,21 @@ const platform = (file, signature) => ({
   signature,
   url: `${releaseBase}/${encodeURIComponent(basename(file))}`
 });
+const proxiedPlatform = (file, signature) => {
+  const direct = `${releaseBase}/${encodeURIComponent(basename(file))}`;
+  return {
+    signature,
+    url: `https://gh-proxy.com/${direct}`
+  };
+};
 
 const windows = platform(windowsInstaller, windowsSignature);
 const manifest = {
   version,
-  notes: `CrossCopy ${version} 稳定性修复与体验改进`,
+  notes: `CrossCopy ${version} 多设备共享与稳定性更新`,
   pub_date: new Date().toISOString(),
   platforms: {
-    "darwin-universal": platform(macArchive, macSignature),
+    "darwin-universal": proxiedPlatform(macArchive, macSignature),
     "windows-x86_64": windows,
     "windows-x86_64-nsis": windows
   }

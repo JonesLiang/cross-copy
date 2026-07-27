@@ -1,7 +1,8 @@
+use crate::crypto::random_secret;
 use crate::model::{
     default_copy_shortcut, default_mouse_shortcut, default_paste_shortcut, ScreenPosition, Settings,
 };
-use std::{fs, io, path::PathBuf, sync::RwLock};
+use std::{collections::HashSet, fs, io, path::PathBuf, sync::RwLock};
 use uuid::Uuid;
 
 pub struct Store {
@@ -13,7 +14,7 @@ impl Store {
     pub fn load(app_dir: PathBuf) -> io::Result<Self> {
         fs::create_dir_all(&app_dir)?;
         let path = app_dir.join("settings.json");
-        let value = fs::read_to_string(&path)
+        let mut value = fs::read_to_string(&path)
             .ok()
             .and_then(|raw| serde_json::from_str(&raw).ok())
             .unwrap_or_else(|| Settings {
@@ -22,6 +23,8 @@ impl Store {
                     .unwrap_or_default()
                     .to_string_lossy()
                     .into_owned(),
+                group_id: String::new(),
+                group_secret: String::new(),
                 peers: Vec::new(),
                 sync_enabled: true,
                 launch_at_login: false,
@@ -31,6 +34,21 @@ impl Store {
                 mouse_shortcut: default_mouse_shortcut(),
                 mouse_position: ScreenPosition::Right,
             });
+        if value.group_id.is_empty() {
+            value.group_id = value.device_id.clone();
+        }
+        if value.group_secret.is_empty() {
+            value.group_secret = random_secret();
+        }
+        let mut used_screens = HashSet::new();
+        for peer in &mut value.peers {
+            if peer.screen_number < 2 || used_screens.contains(&peer.screen_number) {
+                peer.screen_number = (2_u8..=u8::MAX)
+                    .find(|number| !used_screens.contains(number))
+                    .unwrap_or(u8::MAX);
+            }
+            used_screens.insert(peer.screen_number);
+        }
         let store = Self {
             path,
             value: RwLock::new(value),

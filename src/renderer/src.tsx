@@ -47,7 +47,21 @@ const crosscopy = {
   setMouseShareEnabled: (value: boolean) =>
     invoke<void>("set_mouse_share_enabled", { value }),
   setMousePosition: (position: ScreenPosition) =>
-    invoke<void>("set_mouse_position", { position })
+    invoke<void>("set_mouse_position", { position }),
+  setPeerScreenPosition: (peerId: string, position: ScreenPosition) =>
+    invoke<void>("set_peer_screen_position", { peerId, position }),
+  setPeerPermissions: (
+    peerId: string,
+    clipboardAllowed: boolean,
+    mouseAllowed: boolean
+  ) =>
+    invoke<void>("set_peer_permissions", {
+      peerId,
+      clipboardAllowed,
+      mouseAllowed
+    }),
+  switchMouseToScreen: (screenNumber: number) =>
+    invoke<void>("switch_mouse_to_screen", { screenNumber })
 };
 
 const EMPTY_STATE: UiState = {
@@ -194,7 +208,7 @@ function App(): React.JSX.Element {
   }
 
   async function installUpdate(): Promise<void> {
-    const update = availableUpdate.current;
+    let update = availableUpdate.current;
     if (!update) {
       await checkForUpdate(true);
       return;
@@ -207,26 +221,50 @@ function App(): React.JSX.Element {
       version: update.version,
       progress: null
     });
-    try {
-      await update.downloadAndInstall((event) => {
-        if (event.event === "Started") {
-          total = event.data.contentLength;
-        } else if (event.event === "Progress") {
-          received += event.data.chunkLength;
-          const progress =
-            total && total > 0 ? Math.min(100, (received / total) * 100) : null;
-          setUpdateState({
-            kind: "downloading",
-            version: update.version,
-            progress
-          });
-        } else {
-          setUpdateState({ kind: "installing", version: update.version });
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      received = 0;
+      total = undefined;
+      try {
+        await update.downloadAndInstall((event) => {
+          if (event.event === "Started") {
+            total = event.data.contentLength;
+          } else if (event.event === "Progress") {
+            received += event.data.chunkLength;
+            const progress =
+              total && total > 0
+                ? Math.min(100, (received / total) * 100)
+                : null;
+            setUpdateState({
+              kind: "downloading",
+              version: update.version,
+              progress
+            });
+          } else {
+            setUpdateState({ kind: "installing", version: update.version });
+          }
+        });
+        await relaunch();
+        return;
+      } catch {
+        if (attempt === 3) {
+          setUpdateState({ kind: "error" });
+          return;
         }
-      });
-      await relaunch();
-    } catch {
-      setUpdateState({ kind: "error" });
+        await update.close().catch(() => undefined);
+        const retryUpdate = await check({ timeout: 15_000 }).catch(() => null);
+        if (!retryUpdate) {
+          setUpdateState({ kind: "error" });
+          return;
+        }
+        update = retryUpdate;
+        availableUpdate.current = retryUpdate;
+        setUpdateState({
+          kind: "downloading",
+          version: update.version,
+          progress: null
+        });
+        await new Promise((resolve) => window.setTimeout(resolve, attempt * 1200));
+      }
     }
   }
 
@@ -672,12 +710,14 @@ const SCREEN_OFFSETS: Record<ScreenPosition, { x: number; y: number }> = {
 };
 
 function MousePanel(props: { state: UiState }): React.JSX.Element {
-  const peer = props.state.peers[0];
-  const [offset, setOffset] = useState(
-    SCREEN_OFFSETS[props.state.mousePosition]
-  );
+  const [selectedPeerId, setSelectedPeerId] = useState("");
+  const selectedPeer =
+    props.state.peers.find((peer) => peer.id === selectedPeerId) ??
+    props.state.peers[0];
+  const [dragOffset, setDragOffset] = useState({ x: 0, y: 0 });
   const [dragging, setDragging] = useState(false);
   const [dragOrigin, setDragOrigin] = useState({
+    peerId: "",
     pointerX: 0,
     pointerY: 0,
     offsetX: 0,
@@ -686,24 +726,56 @@ function MousePanel(props: { state: UiState }): React.JSX.Element {
   const [message, setMessage] = useState("");
 
   useEffect(() => {
-    if (!dragging) setOffset(SCREEN_OFFSETS[props.state.mousePosition]);
-  }, [dragging, props.state.mousePosition]);
+    if (
+      selectedPeerId &&
+      !props.state.peers.some((peer) => peer.id === selectedPeerId)
+    ) {
+      setSelectedPeerId("");
+    }
+  }, [props.state.peers, selectedPeerId]);
 
-  async function choosePosition(position: ScreenPosition): Promise<void> {
-    setOffset(SCREEN_OFFSETS[position]);
+  const peerOffset = (
+    peer: UiState["peers"][number]
+  ): { x: number; y: number } => {
+    if (dragging && peer.id === selectedPeer?.id) return dragOffset;
+    const base = SCREEN_OFFSETS[peer.screenPosition];
+    const sameEdge = props.state.peers
+      .filter(
+        (candidate) => candidate.screenPosition === peer.screenPosition
+      )
+      .sort((a, b) => a.screenNumber - b.screenNumber);
+    const index = sameEdge.findIndex((candidate) => candidate.id === peer.id);
+    const spread = (index - (sameEdge.length - 1) / 2) * 58;
+    return peer.screenPosition === "left" || peer.screenPosition === "right"
+      ? { x: base.x, y: base.y + spread }
+      : { x: base.x + spread, y: base.y };
+  };
+
+  async function choosePosition(
+    peerId: string,
+    position: ScreenPosition
+  ): Promise<void> {
     setMessage("正在同步屏幕位置");
     try {
-      await crosscopy.setMousePosition(position);
-      setMessage("两台电脑的逻辑位置已同步");
+      await crosscopy.setPeerScreenPosition(peerId, position);
+      setMessage("逻辑屏幕位置已同步，对端会自动显示为相反方向");
     } catch (reason) {
       setMessage(typeof reason === "string" ? reason : "屏幕位置同步失败");
     }
   }
 
-  function startDrag(event: React.PointerEvent<HTMLButtonElement>): void {
+  function startDrag(
+    event: React.PointerEvent<HTMLButtonElement>,
+    peerId: string
+  ): void {
     event.currentTarget.setPointerCapture(event.pointerId);
+    setSelectedPeerId(peerId);
+    const peer = props.state.peers.find((candidate) => candidate.id === peerId);
+    const offset = peer ? peerOffset(peer) : { x: 0, y: 0 };
+    setDragOffset(offset);
     setDragging(true);
     setDragOrigin({
+      peerId,
       pointerX: event.clientX,
       pointerY: event.clientY,
       offsetX: offset.x,
@@ -713,7 +785,7 @@ function MousePanel(props: { state: UiState }): React.JSX.Element {
 
   function moveDrag(event: React.PointerEvent<HTMLButtonElement>): void {
     if (!dragging) return;
-    setOffset({
+    setDragOffset({
       x: Math.max(
         -175,
         Math.min(175, dragOrigin.offsetX + event.clientX - dragOrigin.pointerX)
@@ -747,10 +819,12 @@ function MousePanel(props: { state: UiState }): React.JSX.Element {
         : finalOffset.y < 0
           ? "up"
           : "down";
-    void choosePosition(position);
+    if (dragOrigin.peerId) void choosePosition(dragOrigin.peerId, position);
   }
 
-  const online = Boolean(peer?.online);
+  const availablePeers = props.state.peers.filter(
+    (peer) => peer.online && peer.mouseAllowed && peer.mouseShareEnabled
+  );
   const latencyLabel =
     props.state.mouseLatencyMs === null
       ? "完成一次鼠标穿越后显示"
@@ -764,7 +838,7 @@ function MousePanel(props: { state: UiState }): React.JSX.Element {
           <div>
             <h2>共享鼠标</h2>
             <p>
-              开启后移动到指定屏幕边缘即可穿越；任一电脑关闭时，两端会同步关闭。
+              移动到对应边缘，或按 Ctrl+Shift+屏幕编号，直接把本机鼠标切换过去。
             </p>
           </div>
         </div>
@@ -772,7 +846,7 @@ function MousePanel(props: { state: UiState }): React.JSX.Element {
           <input
             type="checkbox"
             checked={props.state.mouseShareEnabled}
-            disabled={!peer}
+            disabled={props.state.peers.length === 0}
             onChange={(event) =>
               void crosscopy.setMouseShareEnabled(event.target.checked)
             }
@@ -785,36 +859,48 @@ function MousePanel(props: { state: UiState }): React.JSX.Element {
         <div className="topology-heading">
           <div>
             <h2>逻辑屏幕位置</h2>
-            <p>拖动另一台电脑到本机的上、下、左或右，松手后自动吸附。</p>
+            <p>拖动任意电脑到本机四周；编号 1 永远是当前电脑。</p>
           </div>
-          <span className={online ? "topology-online" : ""}>
-            {peer ? (online ? "设备在线" : "设备离线") : "尚未配对"}
+          <span className={availablePeers.length > 0 ? "topology-online" : ""}>
+            {props.state.peers.length === 0
+              ? "尚未配对"
+              : `${availablePeers.length} 台可穿越`}
           </span>
         </div>
 
         <div className="screen-layout" aria-label="拖动调整逻辑屏幕位置">
           <div className="screen-device local-screen">
+            <b className="screen-number">1</b>
             <Desktop size={27} />
             <strong>{props.state.deviceName || "本机"}</strong>
             <small>当前电脑</small>
           </div>
-          {peer && (
-            <button
-              className={`screen-device peer-screen ${dragging ? "dragging" : ""}`}
-              style={{
-                transform: `translate(-50%, -50%) translate(${offset.x}px, ${offset.y}px)`
-              }}
-              type="button"
-              onPointerDown={startDrag}
-              onPointerMove={moveDrag}
-              onPointerUp={endDrag}
-              onPointerCancel={() => setDragging(false)}
-            >
-              <Desktop size={27} />
-              <strong>{peer.name}</strong>
-              <small>拖动此屏幕</small>
-            </button>
-          )}
+          {props.state.peers.map((peer) => {
+            const offset = peerOffset(peer);
+            return (
+              <button
+                className={`screen-device peer-screen ${
+                  selectedPeer?.id === peer.id ? "selected" : ""
+                } ${
+                  dragging && selectedPeer?.id === peer.id ? "dragging" : ""
+                }`}
+                style={{
+                  transform: `translate(-50%, -50%) translate(${offset.x}px, ${offset.y}px)`
+                }}
+                type="button"
+                key={peer.id}
+                onPointerDown={(event) => startDrag(event, peer.id)}
+                onPointerMove={moveDrag}
+                onPointerUp={endDrag}
+                onPointerCancel={() => setDragging(false)}
+              >
+                <b className="screen-number">{peer.screenNumber}</b>
+                <Desktop size={27} />
+                <strong>{peer.name}</strong>
+                <small>{peer.online ? "在线" : "离线"}</small>
+              </button>
+            );
+          })}
         </div>
 
         <div className="direction-picker" aria-label="快速选择屏幕方向">
@@ -828,17 +914,46 @@ function MousePanel(props: { state: UiState }): React.JSX.Element {
           ).map(([position, label]) => (
             <button
               className={
-                props.state.mousePosition === position ? "active" : ""
+                selectedPeer?.screenPosition === position ? "active" : ""
               }
               type="button"
               key={position}
-              disabled={!peer}
-              onClick={() => void choosePosition(position)}
+              disabled={!selectedPeer}
+              onClick={() =>
+                selectedPeer &&
+                void choosePosition(selectedPeer.id, position)
+              }
             >
               {label}
             </button>
           ))}
         </div>
+        {selectedPeer && (
+          <div className="screen-switch-row">
+            <span>
+              已选择：屏幕 {selectedPeer.screenNumber} · {selectedPeer.name}
+            </span>
+            <button
+              type="button"
+              disabled={
+                !props.state.mouseShareEnabled ||
+                !selectedPeer.online ||
+                !selectedPeer.mouseAllowed ||
+                !selectedPeer.mouseShareEnabled
+              }
+              onClick={() =>
+                void crosscopy.switchMouseToScreen(selectedPeer.screenNumber)
+              }
+            >
+              立即切换
+              <kbd>
+                {selectedPeer.screenNumber <= 9
+                  ? `Ctrl Shift ${selectedPeer.screenNumber}`
+                  : `屏幕 ${selectedPeer.screenNumber}`}
+              </kbd>
+            </button>
+          </div>
+        )}
         {message && <small className="topology-message">{message}</small>}
       </section>
 
@@ -855,13 +970,12 @@ function MousePanel(props: { state: UiState }): React.JSX.Element {
               ? "已关闭"
               : props.state.mouseSessionActive
                 ? "正在跨屏控制"
-                : online
+                : availablePeers.length > 0
                   ? "等待鼠标到达屏幕边缘"
-                  : "等待另一台电脑上线"}
+                  : "等待有权限的电脑上线并开启共享"}
           </strong>
           <small>
-            {props.state.mouseShareEnabled &&
-            !props.state.mouseListenerStarted
+            {props.state.mouseShareEnabled && !props.state.mouseListenerStarted
               ? "鼠标监听启动失败；请检查系统辅助功能权限，然后关闭并重新开启共享。"
               : props.state.mouseListenerStarted
               ? "鼠标监听已按需启动；本机物理输入始终优先。"
@@ -932,6 +1046,71 @@ function SettingsPanel(props: {
             保存快捷键
           </button>
           {message && <span>{message}</span>}
+        </div>
+      </section>
+
+      <section className="settings-group">
+        <div className="settings-intro">
+          <ShieldCheck size={22} />
+          <div>
+            <h2>设备权限</h2>
+            <p>
+              权限是双向的：关闭某台电脑后，双方都不能通过对应功能互相发送或接收。
+            </p>
+          </div>
+        </div>
+        <div className="device-permissions">
+          {props.state.peers.length === 0 ? (
+            <div className="permissions-empty">配对设备后可在这里单独授权</div>
+          ) : (
+            props.state.peers
+              .slice()
+              .sort((a, b) => a.screenNumber - b.screenNumber)
+              .map((peer) => (
+                <div className="permission-row" key={peer.id}>
+                  <span className="permission-device">
+                    <b>{peer.screenNumber}</b>
+                    <span>
+                      <strong>{peer.name}</strong>
+                      <small>
+                        {peer.direct ? "直接配对" : "由可信设备自动加入"} ·{" "}
+                        {peer.online ? "在线" : "离线"}
+                      </small>
+                    </span>
+                  </span>
+                  <label>
+                    <input
+                      type="checkbox"
+                      checked={peer.clipboardAllowed}
+                      onChange={(event) =>
+                        void crosscopy.setPeerPermissions(
+                          peer.id,
+                          event.target.checked,
+                          peer.mouseAllowed
+                        )
+                      }
+                    />
+                    <i aria-hidden="true" />
+                    剪贴板
+                  </label>
+                  <label>
+                    <input
+                      type="checkbox"
+                      checked={peer.mouseAllowed}
+                      onChange={(event) =>
+                        void crosscopy.setPeerPermissions(
+                          peer.id,
+                          peer.clipboardAllowed,
+                          event.target.checked
+                        )
+                      }
+                    />
+                    <i aria-hidden="true" />
+                    鼠标
+                  </label>
+                </div>
+              ))
+          )}
         </div>
       </section>
 

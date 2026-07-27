@@ -70,6 +70,22 @@ pub fn random_secret() -> String {
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
+pub fn derived_peer_secret(
+    group_secret: &str,
+    first: &str,
+    second: &str,
+) -> Result<String, String> {
+    let key = decode_secret(group_secret)?;
+    let (left, right) = if first <= second {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(&key).map_err(|e| e.to_string())?;
+    mac.update(format!("crosscopy-group-peer:{left}:{right}").as_bytes());
+    Ok(URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes()))
+}
+
 pub fn decode_secret(value: &str) -> Result<Vec<u8>, String> {
     URL_SAFE_NO_PAD.decode(value).map_err(|e| e.to_string())
 }
