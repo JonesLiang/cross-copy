@@ -47,10 +47,17 @@ pub fn screen_size() -> (i32, i32) {
 }
 
 #[cfg(target_os = "macos")]
-pub fn recenter_cursor(_x: i32, _y: i32, _width: i32, _height: i32) -> Result<(), String> {
-    // macOS supplies reliable post-acceleration relative deltas. Keeping the
-    // hidden source pointer parked at the edge avoids synthetic warp events.
-    Ok(())
+pub fn recenter_cursor(x: i32, y: i32, width: i32, height: i32) -> Result<(), String> {
+    use core_graphics::{display::CGDisplay, geometry::CGPoint};
+
+    // Warping does not generate a mouse event, so the event tap only observes
+    // real hardware deltas while the hidden source cursor remains away from
+    // the screen edge.
+    CGDisplay::warp_mouse_cursor_position(CGPoint::new(
+        f64::from(x.clamp(0, width - 1)),
+        f64::from(y.clamp(0, height - 1)),
+    ))
+    .map_err(|error| format!("macOS 鼠标回中失败：{error:?}"))
 }
 
 #[cfg(target_os = "windows")]
