@@ -802,6 +802,125 @@ impl Core {
         Ok(destination.to_string_lossy().into_owned())
     }
 
+    pub async fn filesystem_prepare_drag(
+        self: &Arc<Self>,
+        peer_id: String,
+        paths: Vec<String>,
+    ) -> Result<Vec<String>, String> {
+        self.wake_network();
+        let settings = self.store.get();
+        let peer = settings
+            .peers
+            .into_iter()
+            .find(|peer| peer.id == peer_id)
+            .ok_or("设备不存在")?;
+        if !peer.filesystem_allowed {
+            return Err("未授予这台电脑文件系统权限".into());
+        }
+        let seen = self
+            .discovered
+            .lock()
+            .expect("discovery lock")
+            .get(&peer.id)
+            .cloned()
+            .filter(|seen| now_ms().saturating_sub(seen.last_seen) < ONLINE_WINDOW_MS)
+            .ok_or("设备离线，无法准备拖放文件")?;
+        let key = decode_secret(&peer.secret)?;
+        let mut stream = TcpStream::connect((seen.host, seen.packet.port))
+            .await
+            .map_err(|error| format!("无法连接远端文件系统：{error}"))?;
+        stream
+            .set_nodelay(true)
+            .map_err(|error| error.to_string())?;
+        write_json(
+            &mut stream,
+            &WireMessage::Secure {
+                sender_id: self.store.get().device_id,
+                envelope: encrypt(&key, &SecureMessage::FilesystemDownload { paths })?,
+            },
+        )
+        .await?;
+        let manifest_bytes = read_secure_frame(&mut stream, &key).await?;
+        let manifest: SecureMessage =
+            serde_json::from_slice(&manifest_bytes).map_err(|e| e.to_string())?;
+        let SecureMessage::Manifest { entries } = manifest else {
+            return Err("远端文件清单无效".into());
+        };
+        let total = entries.iter().map(|entry| entry.size).sum();
+        let transfer_id = Uuid::new_v4().to_string();
+        self.begin_transfer_progress(&transfer_id, "正在准备拖放", "received", total);
+
+        let cache_root = self
+            .app
+            .path()
+            .app_cache_dir()
+            .map_err(|error| error.to_string())?
+            .join("drag-cache");
+        cleanup_drag_cache(&cache_root).await;
+        let destination = cache_root.join(Uuid::new_v4().to_string());
+        fs::create_dir_all(&destination)
+            .await
+            .map_err(|error| error.to_string())?;
+        let result = async {
+            let mut top_level = Vec::new();
+            let mut transferred = 0_u64;
+            for entry in entries {
+                let relative = safe_relative_path(&entry.path)?;
+                let target = destination.join(&relative);
+                if let Some(first) = relative.components().next() {
+                    let root = destination.join(first.as_os_str());
+                    if !top_level.contains(&root) {
+                        top_level.push(root);
+                    }
+                }
+                if entry.directory {
+                    fs::create_dir_all(&target)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    continue;
+                }
+                if let Some(parent) = target.parent() {
+                    fs::create_dir_all(parent)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                }
+                let mut file = File::create(&target)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let mut remaining = entry.size;
+                while remaining > 0 {
+                    let chunk = read_secure_frame(&mut stream, &key).await?;
+                    if chunk.is_empty() || chunk.len() as u64 > remaining {
+                        return Err("远端文件数据损坏".into());
+                    }
+                    file.write_all(&chunk)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    remaining -= chunk.len() as u64;
+                    transferred += chunk.len() as u64;
+                    self.update_transfer_progress(transferred);
+                }
+                file.flush().await.map_err(|error| error.to_string())?;
+            }
+            Ok::<Vec<PathBuf>, String>(top_level)
+        }
+        .await;
+        match result {
+            Ok(paths) => {
+                self.complete_transfer_progress();
+                Ok(paths
+                    .into_iter()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .collect())
+            }
+            Err(error) => {
+                self.fail_transfer_progress(&error);
+                let _ = fs::remove_dir_all(destination).await;
+                Err(error)
+            }
+        }
+    }
+
     pub async fn filesystem_upload(
         self: &Arc<Self>,
         peer_id: String,
@@ -3529,6 +3648,24 @@ async fn ensure_no_symlink_ancestors(root: &Path, target: &Path) -> Result<(), S
         }
     }
     Ok(())
+}
+
+async fn cleanup_drag_cache(root: &Path) {
+    let Ok(mut entries) = fs::read_dir(root).await else {
+        return;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let expired = entry
+            .metadata()
+            .await
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age >= Duration::from_secs(24 * 60 * 60));
+        if expired {
+            let _ = fs::remove_dir_all(entry.path()).await;
+        }
+    }
 }
 
 fn scan_roots(paths: &[PathBuf]) -> Result<(u64, Vec<String>), String> {

@@ -27,6 +27,14 @@ pub struct FsEntry {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FsProperties {
+    pub entry: FsEntry,
+    pub item_count: u64,
+    pub total_size: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum FsRequest {
     Roots,
@@ -34,6 +42,9 @@ pub enum FsRequest {
         path: String,
     },
     Metadata {
+        path: String,
+    },
+    Properties {
         path: String,
     },
     Read {
@@ -63,6 +74,10 @@ pub enum FsRequest {
         path: String,
         destination: String,
     },
+    Paste {
+        paths: Vec<String>,
+        destination: String,
+    },
     Remove {
         path: String,
         recursive: bool,
@@ -90,6 +105,9 @@ pub enum FsResponse {
     },
     Done {
         entry: Option<FsEntry>,
+    },
+    Properties {
+        properties: FsProperties,
     },
     Error {
         message: String,
@@ -166,6 +184,12 @@ async fn handle_inner(request: FsRequest) -> Result<FsResponse, String> {
             let path = checked_absolute(&path)?;
             Ok(FsResponse::Done {
                 entry: Some(entry_from_path(path).await?),
+            })
+        }
+        FsRequest::Properties { path } => {
+            let path = checked_absolute(&path)?;
+            Ok(FsResponse::Properties {
+                properties: properties_for_path(path).await?,
             })
         }
         FsRequest::Read { path } => {
@@ -265,6 +289,15 @@ async fn handle_inner(request: FsRequest) -> Result<FsResponse, String> {
         FsRequest::Rename { path, destination } => {
             let path = checked_absolute(&path)?;
             let destination = checked_absolute(&destination)?;
+            if is_filesystem_root(&path) {
+                return Err("不能重命名文件系统根目录".into());
+            }
+            if fs::try_exists(&destination)
+                .await
+                .map_err(|error| friendly_io_error("无法检查新名称", error))?
+            {
+                return Err("同一位置已存在同名项目".into());
+            }
             fs::rename(&path, &destination)
                 .await
                 .map_err(|error| friendly_io_error("无法移动或重命名", error))?;
@@ -280,30 +313,156 @@ async fn handle_inner(request: FsRequest) -> Result<FsResponse, String> {
                 entry: Some(entry_from_path(destination).await?),
             })
         }
-        FsRequest::Remove { path, recursive } => {
+        FsRequest::Paste { paths, destination } => {
+            if paths.is_empty() || paths.len() > 128 {
+                return Err("请选择 1 到 128 个文件或文件夹".into());
+            }
+            let destination = checked_absolute(&destination)?;
+            let destination_metadata = fs::metadata(&destination)
+                .await
+                .map_err(|error| friendly_io_error("无法打开粘贴位置", error))?;
+            if !destination_metadata.is_dir() {
+                return Err("粘贴目标必须是文件夹".into());
+            }
+            let destination = fs::canonicalize(destination)
+                .await
+                .map_err(|error| friendly_io_error("无法确认粘贴位置", error))?;
+            let mut last_entry = None;
+            for value in paths {
+                let source = fs::canonicalize(checked_absolute(&value)?)
+                    .await
+                    .map_err(|error| friendly_io_error("无法确认复制源", error))?;
+                if is_filesystem_root(&source) {
+                    return Err("不能复制文件系统根目录".into());
+                }
+                let name = source.file_name().ok_or("复制源名称无效")?;
+                let target = unique_child_path(&destination, name, source.is_dir()).await?;
+                if target.starts_with(&source) {
+                    return Err("不能把文件夹复制到自身内部".into());
+                }
+                copy_path(&source, &target).await?;
+                last_entry = Some(entry_from_path(target).await?);
+            }
+            Ok(FsResponse::Done { entry: last_entry })
+        }
+        FsRequest::Remove { path, recursive: _ } => {
             let path = checked_absolute(&path)?;
             if is_filesystem_root(&path) {
                 return Err("不能删除文件系统根目录".into());
             }
-            let metadata = fs::symlink_metadata(&path)
+            fs::symlink_metadata(&path)
                 .await
                 .map_err(|error| friendly_io_error("无法读取目标", error))?;
-            if metadata.is_dir() {
-                if recursive {
-                    fs::remove_dir_all(path).await
-                } else {
-                    fs::remove_dir(path).await
-                }
-            } else {
-                fs::remove_file(path).await
-            }
-            .map_err(|error| friendly_io_error("无法删除", error))?;
+            tokio::task::spawn_blocking(move || trash::delete(&path))
+                .await
+                .map_err(|error| format!("系统回收操作异常：{error}"))?
+                .map_err(|error| format!("无法移到系统废纸篓/回收站：{error}"))?;
             Ok(FsResponse::Done { entry: None })
         }
     }
 }
 
+async fn properties_for_path(path: PathBuf) -> Result<FsProperties, String> {
+    let entry = entry_from_path(path.clone()).await?;
+    if !entry.directory {
+        return Ok(FsProperties {
+            total_size: entry.size,
+            item_count: 1,
+            entry,
+        });
+    }
+    let mut total_size = 0_u64;
+    let mut item_count = 0_u64;
+    let mut pending = vec![path];
+    while let Some(directory) = pending.pop() {
+        let mut reader = fs::read_dir(directory)
+            .await
+            .map_err(|error| friendly_io_error("无法统计文件夹", error))?;
+        while let Some(item) = reader
+            .next_entry()
+            .await
+            .map_err(|error| friendly_io_error("无法统计文件夹", error))?
+        {
+            let metadata = fs::symlink_metadata(item.path())
+                .await
+                .map_err(|error| friendly_io_error("无法读取文件信息", error))?;
+            item_count = item_count.saturating_add(1);
+            if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                pending.push(item.path());
+            } else if metadata.is_file() {
+                total_size = total_size.saturating_add(metadata.len());
+            }
+        }
+    }
+    Ok(FsProperties {
+        entry,
+        item_count,
+        total_size,
+    })
+}
+
+async fn unique_child_path(
+    directory: &Path,
+    name: &std::ffi::OsStr,
+    is_directory: bool,
+) -> Result<PathBuf, String> {
+    let original = directory.join(name);
+    if !fs::try_exists(&original)
+        .await
+        .map_err(|error| friendly_io_error("无法检查粘贴位置", error))?
+    {
+        return Ok(original);
+    }
+    let path = Path::new(name);
+    let name = name.to_string_lossy();
+    let stem = if is_directory {
+        name.into_owned()
+    } else {
+        path.file_stem()
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string_lossy().into_owned())
+            .unwrap_or_else(|| name.into_owned())
+    };
+    let extension = if is_directory {
+        String::new()
+    } else {
+        path.extension()
+            .map(|value| format!(".{}", value.to_string_lossy()))
+            .unwrap_or_default()
+    };
+    for index in 2..=9_999 {
+        let candidate = directory.join(format!("{stem} ({index}){extension}"));
+        if !fs::try_exists(&candidate)
+            .await
+            .map_err(|error| friendly_io_error("无法检查粘贴位置", error))?
+        {
+            return Ok(candidate);
+        }
+    }
+    Err("目标文件夹中同名项目过多".into())
+}
+
 async fn copy_path(source: &Path, destination: &Path) -> Result<(), String> {
+    if fs::try_exists(destination)
+        .await
+        .map_err(|error| friendly_io_error("无法检查复制目标", error))?
+    {
+        return Err("复制目标已存在".into());
+    }
+    let result = copy_path_inner(source, destination).await;
+    if result.is_err() {
+        if let Ok(metadata) = fs::symlink_metadata(destination).await {
+            if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                let _ = fs::remove_dir_all(destination).await;
+            } else {
+                let _ = fs::remove_file(destination).await;
+            }
+        }
+    }
+    result
+}
+
+async fn copy_path_inner(source: &Path, destination: &Path) -> Result<(), String> {
     let metadata = fs::symlink_metadata(source)
         .await
         .map_err(|error| friendly_io_error("无法读取复制源", error))?;
@@ -332,11 +491,10 @@ async fn copy_path(source: &Path, destination: &Path) -> Result<(), String> {
             .map_err(|error| friendly_io_error("无法读取源文件夹", error))?
         {
             let target = current_destination.join(item.file_name());
-            let item_metadata = item
-                .metadata()
+            let item_metadata = fs::symlink_metadata(item.path())
                 .await
                 .map_err(|error| friendly_io_error("无法读取文件信息", error))?;
-            if item_metadata.is_dir() {
+            if item_metadata.is_dir() && !item_metadata.file_type().is_symlink() {
                 fs::create_dir(&target)
                     .await
                     .map_err(|error| friendly_io_error("无法创建目标文件夹", error))?;

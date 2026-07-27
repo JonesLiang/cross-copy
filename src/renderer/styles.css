@@ -1882,10 +1882,6 @@ nav {
   white-space: nowrap;
 }
 
-.filesystem-actions {
-  padding-bottom: 4px;
-}
-
 .filesystem-upload-hint {
   display: flex;
   align-items: center;
@@ -1899,15 +1895,10 @@ nav {
   color: var(--accent);
 }
 
-.filesystem-actions button:last-child {
-  margin-left: auto;
-  color: var(--accent);
-}
-
 .filesystem-browser {
   position: relative;
   display: grid;
-  grid-template-rows: minmax(300px, 1fr) 82px;
+  grid-template-rows: minmax(380px, 1fr);
   min-height: 410px;
   overflow: hidden;
   background: var(--surface);
@@ -1990,6 +1981,11 @@ nav {
   background: var(--accent-soft);
 }
 
+.filesystem-entry.preparing {
+  cursor: progress;
+  opacity: 0.68;
+}
+
 .filesystem-entry > span:first-child {
   display: flex;
   min-width: 0;
@@ -2032,33 +2028,6 @@ nav {
   font-size: 11px;
 }
 
-.filesystem-drop {
-  display: grid;
-  grid-template-columns: 34px 1fr;
-  grid-template-rows: 1fr 1fr;
-  align-items: center;
-  padding: 13px 18px;
-  color: var(--muted);
-  background: var(--surface-soft);
-  border-top: 1px dashed var(--line);
-}
-
-.filesystem-drop svg {
-  grid-row: 1 / 3;
-  color: var(--accent);
-}
-
-.filesystem-drop strong {
-  align-self: end;
-  font-size: 11px;
-}
-
-.filesystem-drop span {
-  align-self: start;
-  color: var(--faint);
-  font-size: 9px;
-}
-
 .filesystem-message {
   min-height: 18px;
   color: var(--muted);
@@ -2089,6 +2058,73 @@ nav {
   font-size: 11px;
 }
 
+.file-context-menu {
+  position: fixed;
+  z-index: 40;
+  display: grid;
+  width: 218px;
+  padding: 5px;
+  color: var(--text);
+  background: color-mix(in srgb, var(--surface) 97%, var(--bg));
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  box-shadow:
+    0 18px 44px rgb(0 0 0 / 22%),
+    0 2px 8px rgb(0 0 0 / 9%);
+}
+
+.file-context-menu button {
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr) auto;
+  min-height: 29px;
+  align-items: center;
+  padding: 0 8px;
+  color: var(--text);
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  font-size: 11px;
+  text-align: left;
+  cursor: default;
+}
+
+.file-context-menu button:hover:not(:disabled),
+.file-context-menu button:focus-visible {
+  color: #fff;
+  background: var(--accent);
+  outline: 0;
+}
+
+.file-context-menu button:disabled {
+  color: var(--faint);
+  opacity: 0.55;
+}
+
+.file-context-menu button.danger {
+  color: var(--danger);
+}
+
+.file-context-menu button.danger:hover {
+  color: #fff;
+  background: var(--danger);
+}
+
+.file-context-menu kbd {
+  color: var(--faint);
+  font-family: inherit;
+  font-size: 9px;
+}
+
+.file-context-menu button:hover kbd {
+  color: rgb(255 255 255 / 75%);
+}
+
+.file-context-separator {
+  height: 1px;
+  margin: 4px 6px;
+  background: var(--line);
+}
+
 .editor-backdrop {
   position: fixed;
   z-index: 20;
@@ -2098,6 +2134,143 @@ nav {
   place-items: center;
   background: rgb(12 16 24 / 54%);
   backdrop-filter: blur(3px);
+}
+
+.file-dialog {
+  width: min(420px, 88vw);
+  padding: 18px;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  box-shadow: 0 24px 80px rgb(0 0 0 / 28%);
+}
+
+.file-dialog header {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 12px;
+}
+
+.file-dialog header > div {
+  min-width: 0;
+}
+
+.file-dialog h3 {
+  margin: 0;
+  overflow: hidden;
+  font-size: 14px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-dialog header p {
+  margin: 3px 0 0;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.file-dialog-icon,
+.file-properties-icon {
+  display: grid;
+  width: 38px;
+  height: 38px;
+  flex: 0 0 auto;
+  place-items: center;
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-radius: 10px;
+}
+
+.file-dialog-icon.danger {
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+}
+
+.file-name-dialog label {
+  display: grid;
+  gap: 6px;
+  margin-top: 18px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.file-name-dialog input {
+  width: 100%;
+  height: 35px;
+  padding: 0 10px;
+  color: var(--text);
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  outline: 0;
+  font: inherit;
+}
+
+.file-name-dialog input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent);
+}
+
+.file-dialog-error {
+  margin: 8px 0 0;
+  color: var(--danger);
+  font-size: 10px;
+}
+
+.file-dialog footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 18px;
+}
+
+.file-dialog footer button {
+  min-width: 72px;
+}
+
+.danger-button {
+  color: #fff;
+  background: var(--danger);
+  border-color: var(--danger);
+}
+
+.file-properties-dialog dl {
+  display: grid;
+  gap: 0;
+  margin: 18px 0 0;
+  overflow: hidden;
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+
+.file-properties-dialog dl > div {
+  display: grid;
+  grid-template-columns: 74px minmax(0, 1fr);
+  min-height: 37px;
+  align-items: center;
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--line);
+}
+
+.file-properties-dialog dl > div:last-child {
+  border-bottom: 0;
+}
+
+.file-properties-dialog dt {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.file-properties-dialog dd {
+  margin: 0;
+  overflow: hidden;
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .remote-editor {

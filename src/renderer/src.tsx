@@ -11,8 +11,9 @@ import {
   Desktop,
   DownloadSimple,
   File,
-  Folder,
+  FilePlus,
   FolderOpen,
+  FolderPlus,
   FileText,
   Gear,
   Keyboard,
@@ -22,6 +23,7 @@ import {
   PencilSimple,
   Plus,
   HardDrives,
+  Info,
   FloppyDisk,
   ArrowsClockwise,
   ShieldCheck,
@@ -38,6 +40,7 @@ import { check, type Update } from "@tauri-apps/plugin-updater";
 import type {
   DisplayInfo,
   FsEntry,
+  FsProperties,
   FsRequest,
   FsResponse,
   ScreenPosition,
@@ -97,6 +100,10 @@ const crosscopy = {
     invoke<void>("filesystem_upload", { peerId, localPaths, targetDir }),
   filesystemUploadClipboard: (peerId: string, targetDir: string) =>
     invoke<void>("filesystem_upload_clipboard", { peerId, targetDir }),
+  filesystemPrepareDrag: (peerId: string, paths: string[]) =>
+    invoke<string[]>("filesystem_prepare_drag", { peerId, paths }),
+  filesystemStartDrag: (paths: string[]) =>
+    invoke<void>("filesystem_start_drag", { paths }),
   setPeerMouseDpi: (peerId: string, dpi: number) =>
     invoke<void>("set_peer_mouse_dpi", { peerId, dpi }),
   switchMouseToScreen: (screenNumber: number) =>
@@ -907,6 +914,22 @@ type RemoteEditor = {
   modifiedAt: number | null;
 };
 
+type FileContextMenu = {
+  x: number;
+  y: number;
+  entry: FsEntry | null;
+};
+
+type FileNameDialogState = {
+  mode: "file" | "folder" | "rename";
+  entry: FsEntry | null;
+};
+
+type RemoteFileClipboard = {
+  peerId: string;
+  paths: string[];
+};
+
 function DeviceSelect(props: {
   value: string;
   options: Array<{ value: string; label: string; detail: string }>;
@@ -985,10 +1008,21 @@ function FilesystemPanel(props: { state: UiState }): React.JSX.Element {
   const [saving, setSaving] = useState(false);
   const [externalDragging, setExternalDragging] = useState(false);
   const [uploading, setUploading] = useState(false);
+  const [contextMenu, setContextMenu] = useState<FileContextMenu | null>(null);
+  const [nameDialog, setNameDialog] = useState<FileNameDialogState | null>(null);
+  const [deleteEntry, setDeleteEntry] = useState<FsEntry | null>(null);
+  const [properties, setProperties] = useState<FsProperties | null>(null);
+  const [propertiesLoading, setPropertiesLoading] = useState(false);
+  const [remoteClipboard, setRemoteClipboard] =
+    useState<RemoteFileClipboard | null>(null);
+  const [preparingDragPath, setPreparingDragPath] = useState("");
+  const dragCache = useRef(new Map<string, string[]>());
+  const dragPreparations = useRef(new Map<string, Promise<string[]>>());
 
   const peer =
     availablePeers.find((candidate) => candidate.id === peerId) ??
     availablePeers[0];
+  const selectedEntry = entries.find((entry) => entry.path === selectedPath);
 
   useEffect(() => {
     if (!peer && peerId) setPeerId("");
@@ -998,7 +1032,23 @@ function FilesystemPanel(props: { state: UiState }): React.JSX.Element {
   useEffect(() => {
     setPath(null);
     setSelectedPath("");
+    setContextMenu(null);
+    setProperties(null);
   }, [peerId]);
+
+  useEffect(() => {
+    function closeMenus(): void {
+      setContextMenu(null);
+    }
+    document.addEventListener("mousedown", closeMenus);
+    window.addEventListener("blur", closeMenus);
+    window.addEventListener("resize", closeMenus);
+    return () => {
+      document.removeEventListener("mousedown", closeMenus);
+      window.removeEventListener("blur", closeMenus);
+      window.removeEventListener("resize", closeMenus);
+    };
+  }, []);
 
   useEffect(() => {
     if (!peer) {
@@ -1083,6 +1133,10 @@ function FilesystemPanel(props: { state: UiState }): React.JSX.Element {
         return;
       }
       event.preventDefault();
+      if (remoteClipboard?.peerId === peer.id) {
+        void pasteRemote();
+        return;
+      }
       setUploading(true);
       setMessage(`正在从系统剪贴板复制到 ${peer.name}…`);
       void crosscopy
@@ -1098,7 +1152,37 @@ function FilesystemPanel(props: { state: UiState }): React.JSX.Element {
     }
     window.addEventListener("paste", pasteFiles);
     return () => window.removeEventListener("paste", pasteFiles);
-  }, [peer?.id, peer?.name, path, uploading]);
+  }, [peer?.id, peer?.name, path, remoteClipboard, uploading]);
+
+  useEffect(() => {
+    function handleFileKeys(event: KeyboardEvent): void {
+      const target = event.target as HTMLElement | null;
+      if (target?.matches("input, textarea, [contenteditable='true']")) return;
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "c") {
+        if (!selectedEntry || !peer) return;
+        event.preventDefault();
+        setRemoteClipboard({ peerId: peer.id, paths: [selectedEntry.path] });
+        setMessage(`已复制“${selectedEntry.name}”，可在 ${peer.name} 的其他文件夹粘贴`);
+        return;
+      }
+      if (event.key === "F2" && selectedEntry) {
+        event.preventDefault();
+        setNameDialog({ mode: "rename", entry: selectedEntry });
+        return;
+      }
+      const deleteShortcut =
+        event.key === "Delete" ||
+        (navigator.userAgent.includes("Mac") &&
+          event.metaKey &&
+          event.key === "Backspace");
+      if (deleteShortcut && selectedEntry) {
+        event.preventDefault();
+        setDeleteEntry(selectedEntry);
+      }
+    }
+    window.addEventListener("keydown", handleFileKeys);
+    return () => window.removeEventListener("keydown", handleFileKeys);
+  }, [peer?.id, peer?.name, selectedEntry]);
 
   async function refresh(): Promise<void> {
     if (!peer) return;
@@ -1141,7 +1225,7 @@ function FilesystemPanel(props: { state: UiState }): React.JSX.Element {
       try {
         content = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
       } catch {
-        setMessage("这是二进制文件，请拖到下方区域复制到本机后打开");
+        setMessage("这是二进制文件，可直接拖到 Finder 或文件资源管理器后打开");
         return;
       }
       setEditor({
@@ -1182,65 +1266,151 @@ function FilesystemPanel(props: { state: UiState }): React.JSX.Element {
     }
   }
 
-  async function createEntry(directory: boolean): Promise<void> {
-    if (!peer || !path) return;
-    const name = window.prompt(directory ? "新文件夹名称" : "新文件名称")?.trim();
-    if (!name || name.includes("/") || name.includes("\\")) return;
-    const target = joinRemotePath(path, name);
-    try {
-      const response = await crosscopy.filesystemRequest(peer.id, {
-        type: directory ? "createDirectory" : "createFile",
-        path: target
-      });
-      if (response.type === "error") setMessage(response.message);
-      else await refresh();
-    } catch (reason) {
-      setMessage(errorText(reason, "新建失败"));
+  async function submitNameDialog(name: string): Promise<void> {
+    if (!peer || !path || !nameDialog) return;
+    const value = name.trim();
+    if (!value || value.includes("/") || value.includes("\\")) {
+      throw new Error("名称不能为空，也不能包含斜杠");
     }
-  }
-
-  async function renameSelected(): Promise<void> {
-    if (!peer || !selectedPath) return;
-    const current = entries.find((entry) => entry.path === selectedPath);
-    if (!current) return;
-    const name = window.prompt("输入新名称", current.name)?.trim();
-    if (!name || name === current.name || name.includes("/") || name.includes("\\")) return;
-    const parent = parentRemotePath(current.path);
-    if (!parent) return;
     try {
-      const response = await crosscopy.filesystemRequest(peer.id, {
-        type: "rename",
-        path: current.path,
-        destination: joinRemotePath(parent, name)
-      });
-      if (response.type === "error") setMessage(response.message);
-      else {
+      const response =
+        nameDialog.mode === "rename" && nameDialog.entry
+          ? await crosscopy.filesystemRequest(peer.id, {
+              type: "rename",
+              path: nameDialog.entry.path,
+              destination: joinRemotePath(
+                parentRemotePath(nameDialog.entry.path) ?? path,
+                value
+              )
+            })
+          : await crosscopy.filesystemRequest(peer.id, {
+              type:
+                nameDialog.mode === "folder"
+                  ? "createDirectory"
+                  : "createFile",
+              path: joinRemotePath(path, value)
+            });
+      if (response.type === "error") throw new Error(response.message);
+      if (nameDialog.mode === "rename") {
         setSelectedPath("");
-        await refresh();
       }
+      setNameDialog(null);
+      await refresh();
     } catch (reason) {
-      setMessage(errorText(reason, "重命名失败"));
+      throw new Error(errorText(reason, "操作失败"));
     }
   }
 
-  async function removeSelected(): Promise<void> {
-    if (!peer || !selectedPath) return;
-    const current = entries.find((entry) => entry.path === selectedPath);
-    if (!current || !window.confirm(`确定永久删除“${current.name}”吗？`)) return;
+  async function confirmRemove(): Promise<void> {
+    if (!peer || !deleteEntry) return;
+    const current = deleteEntry;
+    setDeleteEntry(null);
     try {
       const response = await crosscopy.filesystemRequest(peer.id, {
         type: "remove",
         path: current.path,
         recursive: current.directory
       });
-      if (response.type === "error") setMessage(response.message);
-      else {
-        setSelectedPath("");
-        await refresh();
-      }
+      if (response.type === "error") throw new Error(response.message);
+      setSelectedPath("");
+      await refresh();
     } catch (reason) {
       setMessage(errorText(reason, "删除失败"));
     }
+  }
+
+  function copyRemote(entry: FsEntry): void {
+    if (!peer) return;
+    setRemoteClipboard({ peerId: peer.id, paths: [entry.path] });
+    setMessage(`已复制“${entry.name}”，可在 ${peer.name} 的其他文件夹粘贴`);
+  }
+
+  async function pasteRemote(): Promise<void> {
+    if (!peer || !path || remoteClipboard?.peerId !== peer.id) return;
+    setContextMenu(null);
+    setMessage("正在复制远端项目…");
+    try {
+      const response = await crosscopy.filesystemRequest(peer.id, {
+        type: "paste",
+        paths: remoteClipboard.paths,
+        destination: path
+      });
+      if (response.type === "error") throw new Error(response.message);
+      setMessage("已粘贴到当前文件夹");
+      await refresh();
+    } catch (reason) {
+      setMessage(errorText(reason, "粘贴失败"));
+    }
+  }
+
+  async function showProperties(entry: FsEntry): Promise<void> {
+    if (!peer) return;
+    setContextMenu(null);
+    setPropertiesLoading(true);
+    setProperties({
+      entry,
+      itemCount: entry.directory ? 0 : 1,
+      totalSize: entry.size
+    });
+    try {
+      const response = await crosscopy.filesystemRequest(peer.id, {
+        type: "properties",
+        path: entry.path
+      });
+      if (response.type === "error") throw new Error(response.message);
+      if (response.type === "properties") setProperties(response.properties);
+    } catch (reason) {
+      setMessage(errorText(reason, "无法读取文件属性"));
+    } finally {
+      setPropertiesLoading(false);
+    }
+  }
+
+  function prepareRemoteDrag(entry: FsEntry): Promise<string[]> {
+    const cached = dragCache.current.get(entry.path);
+    if (cached) return Promise.resolve(cached);
+    const active = dragPreparations.current.get(entry.path);
+    if (active) return active;
+    if (!peer) return Promise.reject(new Error("设备不可用"));
+    setPreparingDragPath(entry.path);
+    setMessage(`正在准备“${entry.name}”，完成后将进入系统拖放`);
+    const preparation = crosscopy
+      .filesystemPrepareDrag(peer.id, [entry.path])
+      .then((paths) => {
+        dragCache.current.set(entry.path, paths);
+        return paths;
+      })
+      .finally(() => {
+        dragPreparations.current.delete(entry.path);
+        setPreparingDragPath((value) => (value === entry.path ? "" : value));
+      });
+    dragPreparations.current.set(entry.path, preparation);
+    return preparation;
+  }
+
+  async function startNativeDrag(entry: FsEntry): Promise<void> {
+    try {
+      const paths = await prepareRemoteDrag(entry);
+      await crosscopy.filesystemStartDrag(paths);
+      setMessage("");
+    } catch (reason) {
+      dragCache.current.delete(entry.path);
+      setMessage(errorText(reason, "无法启动系统文件拖放"));
+    }
+  }
+
+  function showContextMenu(
+    event: React.MouseEvent,
+    entry: FsEntry | null
+  ): void {
+    event.preventDefault();
+    event.stopPropagation();
+    if (entry) setSelectedPath(entry.path);
+    setContextMenu({
+      x: Math.min(event.clientX, window.innerWidth - 224),
+      y: Math.min(event.clientY, window.innerHeight - 330),
+      entry
+    });
   }
 
   async function download(paths: string[]): Promise<void> {
@@ -1297,30 +1467,9 @@ function FilesystemPanel(props: { state: UiState }): React.JSX.Element {
         </button>
       </div>
 
-      <div className="filesystem-actions">
-        <button type="button" disabled={!path} onClick={() => void createEntry(true)}>
-          <Folder size={16} /> 新建文件夹
-        </button>
-        <button type="button" disabled={!path} onClick={() => void createEntry(false)}>
-          <File size={16} /> 新建文件
-        </button>
-        <button type="button" disabled={!selectedPath} onClick={() => void renameSelected()}>
-          <PencilSimple size={16} /> 重命名
-        </button>
-        <button type="button" disabled={!selectedPath} onClick={() => void removeSelected()}>
-          <Trash size={16} /> 删除
-        </button>
-        <button
-          type="button"
-          disabled={!selectedPath}
-          onClick={() => void download([selectedPath])}
-        >
-          <DownloadSimple size={16} /> 复制到本机
-        </button>
-      </div>
       <div className="filesystem-upload-hint">
         <ArrowUpRight size={14} />
-        打开目标文件夹后，可从 Finder 或文件资源管理器拖入，也可复制文件后在这里粘贴
+        拖入可上传到 {peer?.name}，向外拖可复制到 Finder 或文件资源管理器，右键查看更多操作
       </div>
 
       <div
@@ -1328,7 +1477,15 @@ function FilesystemPanel(props: { state: UiState }): React.JSX.Element {
           externalDragging ? "external-dragging" : ""
         }`}
       >
-        <div className="filesystem-list" aria-busy={loading}>
+        <div
+          className="filesystem-list"
+          aria-busy={loading}
+          onClick={() => {
+            setSelectedPath("");
+            setContextMenu(null);
+          }}
+          onContextMenu={(event) => showContextMenu(event, null)}
+        >
           <div className="filesystem-list-head">
             <span>名称</span><span>修改时间</span><span>大小</span>
           </div>
@@ -1341,13 +1498,20 @@ function FilesystemPanel(props: { state: UiState }): React.JSX.Element {
               <button
                 type="button"
                 key={entry.path}
-                className={`filesystem-entry ${selectedPath === entry.path ? "selected" : ""}`}
-                onClick={() => setSelectedPath(entry.path)}
+                className={`filesystem-entry ${
+                  selectedPath === entry.path ? "selected" : ""
+                } ${preparingDragPath === entry.path ? "preparing" : ""}`}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  setSelectedPath(entry.path);
+                  setContextMenu(null);
+                }}
                 onDoubleClick={() => void openEntry(entry)}
+                onContextMenu={(event) => showContextMenu(event, entry)}
                 draggable
                 onDragStart={(event) => {
-                  event.dataTransfer.setData("application/x-crosscopy-path", entry.path);
-                  event.dataTransfer.effectAllowed = "copy";
+                  event.preventDefault();
+                  void startNativeDrag(entry);
                 }}
               >
                 <span>
@@ -1355,27 +1519,11 @@ function FilesystemPanel(props: { state: UiState }): React.JSX.Element {
                   <b>{entry.name}</b>
                   {entry.readonly && <small>只读</small>}
                 </span>
-                <time>{entry.modifiedAt ? formatDateTime(entry.modifiedAt) : "—"}</time>
-                <span>{entry.directory ? "—" : formatBytes(entry.size)}</span>
+                <time>{entry.modifiedAt ? formatDateTime(entry.modifiedAt) : "-"}</time>
+                <span>{entry.directory ? "-" : formatBytes(entry.size)}</span>
               </button>
             ))
           )}
-        </div>
-        <div
-          className="filesystem-drop"
-          onDragOver={(event) => {
-            event.preventDefault();
-            event.dataTransfer.dropEffect = "copy";
-          }}
-          onDrop={(event) => {
-            event.preventDefault();
-            const remotePath = event.dataTransfer.getData("application/x-crosscopy-path");
-            if (remotePath) void download([remotePath]);
-          }}
-        >
-          <DownloadSimple size={25} />
-          <strong>拖到这里复制到本机</strong>
-          <span>文件和文件夹会保存到“下载/CrossCopy”</span>
         </div>
         {externalDragging && (
           <div className="filesystem-upload-overlay">
@@ -1387,6 +1535,151 @@ function FilesystemPanel(props: { state: UiState }): React.JSX.Element {
       </div>
 
       {message && <div className="filesystem-message">{message}</div>}
+
+      {contextMenu && (
+        <div
+          className="file-context-menu"
+          role="menu"
+          style={{ left: contextMenu.x, top: contextMenu.y }}
+          onMouseDown={(event) => event.stopPropagation()}
+        >
+          {contextMenu.entry && (
+            <>
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  setContextMenu(null);
+                  void openEntry(contextMenu.entry!);
+                }}
+              >
+                <FolderOpen size={16} />
+                打开
+              </button>
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  copyRemote(contextMenu.entry!);
+                  setContextMenu(null);
+                }}
+              >
+                <Copy size={16} />
+                复制
+                <kbd>{navigator.userAgent.includes("Mac") ? "⌘C" : "Ctrl+C"}</kbd>
+              </button>
+            </>
+          )}
+          <button
+            type="button"
+            role="menuitem"
+            disabled={!path || remoteClipboard?.peerId !== peer?.id}
+            onClick={() => void pasteRemote()}
+          >
+            <Clipboard size={16} />
+            粘贴
+            <kbd>{navigator.userAgent.includes("Mac") ? "⌘V" : "Ctrl+V"}</kbd>
+          </button>
+          <div className="file-context-separator" />
+          <button
+            type="button"
+            role="menuitem"
+            disabled={!path}
+            onClick={() => {
+              setContextMenu(null);
+              setNameDialog({ mode: "folder", entry: null });
+            }}
+          >
+            <FolderPlus size={16} />
+            新建文件夹
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            disabled={!path}
+            onClick={() => {
+              setContextMenu(null);
+              setNameDialog({ mode: "file", entry: null });
+            }}
+          >
+            <FilePlus size={16} />
+            新建文件
+          </button>
+          {contextMenu.entry && (
+            <>
+              <div className="file-context-separator" />
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  setContextMenu(null);
+                  setNameDialog({ mode: "rename", entry: contextMenu.entry });
+                }}
+              >
+                <PencilSimple size={16} />
+                重命名
+                <kbd>F2</kbd>
+              </button>
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  setContextMenu(null);
+                  void download([contextMenu.entry!.path]);
+                }}
+              >
+                <DownloadSimple size={16} />
+                下载到本机
+              </button>
+              <button
+                className="danger"
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  setDeleteEntry(contextMenu.entry);
+                  setContextMenu(null);
+                }}
+              >
+                <Trash size={16} />
+                移到废纸篓/回收站
+              </button>
+              <div className="file-context-separator" />
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => void showProperties(contextMenu.entry!)}
+              >
+                <Info size={16} />
+                查看属性
+              </button>
+            </>
+          )}
+        </div>
+      )}
+
+      {nameDialog && (
+        <FileNameDialog
+          state={nameDialog}
+          onClose={() => setNameDialog(null)}
+          onSubmit={submitNameDialog}
+        />
+      )}
+
+      {deleteEntry && (
+        <ConfirmFileDelete
+          entry={deleteEntry}
+          onClose={() => setDeleteEntry(null)}
+          onConfirm={confirmRemove}
+        />
+      )}
+
+      {properties && (
+        <FilePropertiesDialog
+          properties={properties}
+          loading={propertiesLoading}
+          onClose={() => setProperties(null)}
+        />
+      )}
 
       {editor && (
         <div className="editor-backdrop">
@@ -1409,6 +1702,217 @@ function FilesystemPanel(props: { state: UiState }): React.JSX.Element {
           </section>
         </div>
       )}
+    </div>
+  );
+}
+
+function FileNameDialog(props: {
+  state: FileNameDialogState;
+  onClose(): void;
+  onSubmit(name: string): Promise<void>;
+}): React.JSX.Element {
+  const initialName =
+    props.state.mode === "rename"
+      ? (props.state.entry?.name ?? "")
+      : props.state.mode === "folder"
+        ? "未命名文件夹"
+        : "未命名文件";
+  const [name, setName] = useState(initialName);
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState("");
+  const input = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    const field = input.current;
+    if (!field) return;
+    field.focus();
+    const dot = name.lastIndexOf(".");
+    field.setSelectionRange(
+      0,
+      props.state.mode === "rename" && dot > 0 ? dot : name.length
+    );
+  }, []);
+
+  async function submit(event: React.FormEvent): Promise<void> {
+    event.preventDefault();
+    setSubmitting(true);
+    setError("");
+    try {
+      await props.onSubmit(name);
+    } catch (reason) {
+      setError(errorText(reason, "操作失败"));
+      setSubmitting(false);
+    }
+  }
+
+  const title =
+    props.state.mode === "rename"
+      ? "重命名"
+      : props.state.mode === "folder"
+        ? "新建文件夹"
+        : "新建文件";
+
+  return (
+    <div className="editor-backdrop" onMouseDown={props.onClose}>
+      <form
+        className="file-dialog file-name-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="file-name-dialog-title"
+        onMouseDown={(event) => event.stopPropagation()}
+        onSubmit={(event) => void submit(event)}
+      >
+        <header>
+          <span className="file-dialog-icon">
+            {props.state.mode === "folder" ? (
+              <FolderPlus size={19} />
+            ) : (
+              <FilePlus size={19} />
+            )}
+          </span>
+          <div>
+            <h3 id="file-name-dialog-title">{title}</h3>
+            <p>操作会直接发生在远端电脑。</p>
+          </div>
+        </header>
+        <label>
+          名称
+          <input
+            ref={input}
+            value={name}
+            disabled={submitting}
+            onChange={(event) => setName(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Escape") props.onClose();
+            }}
+          />
+        </label>
+        {error && <p className="file-dialog-error">{error}</p>}
+        <footer>
+          <button type="button" disabled={submitting} onClick={props.onClose}>
+            取消
+          </button>
+          <button className="primary-button" type="submit" disabled={submitting}>
+            {submitting ? "处理中…" : title}
+          </button>
+        </footer>
+      </form>
+    </div>
+  );
+}
+
+function ConfirmFileDelete(props: {
+  entry: FsEntry;
+  onClose(): void;
+  onConfirm(): Promise<void>;
+}): React.JSX.Element {
+  const [submitting, setSubmitting] = useState(false);
+
+  return (
+    <div className="editor-backdrop" onMouseDown={props.onClose}>
+      <section
+        className="file-dialog confirm-file-dialog"
+        role="alertdialog"
+        aria-modal="true"
+        aria-labelledby="confirm-file-delete-title"
+        onMouseDown={(event) => event.stopPropagation()}
+      >
+        <header>
+          <span className="file-dialog-icon danger">
+            <Trash size={19} />
+          </span>
+          <div>
+            <h3 id="confirm-file-delete-title">移到废纸篓/回收站？</h3>
+            <p>“{props.entry.name}”会移到远端电脑的系统回收位置。</p>
+          </div>
+        </header>
+        <footer>
+          <button type="button" disabled={submitting} onClick={props.onClose}>
+            取消
+          </button>
+          <button
+            className="danger-button"
+            type="button"
+            disabled={submitting}
+            onClick={() => {
+              setSubmitting(true);
+              void props.onConfirm();
+            }}
+          >
+            {submitting ? "正在移动…" : "移到废纸篓/回收站"}
+          </button>
+        </footer>
+      </section>
+    </div>
+  );
+}
+
+function FilePropertiesDialog(props: {
+  properties: FsProperties;
+  loading: boolean;
+  onClose(): void;
+}): React.JSX.Element {
+  const { entry, itemCount, totalSize } = props.properties;
+  const type = entry.directory
+    ? "文件夹"
+    : entry.name.includes(".")
+      ? `${entry.name.split(".").pop()?.toUpperCase()} 文件`
+      : "文件";
+
+  return (
+    <div className="editor-backdrop" onMouseDown={props.onClose}>
+      <section
+        className="file-dialog file-properties-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="file-properties-title"
+        onMouseDown={(event) => event.stopPropagation()}
+      >
+        <header>
+          <span className="file-properties-icon">
+            {entry.directory ? <FolderOpen size={28} /> : <File size={28} />}
+          </span>
+          <div>
+            <h3 id="file-properties-title" title={entry.name}>
+              {entry.name}
+            </h3>
+            <p>{type}</p>
+          </div>
+        </header>
+        <dl>
+          <div>
+            <dt>大小</dt>
+            <dd>
+              {props.loading
+                ? "正在计算…"
+                : entry.directory
+                  ? `${formatBytes(totalSize)}（${itemCount} 个项目）`
+                  : formatBytes(totalSize)}
+            </dd>
+          </div>
+          <div>
+            <dt>位置</dt>
+            <dd title={entry.path}>{entry.path}</dd>
+          </div>
+          <div>
+            <dt>修改时间</dt>
+            <dd>{entry.modifiedAt ? formatDateTime(entry.modifiedAt) : "未知"}</dd>
+          </div>
+          <div>
+            <dt>属性</dt>
+            <dd>
+              {[entry.readonly && "只读", entry.hidden && "隐藏"]
+                .filter(Boolean)
+                .join("、") || "普通"}
+            </dd>
+          </div>
+        </dl>
+        <footer>
+          <button className="primary-button" type="button" onClick={props.onClose}>
+            完成
+          </button>
+        </footer>
+      </section>
     </div>
   );
 }

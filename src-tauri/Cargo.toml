@@ -1,6 +1,6 @@
 [package]
 name = "crosscopy"
-version = "3.0.2"
+version = "3.1.0"
 description = "Fast private LAN mouse sharing and clipboard sync"
 authors = ["CrossCopy"]
 edition = "2021"
@@ -36,6 +36,10 @@ tauri-plugin-updater = "2"
 tokio = { version = "1", features = ["full"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 walkdir = "2"
+
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+drag = "2.1.1"
+trash = "5.2.6"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"

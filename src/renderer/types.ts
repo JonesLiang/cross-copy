@@ -22,10 +22,17 @@ export type FsEntry = {
   hidden: boolean;
 };
 
+export type FsProperties = {
+  entry: FsEntry;
+  itemCount: number;
+  totalSize: number;
+};
+
 export type FsRequest =
   | { type: "roots" }
   | { type: "list"; path: string }
   | { type: "metadata"; path: string }
+  | { type: "properties"; path: string }
   | { type: "read"; path: string }
   | { type: "readRange"; path: string; offset: number; length: number }
   | {
@@ -38,6 +45,7 @@ export type FsRequest =
   | { type: "createFile"; path: string }
   | { type: "rename"; path: string; destination: string }
   | { type: "copy"; path: string; destination: string }
+  | { type: "paste"; paths: string[]; destination: string }
   | { type: "remove"; path: string; recursive: boolean };
 
 export type FsResponse =
@@ -58,6 +66,7 @@ export type FsResponse =
       eof: boolean;
     }
   | { type: "done"; entry: FsEntry | null }
+  | { type: "properties"; properties: FsProperties }
   | { type: "error"; message: string };
 
 export type UiState = {

@@ -142,6 +142,80 @@ async fn filesystem_upload_clipboard(
 }
 
 #[tauri::command]
+async fn filesystem_prepare_drag(
+    core: State<'_, Arc<Core>>,
+    peer_id: String,
+    paths: Vec<String>,
+) -> Result<Vec<String>, String> {
+    Arc::clone(core.inner())
+        .filesystem_prepare_drag(peer_id, paths)
+        .await
+}
+
+#[tauri::command]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn filesystem_start_drag(app: tauri::AppHandle, paths: Vec<String>) -> Result<(), String> {
+    if paths.is_empty() || paths.len() > 128 {
+        return Err("请选择 1 到 128 个文件或文件夹".into());
+    }
+    let cache_root = app
+        .path()
+        .app_cache_dir()
+        .map_err(|error| error.to_string())?
+        .join("drag-cache")
+        .canonicalize()
+        .map_err(|error| format!("拖放缓存不存在：{error}"))?;
+    let mut cached_paths = Vec::with_capacity(paths.len());
+    for value in paths {
+        let path = std::fs::canonicalize(value).map_err(|error| error.to_string())?;
+        if !path.starts_with(&cache_root) {
+            return Err("只允许拖出 CrossCopy 临时缓存中的文件".into());
+        }
+        cached_paths.push(path);
+    }
+    let session_name = cached_paths
+        .first()
+        .and_then(|path| path.strip_prefix(&cache_root).ok())
+        .and_then(|path| path.components().next())
+        .and_then(|component| match component {
+            std::path::Component::Normal(value) => Some(value.to_os_string()),
+            _ => None,
+        })
+        .ok_or("拖放缓存会话无效")?;
+    let session_directory = cache_root.join(session_name);
+    if cached_paths
+        .iter()
+        .any(|path| path == &session_directory || !path.starts_with(&session_directory))
+    {
+        return Err("拖放文件不属于同一缓存会话".into());
+    }
+    let window = app.get_webview_window("main").ok_or("主窗口不存在")?;
+    app.run_on_main_thread(move || {
+        let cleanup_directory = session_directory.clone();
+        let _ = drag::start_drag(
+            &window,
+            drag::DragItem::Files(cached_paths),
+            drag::Image::Raw(include_bytes!("../icons/128x128.png").to_vec()),
+            move |_result, _position| {
+                let directory = cleanup_directory.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_secs(15 * 60));
+                    let _ = std::fs::remove_dir_all(directory);
+                });
+            },
+            drag::Options::default(),
+        );
+    })
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn filesystem_start_drag(_app: tauri::AppHandle, _paths: Vec<String>) -> Result<(), String> {
+    Err("当前系统暂不支持向文件管理器拖出文件".into())
+}
+
+#[tauri::command]
 fn set_peer_mouse_dpi(core: State<'_, Arc<Core>>, peer_id: String, dpi: u16) -> Result<(), String> {
     core.set_peer_mouse_dpi(peer_id, dpi)
 }
@@ -452,6 +526,8 @@ pub fn run() {
             filesystem_download,
             filesystem_upload,
             filesystem_upload_clipboard,
+            filesystem_prepare_drag,
+            filesystem_start_drag,
             set_peer_mouse_dpi,
             switch_mouse_to_screen,
             set_launch_at_login,
