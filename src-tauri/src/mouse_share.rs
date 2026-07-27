@@ -108,6 +108,7 @@ struct OutgoingSession {
     last_move_sent_at: u64,
     last_sent_x_milli: i64,
     last_sent_y_milli: i64,
+    first_move_logged: bool,
     scroll_sequence: u64,
     total_scroll_x_milli: i64,
     total_scroll_y_milli: i64,
@@ -392,6 +393,7 @@ impl MouseShare {
                 if sequence <= incoming.last_move_sequence {
                     return responses;
                 }
+                let is_first_move = incoming.last_move_sequence == 0;
                 incoming.last_event_at = now_ms();
                 let delta_x_milli = total_x_milli.saturating_sub(incoming.last_total_x_milli);
                 let delta_y_milli = total_y_milli.saturating_sub(incoming.last_total_y_milli);
@@ -408,6 +410,14 @@ impl MouseShare {
                     .clamp(0, i64::from(height - 1) * LOGICAL_PIXEL_MILLI);
                 let next_x = milli_to_pixel(next_x_milli);
                 let next_y = milli_to_pixel(next_y_milli);
+                if is_first_move {
+                    self.inner.logger.info(
+                        "mouse_incoming_first_move",
+                        format!(
+                            "delta_x_milli={delta_x_milli} delta_y_milli={delta_y_milli} next_x={next_x} next_y={next_y}"
+                        ),
+                    );
+                }
                 if distance_from_edge(incoming.return_edge, next_x, next_y, width, height)
                     >= RETURN_ARM_DISTANCE_PIXELS
                 {
@@ -507,6 +517,9 @@ impl MouseShare {
                     })
                     .map(|session| session.exit_edge);
                 if let Some(exit_edge) = cancelled_edge {
+                    self.inner
+                        .logger
+                        .warn("mouse_outgoing_cancelled", "reason=remote_cancel");
                     runtime.outgoing = None;
                     let point =
                         safe_source_point(exit_edge, runtime.last_x, runtime.last_y, width, height);
@@ -535,6 +548,11 @@ impl MouseShare {
                     outgoing.acknowledged = true;
                     outgoing.last_remote_at = now_ms();
                     let latency = now_ms().saturating_sub(sent_at).div_ceil(2);
+                    if !was_acknowledged {
+                        self.inner
+                            .logger
+                            .info("mouse_outgoing_ack", format!("latency_ms={latency}"));
+                    }
                     self.inner.latency_ms.store(latency, Ordering::Relaxed);
                     responses.push(outbound(
                         peer_id,
@@ -771,6 +789,10 @@ impl Inner {
         let (width, height) = (self.screen_width, self.screen_height);
         let mut runtime = self.runtime.lock().expect("mouse runtime lock");
         if let Some(incoming) = runtime.incoming.take() {
+            self.logger.warn(
+                "mouse_incoming_cancelled",
+                format!("reason=local_physical_input event={}", event_kind(event)),
+            );
             if let HookMouseEvent::Move { x, y, .. } = event {
                 runtime.last_x = x;
                 runtime.last_y = y;
@@ -801,6 +823,13 @@ impl Inner {
                     let delta_y = clamp_physical_delta(raw_delta_y);
                     should_recenter = true;
                     if delta_x != 0 || delta_y != 0 {
+                        if !outgoing.first_move_logged {
+                            outgoing.first_move_logged = true;
+                            self.logger.info(
+                                "mouse_outgoing_first_move",
+                                format!("delta_x={delta_x} delta_y={delta_y}"),
+                            );
+                        }
                         outgoing.total_x_milli = outgoing
                             .total_x_milli
                             .saturating_add(i64::from(delta_x) * LOGICAL_500_DPI_GAIN_MILLI);
@@ -914,6 +943,7 @@ impl Inner {
                         last_move_sent_at: 0,
                         last_sent_x_milli: 0,
                         last_sent_y_milli: 0,
+                        first_move_logged: false,
                         scroll_sequence: 0,
                         total_scroll_x_milli: 0,
                         total_scroll_y_milli: 0,
@@ -930,7 +960,16 @@ impl Inner {
                             sent_at,
                         },
                     ));
+                    self.logger.info(
+                        "mouse_outgoing_enter",
+                        format!("edge={position:?} ratio={ratio:.3}"),
+                    );
                     drop(runtime);
+                    #[cfg(target_os = "macos")]
+                    if let Err(error) = set_cursor_visible(false) {
+                        self.logger.warn("mouse_cursor_hide_failed", error);
+                    }
+                    #[cfg(target_os = "windows")]
                     self.inject(HookMouseEvent::CursorVisible(false));
                     let _ = recenter_cursor(anchor_x, anchor_y, width, height);
                     return true;
@@ -1121,6 +1160,15 @@ fn to_hook_button(button: SharedMouseButton) -> HookMouseButton {
         SharedMouseButton::Left => HookMouseButton::Left,
         SharedMouseButton::Right => HookMouseButton::Right,
         SharedMouseButton::Middle => HookMouseButton::Middle,
+    }
+}
+
+fn event_kind(event: HookMouseEvent) -> &'static str {
+    match event {
+        HookMouseEvent::Move { .. } => "move",
+        HookMouseEvent::Button { .. } => "button",
+        HookMouseEvent::Scroll { .. } => "scroll",
+        HookMouseEvent::CursorVisible(_) => "cursor_visibility",
     }
 }
 

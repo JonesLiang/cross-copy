@@ -15,26 +15,28 @@ struct LogState {
     bytes: u64,
 }
 
-pub struct Logger {
-    directory: PathBuf,
+struct LogTarget {
+    name: &'static str,
     current: PathBuf,
     state: Mutex<LogState>,
+}
+
+pub struct Logger {
+    directory: PathBuf,
+    general: LogTarget,
+    mouse: LogTarget,
+    clipboard: LogTarget,
 }
 
 impl Logger {
     pub fn new(app_directory: &Path) -> io::Result<Self> {
         let directory = app_directory.join("logs");
         fs::create_dir_all(&directory)?;
-        let current = directory.join("crosscopy.log");
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&current)?;
-        let bytes = file.metadata()?.len();
         Ok(Self {
+            general: open_target(&directory, "crosscopy.log")?,
+            mouse: open_target(&directory, "mouse.log")?,
+            clipboard: open_target(&directory, "clipboard.log")?,
             directory,
-            current,
-            state: Mutex::new(LogState { file, bytes }),
         })
     }
 
@@ -65,15 +67,9 @@ impl Logger {
             std::env::consts::ARCH
         )?;
         writeln!(output, "{summary}")?;
-        writeln!(output, "\n--- recent logs ---")?;
-
-        for index in (1..=ROTATED_LOGS).rev() {
-            self.append_file(
-                &self.directory.join(format!("crosscopy.log.{index}")),
-                &mut output,
-            )?;
-        }
-        self.append_file(&self.current, &mut output)?;
+        self.append_target("general logs", &self.general, &mut output)?;
+        self.append_target("mouse logs", &self.mouse, &mut output)?;
+        self.append_target("clipboard logs", &self.clipboard, &mut output)?;
         output.flush()?;
         Ok(destination)
     }
@@ -90,10 +86,13 @@ impl Logger {
             event,
             clean_detail
         );
-        let Ok(mut state) = self.state.lock() else {
+        let target = self.target(event);
+        let Ok(mut state) = target.state.lock() else {
             return;
         };
-        if state.bytes + line.len() as u64 > MAX_LOG_BYTES && self.rotate(&mut state).is_err() {
+        if state.bytes + line.len() as u64 > MAX_LOG_BYTES
+            && self.rotate(target, &mut state).is_err()
+        {
             return;
         }
         if state.file.write_all(line.as_bytes()).is_ok() {
@@ -102,9 +101,19 @@ impl Logger {
         }
     }
 
-    fn rotate(&self, state: &mut LogState) -> io::Result<()> {
+    fn target(&self, event: &str) -> &LogTarget {
+        if event.starts_with("mouse_") {
+            &self.mouse
+        } else if is_clipboard_event(event) {
+            &self.clipboard
+        } else {
+            &self.general
+        }
+    }
+
+    fn rotate(&self, target: &LogTarget, state: &mut LogState) -> io::Result<()> {
         state.file.flush()?;
-        let placeholder_path = self.directory.join("crosscopy.rotate.tmp");
+        let placeholder_path = self.directory.join(format!("{}.rotate.tmp", target.name));
         let placeholder = OpenOptions::new()
             .create(true)
             .append(true)
@@ -113,11 +122,12 @@ impl Logger {
         drop(old_file);
         for index in (1..=ROTATED_LOGS).rev() {
             let source = if index == 1 {
-                self.current.clone()
+                target.current.clone()
             } else {
-                self.directory.join(format!("crosscopy.log.{}", index - 1))
+                self.directory
+                    .join(format!("{}.{}", target.name, index - 1))
             };
-            let destination = self.directory.join(format!("crosscopy.log.{index}"));
+            let destination = self.directory.join(format!("{}.{index}", target.name));
             if source.exists() {
                 if destination.exists() {
                     fs::remove_file(&destination)?;
@@ -128,10 +138,21 @@ impl Logger {
         state.file = OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&self.current)?;
+            .open(&target.current)?;
         let _ = fs::remove_file(placeholder_path);
         state.bytes = 0;
         Ok(())
+    }
+
+    fn append_target(&self, title: &str, target: &LogTarget, output: &mut File) -> io::Result<()> {
+        writeln!(output, "\n--- {title} ---")?;
+        for index in (1..=ROTATED_LOGS).rev() {
+            self.append_file(
+                &self.directory.join(format!("{}.{index}", target.name)),
+                output,
+            )?;
+        }
+        self.append_file(&target.current, output)
     }
 
     fn append_file(&self, path: &Path, output: &mut File) -> io::Result<()> {
@@ -149,6 +170,27 @@ impl Logger {
         }
         Ok(())
     }
+}
+
+fn open_target(directory: &Path, name: &'static str) -> io::Result<LogTarget> {
+    let current = directory.join(name);
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&current)?;
+    let bytes = file.metadata()?.len();
+    Ok(LogTarget {
+        name,
+        current,
+        state: Mutex::new(LogState { file, bytes }),
+    })
+}
+
+fn is_clipboard_event(event: &str) -> bool {
+    event.starts_with("clipboard_")
+        || event.starts_with("shortcut_copy_")
+        || event.starts_with("shortcut_paste_")
+        || event.starts_with("file_transfer_")
 }
 
 pub fn masked_ip(ip: IpAddr) -> String {
