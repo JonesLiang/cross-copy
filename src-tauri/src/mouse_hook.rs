@@ -1,21 +1,25 @@
 pub(crate) const SYNTHETIC_INPUT_MARKER: usize = 0x4352_4f53_5343_4f50;
 
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Mutex,
+};
 
 static SOURCE_CURSOR_CAPTURED: AtomicBool = AtomicBool::new(false);
+static SOURCE_CURSOR_LOCK: Mutex<()> = Mutex::new(());
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::sync::atomic::{AtomicI32, AtomicU64};
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 static LAST_SYNTHETIC_X: AtomicI32 = AtomicI32::new(i32::MIN);
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 static LAST_SYNTHETIC_Y: AtomicI32 = AtomicI32::new(i32::MIN);
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 static LAST_SYNTHETIC_AT: AtomicU64 = AtomicU64::new(0);
-#[cfg(target_os = "windows")]
-const SYNTHETIC_ECHO_WINDOW_MS: u64 = 24;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+const SYNTHETIC_ECHO_WINDOW_MS: u64 = 40;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DesktopBounds {
@@ -51,7 +55,6 @@ pub enum HookMouseEvent {
         key: HookKey,
         pressed: bool,
     },
-    CursorVisible(bool),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -314,22 +317,35 @@ pub fn move_cursor_absolute(x: i32, y: i32) -> Result<(), String> {
         event_source::{CGEventSource, CGEventSourceStateID},
         geometry::CGPoint,
     };
+    use std::cell::RefCell;
 
-    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
-        .map_err(|_| "无法创建 macOS 鼠标事件源".to_string())?;
-    let event = CGEvent::new_mouse_event(
-        source,
-        CGEventType::MouseMoved,
-        CGPoint::new(f64::from(x), f64::from(y)),
-        CGMouseButton::Left,
-    )
-    .map_err(|_| "无法创建 macOS 鼠标移动事件".to_string())?;
-    event.set_integer_value_field(
-        EventField::EVENT_SOURCE_USER_DATA,
-        SYNTHETIC_INPUT_MARKER as i64,
-    );
-    event.post(CGEventTapLocation::HID);
-    Ok(())
+    thread_local! {
+        static MOUSE_EVENT_SOURCE: RefCell<Option<CGEventSource>> = const { RefCell::new(None) };
+    }
+
+    MOUSE_EVENT_SOURCE.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(
+                CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+                    .map_err(|_| "无法创建 macOS 鼠标事件源".to_string())?,
+            );
+        }
+        let event = CGEvent::new_mouse_event(
+            slot.as_ref().expect("mouse event source").clone(),
+            CGEventType::MouseMoved,
+            CGPoint::new(f64::from(x), f64::from(y)),
+            CGMouseButton::Left,
+        )
+        .map_err(|_| "无法创建 macOS 鼠标移动事件".to_string())?;
+        event.set_integer_value_field(
+            EventField::EVENT_SOURCE_USER_DATA,
+            SYNTHETIC_INPUT_MARKER as i64,
+        );
+        record_synthetic_move(x, y);
+        event.post(CGEventTapLocation::HID);
+        Ok(())
+    })
 }
 
 #[cfg(target_os = "windows")]
@@ -400,7 +416,10 @@ pub fn set_cursor_visible(visible: bool) -> Result<(), String> {
 }
 
 pub fn set_source_cursor_captured(captured: bool) -> Result<(), String> {
-    let previous = SOURCE_CURSOR_CAPTURED.swap(captured, Ordering::AcqRel);
+    let _guard = SOURCE_CURSOR_LOCK
+        .lock()
+        .map_err(|_| "鼠标控制权状态锁已损坏".to_string())?;
+    let previous = SOURCE_CURSOR_CAPTURED.load(Ordering::Acquire);
     if previous == captured {
         return Ok(());
     }
@@ -421,16 +440,22 @@ pub fn set_source_cursor_captured(captured: bool) -> Result<(), String> {
             })
         };
         if let Err(error) = result {
-            SOURCE_CURSOR_CAPTURED.store(previous, Ordering::Release);
             return Err(format!("无法切换 macOS 鼠标控制权：{error:?}"));
         }
     }
     #[cfg(target_os = "windows")]
     if let Err(error) = set_cursor_visible(!captured) {
-        SOURCE_CURSOR_CAPTURED.store(previous, Ordering::Release);
         return Err(error);
     }
+    SOURCE_CURSOR_CAPTURED.store(captured, Ordering::Release);
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn record_synthetic_move(x: i32, y: i32) {
+    LAST_SYNTHETIC_X.store(x, Ordering::Relaxed);
+    LAST_SYNTHETIC_Y.store(y, Ordering::Relaxed);
+    LAST_SYNTHETIC_AT.store(monotonic_ms(), Ordering::Release);
 }
 
 #[cfg(target_os = "windows")]
@@ -475,8 +500,23 @@ pub fn run_mouse_hook(
         CGEventTapOptions::Default,
         event_types,
         move |_proxy, event_type, event: &CGEvent| {
-            if event.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA)
-                == SYNTHETIC_INPUT_MARKER as i64
+            let location = event.location();
+            let synthetic_echo = matches!(
+                event_type,
+                CGEventType::MouseMoved
+                    | CGEventType::LeftMouseDragged
+                    | CGEventType::RightMouseDragged
+                    | CGEventType::OtherMouseDragged
+            ) && monotonic_ms()
+                .saturating_sub(LAST_SYNTHETIC_AT.load(Ordering::Acquire))
+                <= SYNTHETIC_ECHO_WINDOW_MS
+                && (location.x.round() as i32).abs_diff(LAST_SYNTHETIC_X.load(Ordering::Relaxed))
+                    <= 1
+                && (location.y.round() as i32).abs_diff(LAST_SYNTHETIC_Y.load(Ordering::Relaxed))
+                    <= 1;
+            if synthetic_echo
+                || event.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA)
+                    == SYNTHETIC_INPUT_MARKER as i64
             {
                 return CallbackResult::Keep;
             }
@@ -484,17 +524,14 @@ pub fn run_mouse_hook(
                 CGEventType::MouseMoved
                 | CGEventType::LeftMouseDragged
                 | CGEventType::RightMouseDragged
-                | CGEventType::OtherMouseDragged => {
-                    let point = event.location();
-                    Some(HookMouseEvent::Move {
-                        x: point.x.round() as i32,
-                        y: point.y.round() as i32,
-                        native_delta: Some((
-                            event.get_integer_value_field(EventField::MOUSE_EVENT_DELTA_X) as i32,
-                            event.get_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y) as i32,
-                        )),
-                    })
-                }
+                | CGEventType::OtherMouseDragged => Some(HookMouseEvent::Move {
+                    x: location.x.round() as i32,
+                    y: location.y.round() as i32,
+                    native_delta: Some((
+                        event.get_integer_value_field(EventField::MOUSE_EVENT_DELTA_X) as i32,
+                        event.get_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y) as i32,
+                    )),
+                }),
                 CGEventType::LeftMouseDown => Some(HookMouseEvent::Button {
                     button: HookMouseButton::Left,
                     pressed: true,
@@ -952,7 +989,7 @@ fn windows_key(code: u16) -> Option<HookKey> {
     })
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn monotonic_ms() -> u64 {
     use std::sync::OnceLock;
     use std::time::Instant;
