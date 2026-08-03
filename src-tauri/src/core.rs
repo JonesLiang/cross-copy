@@ -63,7 +63,8 @@ const ONLINE_WINDOW_MS: u64 = 35_000;
 const CLIPBOARD_RETRY_ATTEMPTS: usize = 16;
 const CLIPBOARD_RETRY_DELAY_MS: u64 = 50;
 const ACTIVE_DISCOVERY_MS: u64 = 30_000;
-const MOUSE_PROTOCOL: u8 = 5;
+const MOUSE_PRESENCE_REFRESH_MS: u64 = 5_000;
+const MOUSE_PROTOCOL: u8 = 6;
 
 #[derive(Clone)]
 struct SeenPeer {
@@ -1516,7 +1517,26 @@ impl Core {
         let core = Arc::clone(self);
         tauri::async_runtime::spawn(async move {
             let mut last_error_log = 0_u64;
-            while let Some(outbound) = receiver.recv().await {
+            let mut pending = None;
+            loop {
+                let next_outbound = if pending.is_some() {
+                    pending.take()
+                } else {
+                    receiver.recv().await
+                };
+                let Some(mut outbound) = next_outbound else {
+                    return;
+                };
+                if matches!(&outbound.signal, MouseSignal::Move { .. }) {
+                    while let Ok(next) = receiver.try_recv() {
+                        if same_mouse_move_stream(&outbound, &next) {
+                            outbound = next;
+                        } else {
+                            pending = Some(next);
+                            break;
+                        }
+                    }
+                }
                 let publish_state = mouse_signal_changes_state(&outbound.signal);
                 if let Err(error) = core.send_mouse_signal(outbound).await {
                     let now = now_ms();
@@ -1546,7 +1566,7 @@ impl Core {
                             && seen.mouse_share_enabled()
                     })
             })
-            .map(|peer| (peer.id.clone(), peer.screen_position))
+            .map(|peer| (peer.id.clone(), peer.screen_position, peer.screen_number))
             .collect();
         let receive_dpi = settings
             .peers
@@ -1750,7 +1770,7 @@ impl Core {
         let now = now_ms();
         let previous_presence = self.last_mouse_presence_refresh.load(Ordering::Relaxed);
         let refresh_presence = publish_state
-            || (now.saturating_sub(previous_presence) >= 1_000
+            || (now.saturating_sub(previous_presence) >= MOUSE_PRESENCE_REFRESH_MS
                 && self
                     .last_mouse_presence_refresh
                     .compare_exchange(previous_presence, now, Ordering::Relaxed, Ordering::Relaxed)
@@ -1770,41 +1790,49 @@ impl Core {
                     cached.address = SocketAddr::new(source.ip(), MOUSE_PORT);
                 }
             }
-            let peer_name = self
-                .store
-                .get()
-                .peers
-                .iter()
-                .find(|peer| peer.id == packet.sender_id)
-                .map(|peer| peer.name.clone())
-                .unwrap_or_else(|| packet.sender_id.clone());
             let mut discovered = self.discovered.lock().expect("discovery lock");
             if let Some(seen) = discovered.get_mut(&packet.sender_id) {
                 seen.host = source.ip();
                 seen.last_seen = now;
                 seen.remote_mouse_enabled = Some(true);
             } else {
-                discovered.insert(
-                    packet.sender_id.clone(),
-                    SeenPeer {
-                        packet: DiscoveryPacket {
-                            app: "crosscopy".into(),
-                            protocol: 1,
-                            instance_id: String::new(),
-                            displays: Vec::new(),
-                            id: packet.sender_id.clone(),
-                            name: peer_name,
-                            port: TRANSFER_PORT,
-                            pairing_salt: None,
-                            pairing_expires_at: None,
-                            mouse_share_enabled: true,
-                            mouse_position: ScreenPosition::Right,
+                drop(discovered);
+                let peer_name = self
+                    .store
+                    .get()
+                    .peers
+                    .iter()
+                    .find(|peer| peer.id == packet.sender_id)
+                    .map(|peer| peer.name.clone())
+                    .unwrap_or_else(|| packet.sender_id.clone());
+                discovered = self.discovered.lock().expect("discovery lock");
+                if let Some(seen) = discovered.get_mut(&packet.sender_id) {
+                    seen.host = source.ip();
+                    seen.last_seen = now;
+                    seen.remote_mouse_enabled = Some(true);
+                } else {
+                    discovered.insert(
+                        packet.sender_id.clone(),
+                        SeenPeer {
+                            packet: DiscoveryPacket {
+                                app: "crosscopy".into(),
+                                protocol: 1,
+                                instance_id: String::new(),
+                                displays: Vec::new(),
+                                id: packet.sender_id.clone(),
+                                name: peer_name,
+                                port: TRANSFER_PORT,
+                                pairing_salt: None,
+                                pairing_expires_at: None,
+                                mouse_share_enabled: true,
+                                mouse_position: ScreenPosition::Right,
+                            },
+                            host: source.ip(),
+                            last_seen: now,
+                            remote_mouse_enabled: Some(true),
                         },
-                        host: source.ip(),
-                        last_seen: now,
-                        remote_mouse_enabled: Some(true),
-                    },
-                );
+                    );
+                }
             }
         }
         let responses = self.mouse.apply_remote(&packet.sender_id, signal);
@@ -3713,7 +3741,29 @@ fn now_ms() -> u64 {
 fn mouse_signal_changes_state(signal: &MouseSignal) -> bool {
     !matches!(
         signal,
-        MouseSignal::Move { .. } | MouseSignal::Scroll { .. } | MouseSignal::KeepAlive { .. }
+        MouseSignal::Move { .. }
+            | MouseSignal::Scroll { .. }
+            | MouseSignal::Key { .. }
+            | MouseSignal::KeepAlive { .. }
+    )
+}
+
+fn same_mouse_move_stream(current: &OutboundMouseSignal, next: &OutboundMouseSignal) -> bool {
+    if current.peer_id != next.peer_id {
+        return false;
+    }
+    matches!(
+        (&current.signal, &next.signal),
+        (
+            MouseSignal::Move {
+                session_id: current_session,
+                ..
+            },
+            MouseSignal::Move {
+                session_id: next_session,
+                ..
+            }
+        ) if current_session == next_session
     )
 }
 

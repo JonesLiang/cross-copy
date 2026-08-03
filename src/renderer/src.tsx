@@ -402,7 +402,7 @@ function App(): React.JSX.Element {
             onClick={() => setView("mouse")}
           >
             <MouseSimple size={18} />
-            鼠标共享
+            键鼠共享
           </button>
           <button
             className={`nav-item ${view === "settings" ? "active" : ""}`}
@@ -421,7 +421,7 @@ function App(): React.JSX.Element {
             </span>
             <span>
               <strong>{state.deviceName || "正在读取本机"}</strong>
-              <small>CrossCopy v{appVersion || "—"}</small>
+              <small>CrossCopy v{appVersion || "-"}</small>
             </span>
             <i title="本机服务正在运行" />
           </div>
@@ -442,7 +442,7 @@ function App(): React.JSX.Element {
                 : view === "filesystem"
                   ? "文件系统"
                 : view === "mouse"
-                  ? "鼠标共享"
+                  ? "键鼠共享"
                   : "设置"}
             </h1>
             <p>
@@ -451,7 +451,7 @@ function App(): React.JSX.Element {
                 : view === "filesystem"
                   ? "直接浏览和管理已授权电脑上的文件"
                 : view === "mouse"
-                  ? "把另一台电脑放到逻辑方位，鼠标即可跨越屏幕"
+                  ? "跨越屏幕控制另一台电脑的鼠标与键盘"
                 : "管理设备权限、后台启动、系统权限和诊断"}
             </p>
           </div>
@@ -2087,9 +2087,9 @@ function MousePanel(props: { state: UiState }): React.JSX.Element {
               <MouseSimple size={20} />
             </span>
             <div>
-              <h2>共享鼠标</h2>
+              <h2>共享鼠标与键盘</h2>
               <p>
-                移动到对应边缘，或按 Ctrl+Shift+屏幕编号，直接把本机鼠标切换过去。
+                键盘跟随当前鼠标控制目标。按 Ctrl+Alt+屏幕编号可直接切换，屏幕 1 返回本机。
               </p>
             </div>
           </div>
@@ -2261,7 +2261,7 @@ function MousePanel(props: { state: UiState }): React.JSX.Element {
                 立即切换
                 <kbd>
                   {selectedPeer.screenNumber <= 9
-                    ? `Ctrl Shift ${selectedPeer.screenNumber}`
+                    ? `Ctrl Alt ${selectedPeer.screenNumber}`
                     : `屏幕 ${selectedPeer.screenNumber}`}
                 </kbd>
               </button>
@@ -2295,16 +2295,16 @@ function MousePanel(props: { state: UiState }): React.JSX.Element {
           </strong>
           <small>
             {props.state.mouseShareEnabled && !props.state.mouseListenerStarted
-              ? "鼠标监听启动失败；请检查系统辅助功能权限，然后关闭并重新开启共享。"
+              ? "输入监听启动失败；请检查系统辅助功能权限，然后关闭并重新开启共享。"
               : props.state.mouseListenerStarted
-              ? "鼠标监听已按需启动；本机物理输入始终优先。"
-              : "首次开启后才会启动鼠标监听，不开启时没有额外轮询。"}
+              ? "鼠标与键盘监听已按需启动；目标电脑的本机键盘仍可同时使用。"
+              : "首次开启后才会启动输入监听，不开启时没有额外轮询。"}
           </small>
         </section>
       </div>
 
       <section className="mouse-support-note">
-        扩展屏会作为同一电脑的固定屏幕组；镜像屏自动合并为一个逻辑屏幕。当前仅转发鼠标移动、左键、右键、滚轮滚动和滚轮按下。
+        扩展屏会作为同一电脑的固定屏幕组，镜像屏自动合并。键盘按目标电脑的系统配置处理，目标电脑自己的键盘仍可同时使用。
       </section>
     </div>
   );
@@ -2326,7 +2326,7 @@ function PeerDpiControl(props: {
   async function save(): Promise<void> {
     const parsed = Number.parseInt(draft, 10);
     if (!Number.isFinite(parsed) || parsed < 100 || parsed > 2000) {
-      setMessage("请输入 100–2000");
+      setMessage("请输入 100-2000");
       return;
     }
     const dpi = Math.round(parsed);
@@ -2402,12 +2402,12 @@ function ShortcutSettings(props: {
         </span>
         <div>
           <h2>
-            {props.mode === "clipboard" ? "剪贴板快捷键" : "鼠标共享快捷键"}
+            {props.mode === "clipboard" ? "剪贴板快捷键" : "键鼠共享快捷键"}
           </h2>
           <p>
             {props.mode === "clipboard"
               ? "专用组合键不会覆盖普通复制和粘贴。"
-              : "用于快速开启或关闭鼠标共享。"}
+              : "用于快速开启或关闭键鼠共享。"}
           </p>
         </div>
       </div>
@@ -2419,7 +2419,7 @@ function ShortcutSettings(props: {
           </>
         ) : (
           <ShortcutInput
-            label="开启或关闭鼠标共享"
+            label="开启或关闭键鼠共享"
             value={mouse}
             onChange={setMouse}
           />
@@ -2548,7 +2548,7 @@ function SettingsPanel(props: {
           <div className="preference-row">
             <span>
               <strong>辅助功能权限</strong>
-              <small>用于跨设备快捷键和鼠标控制，不会转发键盘输入</small>
+              <small>用于全局快捷键以及跨设备鼠标和键盘控制</small>
             </span>
             <button
               className="secondary-button"

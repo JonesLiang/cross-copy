@@ -327,11 +327,17 @@ fn set_shortcuts(
     {
         return Err("不能占用系统原生复制或粘贴快捷键，请增加 Shift 或 Alt".into());
     }
-    if [copy.as_str(), paste.as_str(), mouse.as_str()]
+    if [&copy_parsed, &paste_parsed, &mouse_parsed]
         .iter()
-        .any(|value| screen_shortcuts().iter().any(|screen| screen == value))
+        .any(|value| {
+            screen_shortcuts().iter().any(|screen| {
+                screen
+                    .parse::<Shortcut>()
+                    .is_ok_and(|parsed| &parsed == *value)
+            })
+        })
     {
-        return Err("Ctrl+Shift+1 至 Ctrl+Shift+9 已用于切换逻辑屏幕".into());
+        return Err("Ctrl+Alt+1 至 Ctrl+Alt+9 已用于切换鼠标和键盘".into());
     }
 
     let previous = core.store.get();
@@ -603,15 +609,15 @@ fn macos_bundle_path(executable: &Path) -> Option<PathBuf> {
 
 fn screen_shortcuts() -> [&'static str; 9] {
     [
-        "Ctrl+Shift+1",
-        "Ctrl+Shift+2",
-        "Ctrl+Shift+3",
-        "Ctrl+Shift+4",
-        "Ctrl+Shift+5",
-        "Ctrl+Shift+6",
-        "Ctrl+Shift+7",
-        "Ctrl+Shift+8",
-        "Ctrl+Shift+9",
+        "Ctrl+Alt+1",
+        "Ctrl+Alt+2",
+        "Ctrl+Alt+3",
+        "Ctrl+Alt+4",
+        "Ctrl+Alt+5",
+        "Ctrl+Alt+6",
+        "Ctrl+Alt+7",
+        "Ctrl+Alt+8",
+        "Ctrl+Alt+9",
     ]
 }
 
