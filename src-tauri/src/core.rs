@@ -1515,41 +1515,55 @@ impl Core {
             return;
         };
         let core = Arc::clone(self);
-        tauri::async_runtime::spawn(async move {
-            let mut last_error_log = 0_u64;
-            let mut pending = None;
-            loop {
-                let next_outbound = if pending.is_some() {
-                    pending.take()
-                } else {
-                    receiver.recv().await
+        let spawn_result = std::thread::Builder::new()
+            .name("crosscopy-mouse-network".into())
+            .spawn(move || {
+                let send_socket = match std::net::UdpSocket::bind(("0.0.0.0", 0)) {
+                    Ok(socket) => socket,
+                    Err(error) => {
+                        core.logger
+                            .error("mouse_network_socket_failed", error.to_string());
+                        return;
+                    }
                 };
-                let Some(mut outbound) = next_outbound else {
-                    return;
-                };
-                if matches!(&outbound.signal, MouseSignal::Move { .. }) {
-                    while let Ok(next) = receiver.try_recv() {
-                        if same_mouse_move_stream(&outbound, &next) {
-                            outbound = next;
-                        } else {
-                            pending = Some(next);
-                            break;
+                let mut last_error_log = 0_u64;
+                let mut pending = None;
+                loop {
+                    let next_outbound = if pending.is_some() {
+                        pending.take()
+                    } else {
+                        receiver.blocking_recv()
+                    };
+                    let Some(mut outbound) = next_outbound else {
+                        return;
+                    };
+                    if matches!(&outbound.signal, MouseSignal::Move { .. }) {
+                        while let Ok(next) = receiver.try_recv() {
+                            if same_mouse_move_stream(&outbound, &next) {
+                                outbound = next;
+                            } else {
+                                pending = Some(next);
+                                break;
+                            }
                         }
                     }
-                }
-                let publish_state = mouse_signal_changes_state(&outbound.signal);
-                if let Err(error) = core.send_mouse_signal(outbound).await {
-                    let now = now_ms();
-                    if now.saturating_sub(last_error_log) >= 1_000 {
-                        last_error_log = now;
-                        core.logger.warn("mouse_send_failed", error);
+                    let publish_state = mouse_signal_changes_state(&outbound.signal);
+                    if let Err(error) = core.send_mouse_signal_blocking(&send_socket, outbound) {
+                        let now = now_ms();
+                        if now.saturating_sub(last_error_log) >= 1_000 {
+                            last_error_log = now;
+                            core.logger.warn("mouse_send_failed", error);
+                        }
+                    }
+                    if publish_state {
+                        core.publish();
                     }
                 }
-                if publish_state {
-                    core.publish();
-                }
-            }
-        });
+            });
+        if let Err(error) = spawn_result {
+            self.logger
+                .error("mouse_network_thread_failed", error.to_string());
+        }
     }
 
     fn refresh_mouse_runtime(&self) {
@@ -1746,6 +1760,31 @@ impl Core {
         socket
             .send_to(&bytes, route.address)
             .await
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    fn send_mouse_signal_blocking(
+        &self,
+        socket: &std::net::UdpSocket,
+        outbound: OutboundMouseSignal,
+    ) -> Result<(), String> {
+        let route = self
+            .mouse_routes
+            .lock()
+            .expect("mouse routes lock")
+            .get(&outbound.peer_id)
+            .cloned()
+            .ok_or("鼠标目标设备不在线、未授权或未开启共享")?;
+        let packet = UdpMousePacket {
+            app: "crosscopy".into(),
+            protocol: MOUSE_PROTOCOL,
+            sender_id: self.device_id.clone(),
+            envelope: encrypt(&route.key, &outbound.signal)?,
+        };
+        let bytes = serde_json::to_vec(&packet).map_err(|error| error.to_string())?;
+        socket
+            .send_to(&bytes, route.address)
             .map_err(|error| error.to_string())?;
         Ok(())
     }

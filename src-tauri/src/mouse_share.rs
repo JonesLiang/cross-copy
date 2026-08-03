@@ -2,9 +2,9 @@ use crate::{
     logger::Logger,
     model::ScreenPosition,
     mouse_hook::{
-        recenter_cursor, run_keyboard_hook, run_mouse_hook, screen_bounds, set_realtime_priority,
-        set_source_cursor_captured, DesktopBounds, HookKey, HookMouseButton, HookMouseEvent,
-        SYNTHETIC_INPUT_MARKER,
+        ensure_source_cursor_captured, recenter_cursor, run_keyboard_hook, run_mouse_hook,
+        screen_bounds, set_realtime_priority, set_source_cursor_captured, DesktopBounds, HookKey,
+        HookMouseButton, HookMouseEvent, SYNTHETIC_INPUT_MARKER,
     },
 };
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
@@ -35,8 +35,7 @@ const SESSION_TIMEOUT_MS: u64 = 5_000;
 const KEEP_ALIVE_MS: u64 = 1_000;
 const EXTREME_MOVE_SEND_INTERVAL_MS: u64 = 2;
 const BALANCED_MOVE_SEND_INTERVAL_MS: u64 = 4;
-const EXTREME_MAINTENANCE_INTERVAL_MS: u64 = 10;
-const BALANCED_MAINTENANCE_INTERVAL_MS: u64 = 20;
+const SESSION_MAINTENANCE_INTERVAL_MS: u64 = 50;
 const EDGE_INSET_PIXELS: i32 = 8;
 #[cfg(target_os = "windows")]
 const SOURCE_CURSOR_RECENTER_MARGIN: i32 = 64;
@@ -762,6 +761,10 @@ impl MouseShare {
                 runtime.last_y = point.1;
                 runtime.crossing_blocked_until = now_ms() + EDGE_TRANSITION_COOLDOWN_MS;
                 simulated_events.push(absolute_move(point.0, point.1));
+                self.inner.logger.info(
+                    "mouse_outgoing_return_received",
+                    format!("reason=remote_crossed_return_edge ratio={ratio:.3}"),
+                );
             }
             MouseSignal::Cancel { session_id } => {
                 let cancelled_edge = runtime
@@ -986,15 +989,10 @@ impl MouseShare {
                         set_realtime_priority(extreme);
                         high_priority = extreme;
                     }
-                    let delay = if mouse_share.session_active() {
-                        if extreme {
-                            EXTREME_MAINTENANCE_INTERVAL_MS
-                        } else {
-                            BALANCED_MAINTENANCE_INTERVAL_MS
-                        }
-                    } else {
-                        50
-                    };
+                    // Movement is sent directly by the native hook.  This
+                    // thread is only a recovery path and must not contend
+                    // with every input frame for the runtime lock.
+                    let delay = SESSION_MAINTENANCE_INTERVAL_MS;
                     std::thread::sleep(std::time::Duration::from_millis(delay));
                     mouse_share.expire_unresponsive_outgoing();
 
@@ -1287,14 +1285,20 @@ impl Inner {
                 return true;
             }
             self.last_physical_at.store(now, Ordering::Relaxed);
+            let takeover_detail = match event {
+                HookMouseEvent::Move { x, y, native_delta } => format!(
+                    "event=move distance={} x={x} y={y} native_delta={native_delta:?}",
+                    runtime
+                        .incoming
+                        .as_ref()
+                        .map_or(0, |incoming| incoming.takeover_distance)
+                ),
+                _ => format!("event={}", event_kind(event)),
+            };
             let incoming = runtime.incoming.take().expect("incoming session");
             self.logger.warn(
                 "mouse_incoming_cancelled",
-                format!(
-                    "reason=local_physical_intent event={} distance={}",
-                    event_kind(event),
-                    incoming.takeover_distance
-                ),
+                format!("reason=local_physical_intent {takeover_detail}"),
             );
             if let HookMouseEvent::Move { x, y, .. } = event {
                 runtime.last_x = x;
@@ -1366,8 +1370,9 @@ impl Inner {
                         outgoing.total_y_milli = outgoing
                             .total_y_milli
                             .saturating_add(scaled_pointer_delta(delta_y));
-                        let send_interval = if self.extreme_performance.load(Ordering::Acquire) {
-                            EXTREME_MOVE_SEND_INTERVAL_MS
+                        let extreme = self.extreme_performance.load(Ordering::Acquire);
+                        let send_interval = if extreme {
+                            0
                         } else {
                             BALANCED_MOVE_SEND_INTERVAL_MS
                         };
@@ -1437,6 +1442,9 @@ impl Inner {
             }
             let anchor = (outgoing.anchor_x, outgoing.anchor_y);
             drop(runtime);
+            if let Err(error) = ensure_source_cursor_captured() {
+                self.logger.warn("mouse_cursor_guard_failed", error);
+            }
             if should_recenter {
                 let _ = recenter_cursor(anchor.0, anchor.1, bounds);
             }
@@ -1899,7 +1907,11 @@ fn inject_mouse_event(enigo: &mut Enigo, event: HookMouseEvent) -> Result<(), St
         HookMouseEvent::Move { x, y, .. } => {
             #[cfg(any(target_os = "windows", target_os = "macos"))]
             {
-                crate::mouse_hook::move_cursor_absolute(x, y)
+                let bounds = screen_bounds();
+                crate::mouse_hook::move_cursor_absolute(
+                    bounds.x.saturating_add(x),
+                    bounds.y.saturating_add(y),
+                )
             }
             #[cfg(not(any(target_os = "windows", target_os = "macos")))]
             {

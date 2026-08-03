@@ -18,6 +18,8 @@ static LAST_SYNTHETIC_X: AtomicI32 = AtomicI32::new(i32::MIN);
 static LAST_SYNTHETIC_Y: AtomicI32 = AtomicI32::new(i32::MIN);
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 static LAST_SYNTHETIC_AT: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "macos")]
+static LAST_CURSOR_GUARD_AT: AtomicU64 = AtomicU64::new(0);
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 const SYNTHETIC_ECHO_WINDOW_MS: u64 = 40;
 
@@ -451,6 +453,37 @@ pub fn set_source_cursor_captured(captured: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// macOS may make the cursor visible again while it is disassociated (for
+/// example after a display or application transition).  Re-hide it without
+/// changing the capture state or accumulating unbalanced hide calls.
+#[cfg(target_os = "macos")]
+pub fn ensure_source_cursor_captured() -> Result<(), String> {
+    use core_graphics::display::CGDisplay;
+
+    if !SOURCE_CURSOR_CAPTURED.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    let now = monotonic_ms();
+    if now.saturating_sub(LAST_CURSOR_GUARD_AT.load(Ordering::Relaxed)) < 16 {
+        return Ok(());
+    }
+    LAST_CURSOR_GUARD_AT.store(now, Ordering::Relaxed);
+    unsafe extern "C" {
+        fn CGCursorIsVisible() -> u32;
+    }
+    if unsafe { CGCursorIsVisible() } != 0 {
+        CGDisplay::main()
+            .hide_cursor()
+            .map_err(|error| format!("无法重新隐藏 macOS 源端指针：{error:?}"))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn ensure_source_cursor_captured() -> Result<(), String> {
+    Ok(())
+}
+
 #[cfg(target_os = "macos")]
 fn record_synthetic_move(x: i32, y: i32) {
     LAST_SYNTHETIC_X.store(x, Ordering::Relaxed);
@@ -501,6 +534,14 @@ pub fn run_mouse_hook(
         event_types,
         move |_proxy, event_type, event: &CGEvent| {
             let location = event.location();
+            // EVENT_SOURCE_USER_DATA is not preserved consistently when a
+            // HID-posted event passes through the WindowServer.  The source
+            // process id is preserved and unambiguously identifies every
+            // event injected by this CrossCopy process (including Enigo
+            // button and scroll events).
+            let injected_by_this_process = event
+                .get_integer_value_field(EventField::EVENT_SOURCE_UNIX_PROCESS_ID)
+                == i64::from(std::process::id());
             let synthetic_echo = matches!(
                 event_type,
                 CGEventType::MouseMoved
@@ -514,7 +555,8 @@ pub fn run_mouse_hook(
                     <= 1
                 && (location.y.round() as i32).abs_diff(LAST_SYNTHETIC_Y.load(Ordering::Relaxed))
                     <= 1;
-            if synthetic_echo
+            if injected_by_this_process
+                || synthetic_echo
                 || event.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA)
                     == SYNTHETIC_INPUT_MARKER as i64
             {
