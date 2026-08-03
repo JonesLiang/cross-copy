@@ -933,9 +933,9 @@ impl MouseShare {
                         .logger
                         .info("keyboard_listener_started", "provider=native_keyboard");
                     let callback_inner = Arc::clone(&keyboard_inner);
-                    if let Err(error) =
-                        run_keyboard_hook(move |event| callback_inner.handle_local_key_event(event))
-                    {
+                    if let Err(error) = run_keyboard_hook(move |key, pressed| {
+                        callback_inner.handle_local_key_event(key, pressed)
+                    }) {
                         keyboard_inner
                             .keyboard_listener_started
                             .store(false, Ordering::Release);

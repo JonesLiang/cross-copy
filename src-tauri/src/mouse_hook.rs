@@ -677,15 +677,16 @@ pub fn run_keyboard_hook(
             let Some(key) = mac_key(code) else {
                 return CallbackResult::Keep;
             };
-            let captured = if event_type == CGEventType::FlagsChanged {
-                if key == HookKey::CapsLock {
+            let captured = match event_type {
+                CGEventType::FlagsChanged if key == HookKey::CapsLock => {
                     callback(key, true) | callback(key, false)
-                } else {
-                    let pressed = mac_modifier_pressed(key, event.get_flags());
-                    callback(key, pressed)
                 }
-            } else {
-                callback(key, event_type == CGEventType::KeyDown)
+                CGEventType::FlagsChanged => {
+                    callback(key, mac_modifier_pressed(key, event.get_flags()))
+                }
+                CGEventType::KeyDown => callback(key, true),
+                CGEventType::KeyUp => callback(key, false),
+                _ => false,
             };
             if captured {
                 CallbackResult::Drop
