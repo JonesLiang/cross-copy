@@ -9,18 +9,20 @@ use std::sync::{
 static SOURCE_CURSOR_CAPTURED: AtomicBool = AtomicBool::new(false);
 static SOURCE_CURSOR_LOCK: Mutex<()> = Mutex::new(());
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(target_os = "macos")]
+use std::sync::atomic::AtomicU64;
+#[cfg(target_os = "windows")]
 use std::sync::atomic::{AtomicI32, AtomicU64};
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(target_os = "windows")]
 static LAST_SYNTHETIC_X: AtomicI32 = AtomicI32::new(i32::MIN);
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(target_os = "windows")]
 static LAST_SYNTHETIC_Y: AtomicI32 = AtomicI32::new(i32::MIN);
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(target_os = "windows")]
 static LAST_SYNTHETIC_AT: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_os = "macos")]
 static LAST_CURSOR_GUARD_AT: AtomicU64 = AtomicU64::new(0);
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(target_os = "windows")]
 const SYNTHETIC_ECHO_WINDOW_MS: u64 = 40;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -312,42 +314,19 @@ pub fn recenter_cursor(x: i32, y: i32, bounds: DesktopBounds) -> Result<(), Stri
     .map_err(|error| format!("macOS 鼠标回中失败：{error:?}"))
 }
 
+/// Moves the cursor on behalf of a remote controller.  Warping is used
+/// instead of posting `kCGEventMouseMoved`: the WindowServer coalesces and
+/// regenerates HID-posted mouse-moved events, stripping their source
+/// identity, so the event tap cannot reliably tell injected motion from
+/// physical input.  Warped moves generate no events at all, which keeps the
+/// tap observing genuine hardware only (the same reason the source-side
+/// recenter warps).
 #[cfg(target_os = "macos")]
 pub fn move_cursor_absolute(x: i32, y: i32) -> Result<(), String> {
-    use core_graphics::{
-        event::{CGEvent, CGEventTapLocation, CGEventType, CGMouseButton, EventField},
-        event_source::{CGEventSource, CGEventSourceStateID},
-        geometry::CGPoint,
-    };
-    use std::cell::RefCell;
+    use core_graphics::{display::CGDisplay, geometry::CGPoint};
 
-    thread_local! {
-        static MOUSE_EVENT_SOURCE: RefCell<Option<CGEventSource>> = const { RefCell::new(None) };
-    }
-
-    MOUSE_EVENT_SOURCE.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        if slot.is_none() {
-            *slot = Some(
-                CGEventSource::new(CGEventSourceStateID::HIDSystemState)
-                    .map_err(|_| "无法创建 macOS 鼠标事件源".to_string())?,
-            );
-        }
-        let event = CGEvent::new_mouse_event(
-            slot.as_ref().expect("mouse event source").clone(),
-            CGEventType::MouseMoved,
-            CGPoint::new(f64::from(x), f64::from(y)),
-            CGMouseButton::Left,
-        )
-        .map_err(|_| "无法创建 macOS 鼠标移动事件".to_string())?;
-        event.set_integer_value_field(
-            EventField::EVENT_SOURCE_USER_DATA,
-            SYNTHETIC_INPUT_MARKER as i64,
-        );
-        record_synthetic_move(x, y);
-        event.post(CGEventTapLocation::HID);
-        Ok(())
-    })
+    CGDisplay::warp_mouse_cursor_position(CGPoint::new(f64::from(x), f64::from(y)))
+        .map_err(|error| format!("macOS 鼠标移动失败：{error:?}"))
 }
 
 #[cfg(target_os = "windows")]
@@ -484,13 +463,6 @@ pub fn ensure_source_cursor_captured() -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
-fn record_synthetic_move(x: i32, y: i32) {
-    LAST_SYNTHETIC_X.store(x, Ordering::Relaxed);
-    LAST_SYNTHETIC_Y.store(y, Ordering::Relaxed);
-    LAST_SYNTHETIC_AT.store(monotonic_ms(), Ordering::Release);
-}
-
 #[cfg(target_os = "windows")]
 pub fn set_cursor_visible(visible: bool) -> Result<(), String> {
     use windows::Win32::UI::WindowsAndMessaging::ShowCursor;
@@ -534,29 +506,16 @@ pub fn run_mouse_hook(
         event_types,
         move |_proxy, event_type, event: &CGEvent| {
             let location = event.location();
-            // EVENT_SOURCE_USER_DATA is not preserved consistently when a
-            // HID-posted event passes through the WindowServer.  The source
-            // process id is preserved and unambiguously identifies every
-            // event injected by this CrossCopy process (including Enigo
-            // button and scroll events).
+            // Cursor motion injected for a remote controller is applied with
+            // CGWarpMouseCursorPosition, which generates no events, so every
+            // move observed here is physical.  Only Enigo button and scroll
+            // events still arrive through the HID stream; the source process
+            // id unambiguously identifies every event injected by this
+            // CrossCopy process, with EVENT_SOURCE_USER_DATA as a fallback.
             let injected_by_this_process = event
                 .get_integer_value_field(EventField::EVENT_SOURCE_UNIX_PROCESS_ID)
                 == i64::from(std::process::id());
-            let synthetic_echo = matches!(
-                event_type,
-                CGEventType::MouseMoved
-                    | CGEventType::LeftMouseDragged
-                    | CGEventType::RightMouseDragged
-                    | CGEventType::OtherMouseDragged
-            ) && monotonic_ms()
-                .saturating_sub(LAST_SYNTHETIC_AT.load(Ordering::Acquire))
-                <= SYNTHETIC_ECHO_WINDOW_MS
-                && (location.x.round() as i32).abs_diff(LAST_SYNTHETIC_X.load(Ordering::Relaxed))
-                    <= 1
-                && (location.y.round() as i32).abs_diff(LAST_SYNTHETIC_Y.load(Ordering::Relaxed))
-                    <= 1;
             if injected_by_this_process
-                || synthetic_echo
                 || event.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA)
                     == SYNTHETIC_INPUT_MARKER as i64
             {

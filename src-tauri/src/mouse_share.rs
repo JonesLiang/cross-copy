@@ -1905,13 +1905,12 @@ fn event_kind(event: HookMouseEvent) -> &'static str {
 fn inject_mouse_event(enigo: &mut Enigo, event: HookMouseEvent) -> Result<(), String> {
     match event {
         HookMouseEvent::Move { x, y, .. } => {
+            // Injection-queue move events are already in global desktop
+            // coordinates (Inner::inject globalizes them), so they are passed
+            // to the platform cursor APIs unchanged.
             #[cfg(any(target_os = "windows", target_os = "macos"))]
             {
-                let bounds = screen_bounds();
-                crate::mouse_hook::move_cursor_absolute(
-                    bounds.x.saturating_add(x),
-                    bounds.y.saturating_add(y),
-                )
+                crate::mouse_hook::move_cursor_absolute(x, y)
             }
             #[cfg(not(any(target_os = "windows", target_os = "macos")))]
             {
