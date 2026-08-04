@@ -24,8 +24,6 @@ use uuid::Uuid;
 
 const NO_LATENCY: u64 = u64::MAX;
 const PHYSICAL_INPUT_PRIORITY_MS: u64 = 180;
-const PHYSICAL_TAKEOVER_WINDOW_MS: u64 = 150;
-const PHYSICAL_TAKEOVER_DISTANCE: u32 = 12;
 const HELD_INPUT_SAFETY_TIMEOUT_MS: u64 = 10_000;
 const LOGICAL_PIXEL_MILLI: i64 = 1_000;
 const MAX_PHYSICAL_DELTA_PER_EVENT: i32 = 256;
@@ -158,8 +156,6 @@ struct IncomingSession {
     held_buttons: [bool; 3],
     held_keys: HashSet<HookKey>,
     last_event_at: u64,
-    takeover_window_started: u64,
-    takeover_distance: u32,
 }
 
 #[derive(Clone)]
@@ -589,8 +585,6 @@ impl MouseShare {
                     held_buttons: [false; 3],
                     held_keys: HashSet::new(),
                     last_event_at: now_ms(),
-                    takeover_window_started: 0,
-                    takeover_distance: 0,
                 });
                 simulated_events.push(absolute_move(x, y));
                 responses.push(outbound(
@@ -1275,64 +1269,14 @@ impl Inner {
         let event = localize_move(event, bounds);
         let mut runtime = self.runtime.lock().expect("mouse runtime lock");
         if runtime.incoming.is_some() {
-            let take_over = match event {
-                HookMouseEvent::Move { x, y, native_delta } => {
-                    let incoming = runtime.incoming.as_mut().expect("incoming session");
-                    if now.saturating_sub(incoming.takeover_window_started)
-                        > PHYSICAL_TAKEOVER_WINDOW_MS
-                    {
-                        incoming.takeover_window_started = now;
-                        incoming.takeover_distance = 0;
-                    }
-                    let (delta_x, delta_y) = native_delta.unwrap_or((
-                        x.saturating_sub(incoming.last_injected_x),
-                        y.saturating_sub(incoming.last_injected_y),
-                    ));
-                    incoming.takeover_distance = incoming.takeover_distance.saturating_add(
-                        delta_x
-                            .unsigned_abs()
-                            .saturating_add(delta_y.unsigned_abs()),
-                    );
-                    incoming.takeover_distance >= PHYSICAL_TAKEOVER_DISTANCE
-                }
-                HookMouseEvent::Button { .. } | HookMouseEvent::Scroll { .. } => true,
-                HookMouseEvent::Key { .. } => false,
-            };
-            if !take_over {
-                return true;
-            }
-            self.last_physical_at.store(now, Ordering::Relaxed);
-            let takeover_detail = match event {
-                HookMouseEvent::Move { x, y, native_delta } => format!(
-                    "event=move distance={} x={x} y={y} native_delta={native_delta:?}",
-                    runtime
-                        .incoming
-                        .as_ref()
-                        .map_or(0, |incoming| incoming.takeover_distance)
-                ),
-                _ => format!("event={}", event_kind(event)),
-            };
-            let incoming = runtime.incoming.take().expect("incoming session");
-            self.logger.warn(
-                "mouse_incoming_cancelled",
-                format!("reason=local_physical_intent {takeover_detail}"),
-            );
-            if let HookMouseEvent::Move { x, y, .. } = event {
-                runtime.last_x = x;
-                runtime.last_y = y;
-            }
-            let release_events = release_held_input(&incoming);
-            let _ = self.outbound.blocking_send(outbound(
-                &incoming.peer_id,
-                MouseSignal::Cancel {
-                    session_id: incoming.session_id,
-                },
-            ));
-            drop(runtime);
-            for event in release_events {
-                self.inject(event);
-            }
-            return false;
+            // A remote controller owns this screen: swallow every local event.
+            // Ambient pointing-device input (a Bluetooth mouse left powered on,
+            // sensor drift, accidental touches) used to tear down sessions
+            // through the physical-takeover heuristic, bouncing the cursor
+            // back to the entry edge every few seconds.  Control now returns
+            // only through the sustained edge-push gesture, a remote cancel,
+            // the session timeout, or an explicit local switch.
+            return true;
         }
 
         self.last_physical_at.store(now, Ordering::Relaxed);
@@ -1890,15 +1834,6 @@ fn to_hook_button(button: SharedMouseButton) -> HookMouseButton {
         SharedMouseButton::Left => HookMouseButton::Left,
         SharedMouseButton::Right => HookMouseButton::Right,
         SharedMouseButton::Middle => HookMouseButton::Middle,
-    }
-}
-
-fn event_kind(event: HookMouseEvent) -> &'static str {
-    match event {
-        HookMouseEvent::Move { .. } => "move",
-        HookMouseEvent::Button { .. } => "button",
-        HookMouseEvent::Scroll { .. } => "scroll",
-        HookMouseEvent::Key { .. } => "key",
     }
 }
 
