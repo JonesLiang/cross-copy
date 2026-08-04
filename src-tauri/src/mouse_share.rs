@@ -40,6 +40,10 @@ const EDGE_INSET_PIXELS: i32 = 8;
 #[cfg(target_os = "windows")]
 const SOURCE_CURSOR_RECENTER_MARGIN: i32 = 64;
 const RETURN_ARM_DISTANCE_PIXELS: i32 = 32;
+// Returning control requires a deliberate sustained push against the return
+// edge.  Jitter in the physical delta stream (a few px back and forth) must
+// never be enough to hand control back.
+const RETURN_PUSH_THRESHOLD_MILLI: i64 = 48_000;
 const EDGE_TRANSITION_COOLDOWN_MS: u64 = 160;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -150,6 +154,7 @@ struct IncomingSession {
     last_total_scroll_y_milli: i64,
     last_keep_alive_at: u64,
     return_armed: bool,
+    return_push_milli: i64,
     held_buttons: [bool; 3],
     held_keys: HashSet<HookKey>,
     last_event_at: u64,
@@ -580,6 +585,7 @@ impl MouseShare {
                     last_total_scroll_y_milli: 0,
                     last_keep_alive_at: now_ms(),
                     return_armed: false,
+                    return_push_milli: 0,
                     held_buttons: [false; 3],
                     held_keys: HashSet::new(),
                     last_event_at: now_ms(),
@@ -651,16 +657,27 @@ impl MouseShare {
                 {
                     incoming.return_armed = true;
                 }
+                // Control is handed back only when the remote controller
+                // keeps pushing against the return edge: outward deltas
+                // accumulate while the cursor is pinned at the edge, and any
+                // inward motion resets the gesture.  Single-frame jitter can
+                // no longer cancel the session.
+                let outward_milli = match incoming.return_edge {
+                    ScreenPosition::Right => delta_x_milli.max(0),
+                    ScreenPosition::Left => (-delta_x_milli).max(0),
+                    ScreenPosition::Down => delta_y_milli.max(0),
+                    ScreenPosition::Up => (-delta_y_milli).max(0),
+                };
+                let pinned_at_return_edge =
+                    distance_from_edge(incoming.return_edge, next_x, next_y, width, height) == 0;
+                if pinned_at_return_edge && outward_milli > 0 {
+                    incoming.return_push_milli =
+                        incoming.return_push_milli.saturating_add(outward_milli);
+                } else {
+                    incoming.return_push_milli = 0;
+                }
                 if incoming.return_armed
-                    && crossed_return_edge(
-                        incoming.return_edge,
-                        next_x,
-                        next_y,
-                        delta_x_milli,
-                        delta_y_milli,
-                        width,
-                        height,
-                    )
+                    && incoming.return_push_milli >= RETURN_PUSH_THRESHOLD_MILLI
                 {
                     let ratio = edge_ratio(incoming.return_edge, next_x, next_y, width, height);
                     let session_id = incoming.session_id.clone();
@@ -1797,23 +1814,6 @@ fn reached_exit_edge(
         ScreenPosition::Right => x >= width - 1 && x >= previous_x,
         ScreenPosition::Up => y <= 0 && y <= previous_y,
         ScreenPosition::Down => y >= height - 1 && y >= previous_y,
-    }
-}
-
-fn crossed_return_edge(
-    edge: ScreenPosition,
-    x: i32,
-    y: i32,
-    delta_x_milli: i64,
-    delta_y_milli: i64,
-    width: i32,
-    height: i32,
-) -> bool {
-    match edge {
-        ScreenPosition::Left => x <= 0 && delta_x_milli < 0,
-        ScreenPosition::Right => x >= width - 1 && delta_x_milli > 0,
-        ScreenPosition::Up => y <= 0 && delta_y_milli < 0,
-        ScreenPosition::Down => y >= height - 1 && delta_y_milli > 0,
     }
 }
 
