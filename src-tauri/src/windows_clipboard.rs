@@ -7,7 +7,10 @@ use clipboard_rs::{Clipboard, ClipboardContext, ContentFormat};
 use std::{path::PathBuf, sync::Arc, thread, time::Duration};
 use windows::Win32::System::{
     Com::IDataObject,
-    DataExchange::{CloseClipboard, CountClipboardFormats, EmptyClipboard, OpenClipboard},
+    DataExchange::{
+        CloseClipboard, CountClipboardFormats, EmptyClipboard, GetClipboardSequenceNumber,
+        OpenClipboard,
+    },
     Ole::{OleFlushClipboard, OleGetClipboard, OleInitialize, OleSetClipboard, OleUninitialize},
 };
 
@@ -79,11 +82,12 @@ impl<'a> ClipboardRestoreGuard<'a> {
         for attempt in 1..=CLIPBOARD_RETRY_ATTEMPTS {
             let result = match self.snapshot.as_ref().expect("snapshot checked") {
                 OleSnapshot::Data(data) => unsafe {
-                    OleSetClipboard(data).map_err(|error| error.to_string())?;
-                    // The STA thread is intentionally short-lived. Materialize
-                    // the restored IDataObject before it exits so Windows does
-                    // not depend on this thread remaining a clipboard owner.
-                    OleFlushClipboard()
+                    OleSetClipboard(data).and_then(|_| {
+                        // The STA thread is intentionally short-lived. Materialize
+                        // the restored IDataObject before it exits so Windows does
+                        // not depend on this thread remaining a clipboard owner.
+                        OleFlushClipboard()
+                    })
                 }
                 .map_err(|error| error.to_string()),
                 OleSnapshot::Empty => clear_clipboard(),
@@ -127,9 +131,16 @@ pub(super) async fn windows_capture_selection(
                 "shortcut_copy_simulation_started",
                 "dispatch=windows_blocking_thread provider=windows_ole",
             );
+            let sequence = unsafe { GetClipboardSequenceNumber() };
             simulate_native_shortcut_on_current_thread('c')?;
             logger.info("shortcut_copy_simulation_completed", "success=true");
-            thread::sleep(Duration::from_millis(120));
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while unsafe { GetClipboardSequenceNumber() } == sequence {
+                if std::time::Instant::now() >= deadline {
+                    return Err("目标程序未更新剪贴板，请确认已选中文本或文件".into());
+                }
+                pump_wait(Duration::from_millis(10));
+            }
             read_current_clipboard(&logger)
         })();
         let restore = original.restore();
@@ -154,7 +165,7 @@ pub(super) async fn windows_paste_pending(
             );
             simulate_native_shortcut_on_current_thread('v')?;
             logger.info("shortcut_paste_simulation_completed", "success=true");
-            thread::sleep(Duration::from_millis(650));
+            pump_wait(Duration::from_millis(650));
             Ok(())
         })();
         let restore = original.restore();
@@ -289,6 +300,29 @@ fn clear_clipboard() -> Result<(), String> {
 
 fn retry_sleep(attempt: usize) {
     if attempt < CLIPBOARD_RETRY_ATTEMPTS {
-        thread::sleep(Duration::from_millis(CLIPBOARD_RETRY_DELAY_MS));
+        pump_wait(Duration::from_millis(CLIPBOARD_RETRY_DELAY_MS));
+    }
+}
+
+// OLE owns a hidden window on this STA. Dispatch messages during waits so
+// delayed clipboard rendering does not depend on a sleeping owner thread.
+fn pump_wait(duration: Duration) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
+    };
+    let deadline = std::time::Instant::now() + duration;
+    loop {
+        let mut message = MSG::default();
+        unsafe {
+            while PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() {
+                let _ = TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        thread::sleep(remaining.min(Duration::from_millis(5)));
     }
 }

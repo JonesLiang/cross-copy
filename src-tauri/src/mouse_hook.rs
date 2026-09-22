@@ -11,19 +11,9 @@ static SOURCE_CURSOR_LOCK: Mutex<()> = Mutex::new(());
 
 #[cfg(target_os = "macos")]
 use std::sync::atomic::AtomicU64;
-#[cfg(target_os = "windows")]
-use std::sync::atomic::{AtomicI32, AtomicU64};
 
-#[cfg(target_os = "windows")]
-static LAST_SYNTHETIC_X: AtomicI32 = AtomicI32::new(i32::MIN);
-#[cfg(target_os = "windows")]
-static LAST_SYNTHETIC_Y: AtomicI32 = AtomicI32::new(i32::MIN);
-#[cfg(target_os = "windows")]
-static LAST_SYNTHETIC_AT: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_os = "macos")]
 static LAST_CURSOR_GUARD_AT: AtomicU64 = AtomicU64::new(0);
-#[cfg(target_os = "windows")]
-const SYNTHETIC_ECHO_WINDOW_MS: u64 = 40;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DesktopBounds {
@@ -349,15 +339,6 @@ pub fn move_cursor_absolute(x: i32, y: i32) -> Result<(), String> {
         i64::from(local_x.clamp(0, bounds.width - 1)) * 65_535 / i64::from(bounds.width - 1);
     let normalized_y =
         i64::from(local_y.clamp(0, bounds.height - 1)) * 65_535 / i64::from(bounds.height - 1);
-    LAST_SYNTHETIC_X.store(
-        bounds.x.saturating_add(local_x.clamp(0, bounds.width - 1)),
-        Ordering::Relaxed,
-    );
-    LAST_SYNTHETIC_Y.store(
-        bounds.y.saturating_add(local_y.clamp(0, bounds.height - 1)),
-        Ordering::Relaxed,
-    );
-    LAST_SYNTHETIC_AT.store(monotonic_ms(), Ordering::Release);
     let input = INPUT {
         r#type: INPUT_MOUSE,
         Anonymous: INPUT_0 {
@@ -505,6 +486,13 @@ pub fn run_mouse_hook(
         CGEventTapOptions::Default,
         event_types,
         move |_proxy, event_type, event: &CGEvent| {
+            if matches!(
+                event_type,
+                CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput
+            ) {
+                CFRunLoop::get_current().stop();
+                return CallbackResult::Keep;
+            }
             let location = event.location();
             // Cursor motion injected for a remote controller is applied with
             // CGWarpMouseCursorPosition, which generates no events, so every
@@ -597,12 +585,12 @@ pub fn run_mouse_hook(
 ) -> Result<(), String> {
     use std::sync::{Arc, OnceLock};
     use windows::Win32::{
-        Foundation::{LPARAM, LRESULT, WPARAM},
+        Foundation::{LPARAM, LRESULT, POINT, WPARAM},
         UI::WindowsAndMessaging::{
-            CallNextHookEx, GetMessageW, SetWindowsHookExW, UnhookWindowsHookEx, HC_ACTION,
-            LLMHF_INJECTED, MSG, MSLLHOOKSTRUCT, WH_MOUSE_LL, WM_LBUTTONDOWN, WM_LBUTTONUP,
-            WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-            WM_RBUTTONDOWN, WM_RBUTTONUP,
+            CallNextHookEx, GetCursorPos, GetMessageW, SetWindowsHookExW, UnhookWindowsHookEx,
+            HC_ACTION, LLMHF_INJECTED, MSG, MSLLHOOKSTRUCT, WH_MOUSE_LL, WM_LBUTTONDOWN,
+            WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
+            WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP,
         },
     };
 
@@ -615,18 +603,24 @@ pub fn run_mouse_hook(
             let message = wparam.0 as u32;
             let explicitly_injected =
                 data.dwExtraInfo == SYNTHETIC_INPUT_MARKER || data.flags & LLMHF_INJECTED != 0;
-            let synthetic_echo = message == WM_MOUSEMOVE
-                && monotonic_ms().saturating_sub(LAST_SYNTHETIC_AT.load(Ordering::Acquire))
-                    <= SYNTHETIC_ECHO_WINDOW_MS
-                && data.pt.x.abs_diff(LAST_SYNTHETIC_X.load(Ordering::Relaxed)) <= 1
-                && data.pt.y.abs_diff(LAST_SYNTHETIC_Y.load(Ordering::Relaxed)) <= 1;
-            if !explicitly_injected && !synthetic_echo {
+            // SendInput always tags injected events. Coordinate/time heuristics
+            // also matched slow physical input and let it escape suppression.
+            if !explicitly_injected {
                 let wheel_delta = || (data.mouseData >> 16) as u16 as i16 as i64;
                 let event = match message {
                     WM_MOUSEMOVE => Some(HookMouseEvent::Move {
                         x: data.pt.x,
                         y: data.pt.y,
-                        native_delta: None,
+                        native_delta: {
+                            let mut current = POINT::default();
+                            if SOURCE_CURSOR_CAPTURED.load(Ordering::Acquire)
+                                && unsafe { GetCursorPos(&mut current) }.is_ok()
+                            {
+                                Some((data.pt.x - current.x, data.pt.y - current.y))
+                            } else {
+                                None
+                            }
+                        },
                     }),
                     WM_LBUTTONDOWN => Some(HookMouseEvent::Button {
                         button: HookMouseButton::Left,
@@ -706,6 +700,13 @@ pub fn run_keyboard_hook(
         CGEventTapOptions::Default,
         event_types,
         move |_proxy, event_type, event: &CGEvent| {
+            if matches!(
+                event_type,
+                CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput
+            ) {
+                CFRunLoop::get_current().stop();
+                return CallbackResult::Keep;
+            }
             if event.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA)
                 == SYNTHETIC_INPUT_MARKER as i64
             {

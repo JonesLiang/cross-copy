@@ -35,8 +35,6 @@ const EXTREME_MOVE_SEND_INTERVAL_MS: u64 = 2;
 const BALANCED_MOVE_SEND_INTERVAL_MS: u64 = 4;
 const SESSION_MAINTENANCE_INTERVAL_MS: u64 = 50;
 const EDGE_INSET_PIXELS: i32 = 8;
-#[cfg(target_os = "windows")]
-const SOURCE_CURSOR_RECENTER_MARGIN: i32 = 64;
 const RETURN_ARM_DISTANCE_PIXELS: i32 = 32;
 // Returning control requires a deliberate sustained push against the return
 // edge.  Jitter in the physical delta stream (a few px back and forth) must
@@ -231,7 +229,9 @@ struct Inner {
     latency_ms: AtomicU64,
     last_physical_at: AtomicU64,
     runtime: Mutex<Runtime>,
-    outbound: mpsc::Sender<OutboundMouseSignal>,
+    // OS hooks must never wait for a network consumer. Consecutive moves are
+    // coalesced by the consumer; button/key ordering is preserved.
+    outbound: mpsc::UnboundedSender<OutboundMouseSignal>,
     injector: Arc<InjectionQueue>,
     logger: Arc<Logger>,
     bounds: Mutex<DesktopBounds>,
@@ -242,26 +242,24 @@ pub struct MouseShare {
 }
 
 impl MouseShare {
-    pub fn new(logger: Arc<Logger>, outbound: mpsc::Sender<OutboundMouseSignal>) -> Arc<Self> {
+    pub fn new(
+        logger: Arc<Logger>,
+        outbound: mpsc::UnboundedSender<OutboundMouseSignal>,
+    ) -> Arc<Self> {
         let injector = InjectionQueue::new();
         let injection_receiver = Arc::clone(&injector);
         let extreme_performance = Arc::new(AtomicBool::new(false));
         let injector_extreme_performance = Arc::clone(&extreme_performance);
         let source_control_active = Arc::new(AtomicBool::new(false));
         let injector_source_control_active = Arc::clone(&source_control_active);
-        let mut enigo = Enigo::new(&mouse_input_settings()).ok();
         let bounds = screen_bounds();
         let injection_logger = Arc::clone(&logger);
         let _ = std::thread::Builder::new()
             .name("crosscopy-mouse-injector".into())
             .spawn(move || {
-                let Some(mut enigo) = enigo.take() else {
-                    injection_logger.error(
-                        "mouse_injector_failed",
-                        "provider=enigo initialization_failed=true",
-                    );
-                    return;
-                };
+                // Initialize on the thread that owns native input resources. A
+                // permission failure at startup must not kill injection forever.
+                let mut enigo = None;
                 let mut last_error_log = 0_u64;
                 let mut high_priority = false;
                 loop {
@@ -276,7 +274,24 @@ impl MouseShare {
                         set_realtime_priority(requested);
                         high_priority = requested;
                     }
-                    if let Err(error) = inject_mouse_event(&mut enigo, event) {
+                    if enigo.is_none() {
+                        match Enigo::new(&mouse_input_settings()) {
+                            Ok(value) => enigo = Some(value),
+                            Err(error) => {
+                                injection_logger.warn("mouse_injector_retry", error.to_string());
+                                // Do not replay old clicks/keys after permission
+                                // is granted seconds later.
+                                injection_receiver
+                                    .pending
+                                    .lock()
+                                    .expect("input injection queue lock")
+                                    .clear();
+                                std::thread::sleep(std::time::Duration::from_secs(1));
+                                continue;
+                            }
+                        }
+                    }
+                    if let Err(error) = inject_mouse_event(enigo.as_mut().unwrap(), event) {
                         let now = now_ms();
                         if now.saturating_sub(last_error_log) >= 1_000 {
                             last_error_log = now;
@@ -334,19 +349,7 @@ impl MouseShare {
             *bounds = latest_bounds;
             changed
         };
-        let was_enabled = self.inner.enabled.swap(enabled, Ordering::AcqRel);
-        if enabled && !was_enabled {
-            if !self.inner.listener_started.load(Ordering::Acquire) {
-                self.inner
-                    .listener_attempted
-                    .store(false, Ordering::Release);
-            }
-            if !self.inner.keyboard_listener_started.load(Ordering::Acquire) {
-                self.inner
-                    .keyboard_listener_attempted
-                    .store(false, Ordering::Release);
-            }
-        }
+        self.inner.enabled.store(enabled, Ordering::Release);
         let targets = targets
             .into_iter()
             .map(|(peer_id, position, screen_number)| MouseTarget {
@@ -412,7 +415,7 @@ impl MouseShare {
             let _ = self
                 .inner
                 .outbound
-                .try_send(outbound(&peer_id, MouseSignal::Cancel { session_id }));
+                .send(outbound(&peer_id, MouseSignal::Cancel { session_id }));
         }
         for event in release_events {
             self.inject(event);
@@ -930,8 +933,14 @@ impl MouseShare {
                             .logger
                             .error("mouse_listener_failed", format!("{error:?}"));
                     }
+                    inner.focus_local();
+                    inner.listener_started.store(false, Ordering::Release);
+                    inner.listener_attempted.store(false, Ordering::Release);
                 })
             {
+                self.inner
+                    .listener_attempted
+                    .store(false, Ordering::Release);
                 self.inner.listener_started.store(false, Ordering::Release);
                 self.inner
                     .logger
@@ -966,8 +975,18 @@ impl MouseShare {
                             .logger
                             .error("keyboard_listener_failed", error);
                     }
+                    keyboard_inner.focus_local();
+                    keyboard_inner
+                        .keyboard_listener_started
+                        .store(false, Ordering::Release);
+                    keyboard_inner
+                        .keyboard_listener_attempted
+                        .store(false, Ordering::Release);
                 })
             {
+                self.inner
+                    .keyboard_listener_attempted
+                    .store(false, Ordering::Release);
                 self.inner
                     .keyboard_listener_started
                     .store(false, Ordering::Release);
@@ -988,6 +1007,7 @@ impl MouseShare {
             .name("crosscopy-mouse-maintenance".into())
             .spawn(move || {
                 let mut high_priority = false;
+                let mut last_listener_retry = 0;
                 loop {
                     let Some(mouse_share) = mouse_share.upgrade() else {
                         return;
@@ -1000,14 +1020,28 @@ impl MouseShare {
                         set_realtime_priority(extreme);
                         high_priority = extreme;
                     }
-                    // Movement is sent directly by the native hook.  This
-                    // thread is only a recovery path and must not contend
-                    // with every input frame for the runtime lock.
-                    let delay = SESSION_MAINTENANCE_INTERVAL_MS;
+                    // Flush the trailing throttled move within a frame while
+                    // active; a fixed 50 ms tick made slow motion visibly step.
+                    // Idle sessions retain the inexpensive maintenance tick.
+                    let delay = if mouse_share.session_active() {
+                        if extreme {
+                            EXTREME_MOVE_SEND_INTERVAL_MS
+                        } else {
+                            BALANCED_MOVE_SEND_INTERVAL_MS
+                        }
+                    } else {
+                        SESSION_MAINTENANCE_INTERVAL_MS
+                    };
                     std::thread::sleep(std::time::Duration::from_millis(delay));
                     mouse_share.expire_unresponsive_outgoing();
 
                     let now = now_ms();
+                    if now.saturating_sub(last_listener_retry) >= 1_000 {
+                        last_listener_retry = now;
+                        if mouse_share.inner.enabled.load(Ordering::Acquire) {
+                            mouse_share.ensure_listener_started();
+                        }
+                    }
                     let mut runtime = mouse_share
                         .inner
                         .runtime
@@ -1095,7 +1129,7 @@ impl MouseShare {
                     }
                     drop(runtime);
                     for signal in signals {
-                        let _ = mouse_share.inner.outbound.blocking_send(signal);
+                        let _ = mouse_share.inner.outbound.send(signal);
                     }
                     let released_any = !releases.is_empty();
                     for event in releases {
@@ -1161,7 +1195,7 @@ impl Inner {
             return Err("目标屏幕当前不可用".into());
         }
         if let Some(previous) = runtime.outgoing.take() {
-            let _ = self.outbound.blocking_send(outbound(
+            let _ = self.outbound.send(outbound(
                 &previous.peer_id,
                 MouseSignal::Cancel {
                     session_id: previous.session_id,
@@ -1169,7 +1203,7 @@ impl Inner {
             ));
         }
         let releases = if let Some(previous) = runtime.incoming.take() {
-            let _ = self.outbound.blocking_send(outbound(
+            let _ = self.outbound.send(outbound(
                 &previous.peer_id,
                 MouseSignal::Cancel {
                     session_id: previous.session_id.clone(),
@@ -1205,7 +1239,7 @@ impl Inner {
             self.focus_local();
             return Err(error);
         }
-        let _ = self.outbound.blocking_send(outbound(
+        let _ = self.outbound.send(outbound(
             &peer_id,
             MouseSignal::Enter {
                 session_id,
@@ -1226,7 +1260,7 @@ impl Inner {
         let outgoing = runtime.outgoing.take();
         let incoming = runtime.incoming.take();
         if let Some(session) = &outgoing {
-            let _ = self.outbound.blocking_send(outbound(
+            let _ = self.outbound.send(outbound(
                 &session.peer_id,
                 MouseSignal::Cancel {
                     session_id: session.session_id.clone(),
@@ -1234,7 +1268,7 @@ impl Inner {
             ));
         }
         if let Some(session) = &incoming {
-            let _ = self.outbound.blocking_send(outbound(
+            let _ = self.outbound.send(outbound(
                 &session.peer_id,
                 MouseSignal::Cancel {
                     session_id: session.session_id.clone(),
@@ -1284,15 +1318,12 @@ impl Inner {
         if let Some(outgoing) = runtime.outgoing.as_mut() {
             let peer_id = outgoing.peer_id.clone();
             let session_id = outgoing.session_id.clone();
-            #[cfg(target_os = "windows")]
-            let mut should_recenter = false;
-            #[cfg(not(target_os = "windows"))]
-            let should_recenter = false;
             match event {
                 HookMouseEvent::Move { x, y, native_delta } => {
                     let (raw_delta_x, raw_delta_y) =
                         native_delta.unwrap_or((x - outgoing.anchor_x, y - outgoing.anchor_y));
-                    let native_outlier = native_delta.is_some()
+                    let native_outlier = cfg!(target_os = "macos")
+                        && native_delta.is_some()
                         && (raw_delta_x.unsigned_abs() > MAX_NATIVE_DELTA_PER_EVENT as u32
                             || raw_delta_y.unsigned_abs() > MAX_NATIVE_DELTA_PER_EVENT as u32);
                     let (delta_x, delta_y) = if native_outlier {
@@ -1303,20 +1334,9 @@ impl Inner {
                             clamp_physical_delta(raw_delta_y),
                         )
                     };
-                    #[cfg(target_os = "windows")]
-                    {
-                        outgoing.anchor_x = x;
-                        outgoing.anchor_y = y;
-                        if x <= SOURCE_CURSOR_RECENTER_MARGIN
-                            || x >= width - 1 - SOURCE_CURSOR_RECENTER_MARGIN
-                            || y <= SOURCE_CURSOR_RECENTER_MARGIN
-                            || y >= height - 1 - SOURCE_CURSOR_RECENTER_MARGIN
-                        {
-                            outgoing.anchor_x = width / 2;
-                            outgoing.anchor_y = height / 2;
-                            should_recenter = true;
-                        }
-                    }
+                    // Suppressed Windows movement never updates the OS cursor.
+                    // Keep the capture anchor fixed; the hook provides each
+                    // physical delta relative to the actual cursor position.
                     if delta_x != 0 || delta_y != 0 {
                         if !outgoing.first_move_logged {
                             outgoing.first_move_logged = true;
@@ -1351,7 +1371,7 @@ impl Inner {
                                     total_y_milli: outgoing.total_y_milli,
                                 },
                             );
-                            if self.outbound.try_send(signal).is_ok() {
+                            if self.outbound.send(signal).is_ok() {
                                 outgoing.last_move_sent_at = now;
                                 outgoing.last_sent_x_milli = outgoing.total_x_milli;
                                 outgoing.last_sent_y_milli = outgoing.total_y_milli;
@@ -1361,7 +1381,7 @@ impl Inner {
                 }
                 HookMouseEvent::Button { button, pressed } => {
                     if outgoing.acknowledged {
-                        let _ = self.outbound.blocking_send(outbound(
+                        let _ = self.outbound.send(outbound(
                             &peer_id,
                             MouseSignal::Button {
                                 session_id,
@@ -1383,7 +1403,7 @@ impl Inner {
                         outgoing.scroll_sequence = outgoing.scroll_sequence.saturating_add(1);
                         if self
                             .outbound
-                            .try_send(outbound(
+                            .send(outbound(
                                 &peer_id,
                                 MouseSignal::Scroll {
                                     session_id,
@@ -1401,13 +1421,9 @@ impl Inner {
                 }
                 _ => {}
             }
-            let anchor = (outgoing.anchor_x, outgoing.anchor_y);
             drop(runtime);
             if let Err(error) = ensure_source_cursor_captured() {
                 self.logger.warn("mouse_cursor_guard_failed", error);
-            }
-            if should_recenter {
-                let _ = recenter_cursor(anchor.0, anchor.1, bounds);
             }
             return true;
         }
@@ -1482,7 +1498,7 @@ impl Inner {
                         self.focus_local();
                         return true;
                     }
-                    let _ = self.outbound.blocking_send(enter);
+                    let _ = self.outbound.send(enter);
                     return true;
                 }
             }
@@ -1563,7 +1579,7 @@ impl Inner {
         let peer_id = outgoing.peer_id.clone();
         let session_id = outgoing.session_id.clone();
         drop(runtime);
-        let _ = self.outbound.blocking_send(outbound(
+        let _ = self.outbound.send(outbound(
             &peer_id,
             MouseSignal::Key {
                 session_id,
@@ -1921,4 +1937,102 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn injection_coalesces_motion_without_reordering_buttons() {
+        let queue = InjectionQueue::new();
+        queue.push(absolute_move(1, 2));
+        queue.push(absolute_move(3, 4));
+        let button = HookMouseEvent::Button {
+            button: HookMouseButton::Left,
+            pressed: true,
+        };
+        queue.push(button);
+        queue.push(absolute_move(5, 6));
+        queue.push(absolute_move(7, 8));
+        assert_eq!(queue.pop(), absolute_move(3, 4));
+        assert_eq!(queue.pop(), button);
+        assert_eq!(queue.pop(), absolute_move(7, 8));
+    }
+
+    #[test]
+    fn repeated_suppressed_moves_keep_accumulating_from_fixed_anchor() {
+        let directory = std::env::temp_dir().join(format!("crosscopy-test-{}", Uuid::new_v4()));
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let mut session = new_outgoing_session(
+            "peer".into(),
+            "session".into(),
+            ScreenPosition::Right,
+            0.5,
+            now_ms(),
+            500,
+            400,
+        );
+        session.acknowledged = true;
+        let inner = Inner {
+            enabled: AtomicBool::new(true),
+            extreme_performance: Arc::new(AtomicBool::new(true)),
+            listener_attempted: AtomicBool::new(false),
+            listener_started: AtomicBool::new(false),
+            keyboard_listener_attempted: AtomicBool::new(false),
+            keyboard_listener_started: AtomicBool::new(false),
+            source_control_active: Arc::new(AtomicBool::new(true)),
+            latency_ms: AtomicU64::new(NO_LATENCY),
+            last_physical_at: AtomicU64::new(0),
+            runtime: Mutex::new(Runtime {
+                targets: Vec::new(),
+                receive_dpi: Vec::new(),
+                last_x: 0,
+                last_y: 0,
+                crossing_blocked_until: 0,
+                outgoing: Some(session),
+                incoming: None,
+                local_held_keys: HashSet::new(),
+                suppressed_shortcut_keys: HashSet::new(),
+            }),
+            outbound: sender,
+            injector: InjectionQueue::new(),
+            logger: Arc::new(Logger::new(&directory).unwrap()),
+            bounds: Mutex::new(DesktopBounds {
+                x: 0,
+                y: 0,
+                width: 1000,
+                height: 800,
+            }),
+        };
+        for _ in 0..10 {
+            assert!(inner.handle_local_event(HookMouseEvent::Move {
+                x: 505,
+                y: 400,
+                native_delta: None
+            }));
+        }
+        for expected in 1..=10 {
+            let signal = receiver.try_recv().unwrap().signal;
+            match signal {
+                MouseSignal::Move { total_x_milli, .. } => {
+                    assert_eq!(total_x_milli, expected * scaled_pointer_delta(5))
+                }
+                _ => panic!("expected motion"),
+            }
+        }
+        assert_eq!(
+            inner
+                .runtime
+                .lock()
+                .unwrap()
+                .outgoing
+                .as_ref()
+                .unwrap()
+                .anchor_x,
+            500
+        );
+        drop(inner);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 }

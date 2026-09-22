@@ -16,12 +16,19 @@ use crate::{
 #[cfg(target_os = "windows")]
 #[path = "windows_clipboard.rs"]
 mod windows_clipboard;
+#[cfg(target_os = "macos")]
+#[path = "macos_clipboard.rs"]
+mod macos_clipboard;
 use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Nonce,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use clipboard_rs::{Clipboard, ClipboardContent, ClipboardContext, ContentFormat};
+use clipboard_rs::{Clipboard, ClipboardContext, ContentFormat};
+#[cfg(not(target_os = "macos"))]
+use clipboard_rs::ClipboardContent;
+#[cfg(target_os = "macos")]
+use macos_clipboard::{capture_clipboard, restore_clipboard};
 use enigo::{
     Direction::{Click, Press, Release},
     Enigo, Key, Keyboard, Settings as EnigoSettings,
@@ -220,6 +227,7 @@ enum PendingClipboard {
     Files(Vec<String>),
 }
 
+#[cfg(not(target_os = "macos"))]
 enum ClipboardSnapshot {
     Contents(Vec<ClipboardContent>),
     Empty,
@@ -265,7 +273,7 @@ pub struct Core {
     port: AtomicU64,
     instance_id: String,
     mouse: Arc<MouseShare>,
-    mouse_receiver: Mutex<Option<mpsc::Receiver<OutboundMouseSignal>>>,
+    mouse_receiver: Mutex<Option<mpsc::UnboundedReceiver<OutboundMouseSignal>>>,
     mouse_socket: Mutex<Option<Arc<UdpSocket>>>,
     mouse_routes: Mutex<HashMap<String, MouseRoute>>,
     device_id: String,
@@ -274,7 +282,7 @@ pub struct Core {
 impl Core {
     pub fn new(store: Arc<Store>, logger: Arc<Logger>, app: AppHandle) -> Arc<Self> {
         let device_id = store.get().device_id;
-        let (mouse_sender, mouse_receiver) = mpsc::channel(256);
+        let (mouse_sender, mouse_receiver) = mpsc::unbounded_channel();
         let mouse = MouseShare::new(Arc::clone(&logger), mouse_sender);
         Arc::new(Self {
             store,
@@ -1121,6 +1129,8 @@ impl Core {
                 "shortcut_copy_simulation_started",
                 native_shortcut_dispatch_detail(),
             );
+            #[cfg(target_os = "macos")]
+            let previous_revision = macos_clipboard::revision();
             if let Err(error) = simulate_native_shortcut(&self.app, 'c').await {
                 self.logger.error("shortcut_copy_simulation_failed", &error);
                 self.add_activity("system", "无法复制", &error, "error");
@@ -1128,8 +1138,16 @@ impl Core {
             }
             self.logger
                 .info("shortcut_copy_simulation_completed", "success=true");
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            let event = read_current_clipboard(&self.logger).await;
+            #[cfg(target_os = "macos")]
+            let event = match macos_clipboard::wait_for_change(previous_revision).await {
+                Ok(()) => read_current_clipboard(&self.logger).await,
+                Err(error) => Err(error),
+            };
+            #[cfg(not(target_os = "macos"))]
+            let event = {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                read_current_clipboard(&self.logger).await
+            };
             if let Err(error) = restore_clipboard(original, &self.logger).await {
                 self.logger.error("clipboard_restore_failed", &error);
                 self.add_activity("system", "恢复本机剪贴板失败", &error, "error");
@@ -1305,9 +1323,11 @@ impl Core {
         let socket = UdpSocket::bind(("0.0.0.0", DISCOVERY_PORT))
             .await
             .map_err(|e| e.to_string())?;
-        socket
-            .join_multicast_v4(MULTICAST, Ipv4Addr::UNSPECIFIED)
-            .map_err(|e| e.to_string())?;
+        // A disconnected/VPN interface may reject multicast at launch. LAN
+        // broadcast and known-peer unicast can still discover the other host.
+        if let Err(error) = socket.join_multicast_v4(MULTICAST, Ipv4Addr::UNSPECIFIED) {
+            self.logger.warn("discovery_multicast_unavailable", error.to_string());
+        }
         socket.set_multicast_ttl_v4(1).map_err(|e| e.to_string())?;
         socket
             .set_multicast_loop_v4(false)
@@ -1334,6 +1354,7 @@ impl Core {
             let mut buffer = [0_u8; 4096];
             loop {
                 let Ok((size, source)) = mouse_socket.recv_from(&mut buffer).await else {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                     continue;
                 };
                 let Ok(packet) = serde_json::from_slice::<UdpMousePacket>(&buffer[..size]) else {
@@ -1526,6 +1547,9 @@ impl Core {
                         return;
                     }
                 };
+                if let Err(error) = send_socket.set_write_timeout(Some(Duration::from_millis(100))) {
+                    core.logger.warn("mouse_network_timeout_failed", error.to_string());
+                }
                 let mut last_error_log = 0_u64;
                 let mut pending = None;
                 loop {
@@ -3179,6 +3203,7 @@ async fn read_current_clipboard(logger: &Logger) -> Result<LocalClipboard, Strin
     Err(last_error)
 }
 
+#[cfg(not(target_os = "macos"))]
 async fn capture_clipboard(logger: &Logger) -> Result<ClipboardSnapshot, String> {
     let mut last_error = String::new();
     for attempt in 1..=CLIPBOARD_RETRY_ATTEMPTS {
@@ -3222,6 +3247,7 @@ async fn capture_clipboard(logger: &Logger) -> Result<ClipboardSnapshot, String>
     Err(format!("保护本机剪贴板失败：{last_error}"))
 }
 
+#[cfg(not(target_os = "macos"))]
 async fn restore_clipboard(snapshot: ClipboardSnapshot, logger: &Logger) -> Result<(), String> {
     match snapshot {
         ClipboardSnapshot::Contents(contents) => {
