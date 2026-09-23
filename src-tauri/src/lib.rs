@@ -246,8 +246,11 @@ fn unpair(core: State<'_, Arc<Core>>, peer_id: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn export_diagnostics(core: State<'_, Arc<Core>>) -> Result<String, String> {
-    core.export_diagnostics()
+async fn export_diagnostics(
+    core: State<'_, Arc<Core>>,
+    peer_id: Option<String>,
+) -> Result<String, String> {
+    core.export_diagnostics(peer_id).await
 }
 
 #[tauri::command]

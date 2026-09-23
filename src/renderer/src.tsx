@@ -59,7 +59,8 @@ const crosscopy = {
   setLaunchAtLogin: (value: boolean) =>
     invoke<void>("set_launch_at_login", { value }),
   unpair: (peerId: string) => invoke<void>("unpair", { peerId }),
-  exportDiagnostics: () => invoke<string>("export_diagnostics"),
+  exportDiagnostics: (peerId?: string) =>
+    invoke<string>("export_diagnostics", { peerId: peerId ?? null }),
   getUpdateEnvironment: () =>
     invoke<UpdateEnvironment>("get_update_environment"),
   logUpdateEvent: (level: string, event: string, detail: string) =>
@@ -233,10 +234,10 @@ function App(): React.JSX.Element {
     setError("");
   }
 
-  async function exportDiagnostics(): Promise<void> {
+  async function exportDiagnostics(peerId?: string): Promise<void> {
     setDiagnosticsMessage("正在生成");
     try {
-      const path = await crosscopy.exportDiagnostics();
+      const path = await crosscopy.exportDiagnostics(peerId);
       setDiagnosticsMessage(`已导出到 ${path}`);
     } catch (reason) {
       setDiagnosticsMessage(
@@ -2438,7 +2439,7 @@ function ShortcutSettings(props: {
 function SettingsPanel(props: {
   state: UiState;
   diagnosticsMessage: string;
-  onDiagnostics(): Promise<void>;
+  onDiagnostics(peerId?: string): Promise<void>;
 }): React.JSX.Element {
   const isMac = navigator.userAgent.includes("Mac");
 
@@ -2563,7 +2564,7 @@ function SettingsPanel(props: {
         <div className="preference-row">
           <span>
             <strong>诊断日志</strong>
-            <small>不包含配对码、剪贴板内容或完整文件路径</small>
+            <small>可导出本机或在线配对设备；不包含配对码、剪贴板内容、输入字符或完整文件路径</small>
           </span>
           <div className="diagnostics-setting">
             <button
@@ -2572,8 +2573,19 @@ function SettingsPanel(props: {
               onClick={() => void props.onDiagnostics()}
             >
               <FileText size={16} />
-              导出日志
+              导出本机日志
             </button>
+            {props.state.peers.filter((peer) => peer.online).map((peer) => (
+              <button
+                className="secondary-button"
+                type="button"
+                key={peer.id}
+                onClick={() => void props.onDiagnostics(peer.id)}
+              >
+                <FileText size={16} />
+                导出 {peer.name} 日志
+              </button>
+            ))}
             {props.diagnosticsMessage && <small>{props.diagnosticsMessage}</small>}
           </div>
         </div>

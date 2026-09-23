@@ -515,6 +515,42 @@ pub fn set_source_cursor_captured(captured: bool) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+pub fn cursor_diagnostics() -> String {
+    unsafe extern "C" {
+        fn CGCursorIsVisible() -> u32;
+    }
+    let captured = SOURCE_CURSOR_CAPTURED.load(Ordering::Acquire);
+    let visible = unsafe { CGCursorIsVisible() } != 0;
+    format!(
+        "captured={captured} visible={visible} capture_visibility_conflict={}",
+        captured && visible
+    )
+}
+
+#[cfg(target_os = "windows")]
+pub fn cursor_diagnostics() -> String {
+    use windows::Win32::{Foundation::POINT, UI::WindowsAndMessaging::GetCursorPos};
+    let mut point = POINT::default();
+    let position = if unsafe { GetCursorPos(&mut point) }.is_ok() {
+        format!("x={} y={}", point.x, point.y)
+    } else {
+        "x=unknown y=unknown".to_string()
+    };
+    format!(
+        "captured={} {position}",
+        SOURCE_CURSOR_CAPTURED.load(Ordering::Acquire)
+    )
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub fn cursor_diagnostics() -> String {
+    format!(
+        "captured={}",
+        SOURCE_CURSOR_CAPTURED.load(Ordering::Acquire)
+    )
+}
+
 /// macOS may make the cursor visible again while it is disassociated (for
 /// example after a display or application transition).  Re-hide it without
 /// changing the capture state or accumulating unbalanced hide calls.

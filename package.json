@@ -1,6 +1,6 @@
 {
   "name": "crosscopy",
-  "version": "3.2.7",
+  "version": "3.2.8",
   "description": "Fast private LAN mouse sharing and clipboard sync",
   "type": "module",
   "scripts": {

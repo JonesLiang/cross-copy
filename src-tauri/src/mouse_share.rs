@@ -2,9 +2,9 @@ use crate::{
     logger::Logger,
     model::ScreenPosition,
     mouse_hook::{
-        ensure_source_cursor_captured, recenter_cursor, run_keyboard_hook, run_mouse_hook,
-        screen_bounds, set_realtime_priority, set_source_cursor_captured, DesktopBounds, HookKey,
-        HookMouseButton, HookMouseEvent, SYNTHETIC_INPUT_MARKER,
+        cursor_diagnostics, ensure_source_cursor_captured, recenter_cursor, run_keyboard_hook,
+        run_mouse_hook, screen_bounds, set_realtime_priority, set_source_cursor_captured,
+        DesktopBounds, HookKey, HookMouseButton, HookMouseEvent, SYNTHETIC_INPUT_MARKER,
     },
 };
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
@@ -258,6 +258,29 @@ struct Runtime {
 }
 
 impl Runtime {
+    fn trace_state(&self) -> String {
+        let outgoing = self.outgoing.as_ref().map_or_else(
+            || "none".to_string(),
+            |s| {
+                format!(
+                    "peer={} session={} ack={} seq={} total=({},{}),last_remote={}",
+                    s.peer_id,
+                    short_id(&s.session_id),
+                    s.acknowledged,
+                    s.move_sequence,
+                    s.total_x_milli,
+                    s.total_y_milli,
+                    s.last_remote_at
+                )
+            },
+        );
+        let incoming = self.incoming.as_ref().map_or_else(
+            || "none".to_string(),
+            |s| format!("peer={} session={} seq={} pos=({},{}),return_armed={} push={} held_buttons={:?} held_keys={} last_event={}", s.peer_id, short_id(&s.session_id), s.last_move_sequence, s.last_injected_x, s.last_injected_y, s.return_armed, s.return_push_milli, s.held_buttons, s.held_keys.len(), s.last_event_at),
+        );
+        format!("outgoing=[{outgoing}] incoming=[{incoming}] edge_armed={} blocked_until={} last=({},{}),takeover_delta={:?}", self.edge_armed, self.crossing_blocked_until, self.last_x, self.last_y, self.takeover_delta)
+    }
+
     fn retire_incoming(&mut self) -> Option<IncomingSession> {
         let incoming = self.incoming.take()?;
         self.retired_sessions
@@ -369,14 +392,17 @@ impl MouseShare {
                 loop {
                     let queued = injection_receiver.pop();
                     let event = queued.event;
+                    injection_logger.mouse_trace("inject_dequeued", format!("event={} generation={} current_generation={} queue_ms={} source_control_active={}", describe_hook_event(event), queued.generation, injection_receiver.generation.load(Ordering::Acquire), queued.queued_at.elapsed().as_millis(), injector_source_control_active.load(Ordering::Acquire)));
                     if queued.generation != injection_receiver.generation.load(Ordering::Acquire)
                         && !is_release(event)
                     {
+                        injection_logger.mouse_trace("inject_dropped", "reason=stale_generation");
                         continue;
                     }
                     if matches!(event, HookMouseEvent::Move { .. })
                         && injector_source_control_active.load(Ordering::Acquire)
                     {
+                        injection_logger.mouse_trace("inject_dropped", "reason=source_control_active_move");
                         continue;
                     }
                     let requested = injector_extreme_performance.load(Ordering::Acquire);
@@ -408,7 +434,8 @@ impl MouseShare {
                     }
                     let queue_ms = queued.queued_at.elapsed().as_millis();
                     let started = std::time::Instant::now();
-                    if let Err(error) = inject_mouse_event(enigo.as_mut().unwrap(), event) {
+                    let result = inject_mouse_event(enigo.as_mut().unwrap(), event);
+                    if let Err(error) = &result {
                         let now = now_ms();
                         if now.saturating_sub(last_error_log) >= 1_000 {
                             last_error_log = now;
@@ -416,6 +443,7 @@ impl MouseShare {
                         }
                     }
                     let inject_ms = started.elapsed().as_millis();
+                    injection_logger.mouse_trace("inject_completed", format!("event={} ok={} queue_ms={} inject_ms={} cursor={}", describe_hook_event(event), result.is_ok(), queue_ms, inject_ms, cursor_diagnostics()));
                     if (queue_ms >= 32 || inject_ms >= 16)
                         && now_ms().saturating_sub(last_stall_log) >= 1_000
                     {
@@ -637,12 +665,25 @@ impl MouseShare {
 
     pub fn apply_remote(&self, peer_id: &str, signal: MouseSignal) -> Vec<OutboundMouseSignal> {
         let mut responses = Vec::new();
+        let signal_description = describe_mouse_signal(&signal);
         if !self.inner.enabled.load(Ordering::Acquire) {
+            self.inner.logger.mouse_trace(
+                "remote_signal_dropped",
+                format!("peer={peer_id} signal={signal_description} reason=disabled"),
+            );
             return responses;
         }
         let bounds = self.inner.desktop_bounds();
         let (width, height) = (bounds.width, bounds.height);
         let mut runtime = self.inner.runtime.lock().expect("mouse runtime lock");
+        self.inner.logger.mouse_trace(
+            "remote_signal_apply",
+            format!(
+                "peer={peer_id} signal={signal_description} state={} cursor={}",
+                runtime.trace_state(),
+                cursor_diagnostics()
+            ),
+        );
         let mut simulated_events = Vec::new();
         let mut source_ownership_changed = false;
         match signal {
@@ -1102,6 +1143,14 @@ impl MouseShare {
             }
         }
         drop(runtime);
+        self.inner.logger.mouse_trace(
+            "remote_signal_applied",
+            format!(
+                "peer={peer_id} signal={signal_description} responses={} cursor={}",
+                responses.len(),
+                cursor_diagnostics()
+            ),
+        );
         responses
     }
 
@@ -1543,8 +1592,25 @@ impl Inner {
         let (width, height) = (bounds.width, bounds.height);
         let event = localize_move(event, bounds);
         let mut runtime = self.runtime.lock().expect("mouse runtime lock");
+        self.logger.mouse_trace(
+            "local_mouse_event",
+            format!(
+                "event={} state={} cursor={}",
+                describe_hook_event(event),
+                runtime.trace_state(),
+                cursor_diagnostics()
+            ),
+        );
         if runtime.incoming.is_some() {
             if runtime.local_intent(event, now) {
+                self.logger.mouse_trace(
+                    "local_mouse_decision",
+                    format!(
+                        "decision=takeover pass_to_os=true event={} state={}",
+                        describe_hook_event(event),
+                        runtime.trace_state()
+                    ),
+                );
                 self.take_over_incoming(&mut runtime, now);
                 if let HookMouseEvent::Move { x, y, .. } = event {
                     runtime.last_x = x;
@@ -1552,6 +1618,14 @@ impl Inner {
                 }
                 return false;
             }
+            self.logger.mouse_trace(
+                "local_mouse_decision",
+                format!(
+                    "decision=suppress_while_remote_controls pass_to_os=false event={} state={}",
+                    describe_hook_event(event),
+                    runtime.trace_state()
+                ),
+            );
             return true;
         }
 
@@ -1669,6 +1743,14 @@ impl Inner {
             if let Err(error) = ensure_source_cursor_captured() {
                 self.logger.warn("mouse_cursor_guard_failed", error);
             }
+            self.logger.mouse_trace(
+                "local_mouse_decision",
+                format!(
+                    "decision=forward_to_remote pass_to_os=false event={} cursor={}",
+                    describe_hook_event(event),
+                    cursor_diagnostics()
+                ),
+            );
             return true;
         }
 
@@ -1754,10 +1836,25 @@ impl Inner {
                         return true;
                     }
                     let _ = self.outbound.send(enter);
+                    self.logger.mouse_trace(
+                        "local_mouse_decision",
+                        format!(
+                            "decision=cross_to_remote peer={peer_id} pass_to_os=false cursor={}",
+                            cursor_diagnostics()
+                        ),
+                    );
                     return true;
                 }
             }
         }
+        self.logger.mouse_trace(
+            "local_mouse_decision",
+            format!(
+                "decision=local pass_to_os=true event={} state={}",
+                describe_hook_event(event),
+                runtime.trace_state()
+            ),
+        );
         false
     }
 
@@ -1766,6 +1863,15 @@ impl Inner {
             return false;
         }
         let mut runtime = self.runtime.lock().expect("mouse runtime lock");
+        self.logger.mouse_trace(
+            "local_key_event",
+            format!(
+                "key={} pressed={} state={}",
+                describe_key(key),
+                pressed,
+                runtime.trace_state()
+            ),
+        );
         if runtime.incoming.is_some() {
             if pressed {
                 self.take_over_incoming(&mut runtime, now_ms());
@@ -1854,7 +1960,110 @@ impl Inner {
 
     fn inject(&self, event: HookMouseEvent) {
         let event = globalize_move(event, self.desktop_bounds());
+        self.logger.mouse_trace(
+            "inject_queued",
+            format!(
+                "event={} generation={}",
+                describe_hook_event(event),
+                self.injector.generation.load(Ordering::Acquire)
+            ),
+        );
         self.injector.push(event);
+    }
+}
+
+fn short_id(value: &str) -> &str {
+    value.get(..8).unwrap_or(value)
+}
+
+fn describe_key(key: HookKey) -> String {
+    match key {
+        HookKey::Character(_) => "character".to_string(),
+        HookKey::Function(number) => format!("function-{number}"),
+        HookKey::Numpad(number) => format!("numpad-{number}"),
+        other => format!("{other:?}"),
+    }
+}
+
+fn describe_hook_event(event: HookMouseEvent) -> String {
+    match event {
+        HookMouseEvent::Move { x, y, native_delta } => {
+            format!("move x={x} y={y} native_delta={native_delta:?}")
+        }
+        HookMouseEvent::Button { button, pressed } => {
+            format!("button={button:?} pressed={pressed}")
+        }
+        HookMouseEvent::Scroll {
+            delta_x_milli,
+            delta_y_milli,
+        } => format!("scroll dx={delta_x_milli} dy={delta_y_milli}"),
+        HookMouseEvent::Key { key, pressed } => {
+            format!("key={} pressed={pressed}", describe_key(key))
+        }
+    }
+}
+
+pub fn describe_mouse_signal(signal: &MouseSignal) -> String {
+    match signal {
+        MouseSignal::Enter {
+            session_id,
+            entry_edge,
+            ratio,
+            sent_at,
+        } => format!(
+            "enter session={} edge={entry_edge:?} ratio={ratio:.4} sent_at={sent_at}",
+            short_id(session_id)
+        ),
+        MouseSignal::Move {
+            session_id,
+            sequence,
+            total_x_milli,
+            total_y_milli,
+        } => format!(
+            "move session={} seq={sequence} total=({total_x_milli},{total_y_milli})",
+            short_id(session_id)
+        ),
+        MouseSignal::Button {
+            session_id,
+            button,
+            pressed,
+        } => format!(
+            "button session={} button={button:?} pressed={pressed}",
+            short_id(session_id)
+        ),
+        MouseSignal::Scroll {
+            session_id,
+            sequence,
+            total_x_milli,
+            total_y_milli,
+        } => format!(
+            "scroll session={} seq={sequence} total=({total_x_milli},{total_y_milli})",
+            short_id(session_id)
+        ),
+        MouseSignal::Key {
+            session_id,
+            key,
+            pressed,
+        } => format!(
+            "key session={} key={} pressed={pressed}",
+            short_id(session_id),
+            describe_key(*key)
+        ),
+        MouseSignal::Return { session_id, ratio } => {
+            format!("return session={} ratio={ratio:.4}", short_id(session_id))
+        }
+        MouseSignal::Cancel { session_id } => format!("cancel session={}", short_id(session_id)),
+        MouseSignal::Ack {
+            session_id,
+            sent_at,
+        } => format!("ack session={} sent_at={sent_at}", short_id(session_id)),
+        MouseSignal::Latency {
+            session_id,
+            milliseconds,
+        } => format!("latency session={} ms={milliseconds}", short_id(session_id)),
+        MouseSignal::KeepAlive { session_id } => {
+            format!("keep_alive session={}", short_id(session_id))
+        }
     }
 }
 

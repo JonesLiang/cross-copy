@@ -9,30 +9,30 @@ use crate::{
         PeerView, ScreenPosition, TransferProgress, UiState,
     },
     mouse_hook::SYNTHETIC_INPUT_MARKER,
-    mouse_share::{MouseShare, MouseSignal, OutboundMouseSignal},
+    mouse_share::{describe_mouse_signal, MouseShare, MouseSignal, OutboundMouseSignal},
     remote_fs::{self, FsRequest, FsResponse},
     store::Store,
 };
-#[cfg(target_os = "windows")]
-#[path = "windows_clipboard.rs"]
-mod windows_clipboard;
 #[cfg(target_os = "macos")]
 #[path = "macos_clipboard.rs"]
 mod macos_clipboard;
+#[cfg(target_os = "windows")]
+#[path = "windows_clipboard.rs"]
+mod windows_clipboard;
 use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Nonce,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use clipboard_rs::{Clipboard, ClipboardContext, ContentFormat};
 #[cfg(not(target_os = "macos"))]
 use clipboard_rs::ClipboardContent;
-#[cfg(target_os = "macos")]
-use macos_clipboard::{capture_clipboard, restore_clipboard};
+use clipboard_rs::{Clipboard, ClipboardContext, ContentFormat};
 use enigo::{
     Direction::{Click, Press, Release},
     Enigo, Key, Keyboard, Settings as EnigoSettings,
 };
+#[cfg(target_os = "macos")]
+use macos_clipboard::{capture_clipboard, restore_clipboard};
 use rand::RngCore;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{
@@ -181,6 +181,7 @@ enum SecureMessage {
     TrustSync {
         snapshot: TrustSnapshot,
     },
+    DiagnosticsRequest,
     Filesystem {
         request: FsRequest,
     },
@@ -383,7 +384,11 @@ impl Core {
         // hold discovery/pairing locks across that call: mouse presence updates
         // and routing also need them.
         let discovered = self.discovered.lock().expect("discovery lock").clone();
-        let pairing = self.pairing.lock().expect("pairing lock").as_ref()
+        let pairing = self
+            .pairing
+            .lock()
+            .expect("pairing lock")
+            .as_ref()
             .map(|session| (session.code.clone(), session.expires_at));
         UiState {
             device_name: settings.device_name,
@@ -1113,7 +1118,8 @@ impl Core {
             return;
         }
         if let Err(error) = wait_for_shortcut_release().await {
-            self.logger.warn("clipboard_shortcut_modifiers_held", &error);
+            self.logger
+                .warn("clipboard_shortcut_modifiers_held", &error);
             self.add_activity("system", "快捷键尚未释放", &error, "error");
             return;
         }
@@ -1205,7 +1211,8 @@ impl Core {
             return;
         }
         if let Err(error) = wait_for_shortcut_release().await {
-            self.logger.warn("clipboard_shortcut_modifiers_held", &error);
+            self.logger
+                .warn("clipboard_shortcut_modifiers_held", &error);
             self.add_activity("system", "快捷键尚未释放", &error, "error");
             return;
         }
@@ -1297,7 +1304,7 @@ impl Core {
             .info("service_stop", "mouse_sessions_released=true");
     }
 
-    pub fn export_diagnostics(&self) -> Result<String, String> {
+    fn diagnostics_summary(&self) -> String {
         let settings = self.store.get();
         let now = now_ms();
         let online = self
@@ -1307,7 +1314,7 @@ impl Core {
             .values()
             .filter(|peer| now.saturating_sub(peer.last_seen) < ONLINE_WINDOW_MS)
             .count();
-        let summary = format!(
+        format!(
             "sync_enabled={}\nmouse_share_enabled={}\nmouse_extreme_performance={}\nmouse_protocol={}\nmouse_position={:?}\nmouse_listener_started={}\nmouse_latency_ms={:?}\npaired_peers={}\nonline_peers={}\ndiscovery_port={}\ntransfer_port={}\nmouse_port={}",
             settings.sync_enabled,
             settings.mouse_share_enabled,
@@ -1321,14 +1328,71 @@ impl Core {
             DISCOVERY_PORT,
             TRANSFER_PORT,
             MOUSE_PORT
-        );
+        )
+    }
+
+    pub async fn export_diagnostics(&self, peer_id: Option<String>) -> Result<String, String> {
+        let (bytes, label) = if let Some(peer_id) = peer_id {
+            let settings = self.store.get();
+            let peer = settings
+                .peers
+                .iter()
+                .find(|peer| peer.id == peer_id)
+                .ok_or("诊断日志目标不存在")?;
+            let seen = self
+                .discovered
+                .lock()
+                .expect("discovery lock")
+                .get(&peer_id)
+                .cloned()
+                .ok_or("诊断日志目标离线")?;
+            if now_ms().saturating_sub(seen.last_seen) >= ONLINE_WINDOW_MS {
+                return Err("诊断日志目标离线".into());
+            }
+            let key = decode_secret(&peer.secret)?;
+            let address = SocketAddr::new(seen.host, seen.packet.port);
+            self.logger.info(
+                "diagnostics_remote_request_started",
+                format!("peer={} target={}", peer.id, masked_ip(address.ip())),
+            );
+            let mut stream =
+                tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(address))
+                    .await
+                    .map_err(|_| "连接对端诊断服务超时".to_string())?
+                    .map_err(|error| error.to_string())?;
+            write_json(
+                &mut stream,
+                &WireMessage::Secure {
+                    sender_id: settings.device_id,
+                    envelope: encrypt(&key, &SecureMessage::DiagnosticsRequest)?,
+                },
+            )
+            .await?;
+            let bytes = tokio::time::timeout(
+                Duration::from_secs(15),
+                read_secure_frame(&mut stream, &key),
+            )
+            .await
+            .map_err(|_| "等待对端生成诊断日志超时".to_string())??;
+            self.logger.info(
+                "diagnostics_remote_request_completed",
+                format!("peer={} bytes={}", peer.id, bytes.len()),
+            );
+            (bytes, format!("remote-{}", safe_file_label(&peer.name)))
+        } else {
+            (
+                self.logger
+                    .export_bytes(&self.diagnostics_summary())
+                    .map_err(|error| error.to_string())?,
+                "local".to_string(),
+            )
+        };
         let directory = dirs::download_dir()
             .ok_or("无法找到下载目录")?
             .join("CrossCopy");
-        let path = self
-            .logger
-            .export(&directory, &summary)
-            .map_err(|e| e.to_string())?;
+        std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+        let path = directory.join(format!("CrossCopy-diagnostics-{label}-{}.txt", now_ms()));
+        std::fs::write(&path, bytes).map_err(|error| error.to_string())?;
         reveal_file(&path);
         self.logger
             .info("diagnostics_exported", "destination=downloads/CrossCopy");
@@ -1342,7 +1406,8 @@ impl Core {
         // A disconnected/VPN interface may reject multicast at launch. LAN
         // broadcast and known-peer unicast can still discover the other host.
         if let Err(error) = socket.join_multicast_v4(MULTICAST, Ipv4Addr::UNSPECIFIED) {
-            self.logger.warn("discovery_multicast_unavailable", error.to_string());
+            self.logger
+                .warn("discovery_multicast_unavailable", error.to_string());
         }
         socket.set_multicast_ttl_v4(1).map_err(|e| e.to_string())?;
         socket
@@ -1373,7 +1438,18 @@ impl Core {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     continue;
                 };
+                mouse_receive_core.logger.mouse_trace(
+                    "udp_datagram_received",
+                    format!("source={} bytes={size}", masked_ip(source.ip())),
+                );
                 let Ok(packet) = serde_json::from_slice::<UdpMousePacket>(&buffer[..size]) else {
+                    mouse_receive_core.logger.mouse_trace(
+                        "udp_datagram_rejected",
+                        format!(
+                            "source={} bytes={size} reason=invalid_json",
+                            masked_ip(source.ip())
+                        ),
+                    );
                     continue;
                 };
                 if let Err(error) = mouse_receive_core.handle_udp_mouse(source, packet).await {
@@ -1557,7 +1633,9 @@ impl Core {
             loop {
                 wake.notified().await;
                 tokio::time::sleep(Duration::from_millis(16)).await;
-                let Some(core) = weak.upgrade() else { return; };
+                let Some(core) = weak.upgrade() else {
+                    return;
+                };
                 let _ = tauri::async_runtime::spawn_blocking(move || core.publish()).await;
             }
         });
@@ -1573,8 +1651,10 @@ impl Core {
                         return;
                     }
                 };
-                if let Err(error) = send_socket.set_write_timeout(Some(Duration::from_millis(100))) {
-                    core.logger.warn("mouse_network_timeout_failed", error.to_string());
+                if let Err(error) = send_socket.set_write_timeout(Some(Duration::from_millis(100)))
+                {
+                    core.logger
+                        .warn("mouse_network_timeout_failed", error.to_string());
                 }
                 let mut last_error_log = 0_u64;
                 let mut pending = None;
@@ -1787,6 +1867,7 @@ impl Core {
     }
 
     async fn send_mouse_signal(&self, outbound: OutboundMouseSignal) -> Result<(), String> {
+        let description = describe_mouse_signal(&outbound.signal);
         let route = self
             .mouse_routes
             .lock()
@@ -1807,10 +1888,18 @@ impl Core {
             envelope: encrypt(&route.key, &outbound.signal)?,
         };
         let bytes = serde_json::to_vec(&packet).map_err(|error| error.to_string())?;
-        socket
+        let sent = socket
             .send_to(&bytes, route.address)
             .await
             .map_err(|error| error.to_string())?;
+        self.logger.mouse_trace(
+            "udp_signal_sent",
+            format!(
+                "peer={} target={} bytes={sent} signal={description}",
+                outbound.peer_id,
+                masked_ip(route.address.ip())
+            ),
+        );
         Ok(())
     }
 
@@ -1819,6 +1908,7 @@ impl Core {
         socket: &std::net::UdpSocket,
         outbound: OutboundMouseSignal,
     ) -> Result<(), String> {
+        let description = describe_mouse_signal(&outbound.signal);
         let route = self
             .mouse_routes
             .lock()
@@ -1833,9 +1923,17 @@ impl Core {
             envelope: encrypt(&route.key, &outbound.signal)?,
         };
         let bytes = serde_json::to_vec(&packet).map_err(|error| error.to_string())?;
-        socket
+        let sent = socket
             .send_to(&bytes, route.address)
             .map_err(|error| error.to_string())?;
+        self.logger.mouse_trace(
+            "udp_signal_sent",
+            format!(
+                "peer={} target={} bytes={sent} signal={description}",
+                outbound.peer_id,
+                masked_ip(route.address.ip())
+            ),
+        );
         Ok(())
     }
 
@@ -1855,6 +1953,15 @@ impl Core {
             .cloned()
             .ok_or("鼠标数据来自未授权、离线或未开启共享的设备")?;
         let signal: MouseSignal = decrypt(&route.key, &packet.envelope)?;
+        self.logger.mouse_trace(
+            "udp_signal_decrypted",
+            format!(
+                "peer={} source={} signal={}",
+                packet.sender_id,
+                masked_ip(source.ip()),
+                describe_mouse_signal(&signal)
+            ),
+        );
         let publish_state = mouse_signal_changes_state(&signal);
         let now = now_ms();
         let previous_presence = self.last_mouse_presence_refresh.load(Ordering::Relaxed);
@@ -2576,6 +2683,21 @@ impl Core {
                     SecureMessage::TrustSync { snapshot } => {
                         self.merge_trust_snapshot(snapshot)?;
                         Ok(())
+                    }
+                    SecureMessage::DiagnosticsRequest => {
+                        self.logger.info(
+                            "diagnostics_remote_request_received",
+                            format!("peer={}", peer.id),
+                        );
+                        let bytes = self
+                            .logger
+                            .export_bytes(&self.diagnostics_summary())
+                            .map_err(|error| error.to_string())?;
+                        self.logger.info(
+                            "diagnostics_remote_response",
+                            format!("peer={} bytes={}", peer.id, bytes.len()),
+                        );
+                        write_secure_frame(&mut stream, &key, &bytes).await
                     }
                     SecureMessage::Filesystem { request } => {
                         let response = if peer.filesystem_allowed {
@@ -3402,10 +3524,17 @@ fn native_shortcut_key(key: char) -> Result<Key, String> {
 }
 
 async fn wait_for_shortcut_release() -> Result<(), String> {
-    wait_for_modifiers_released(crate::mouse_hook::shortcut_modifiers_down, Duration::from_secs(3)).await
+    wait_for_modifiers_released(
+        crate::mouse_hook::shortcut_modifiers_down,
+        Duration::from_secs(3),
+    )
+    .await
 }
 
-async fn wait_for_modifiers_released(mut pressed: impl FnMut() -> bool, timeout: Duration) -> Result<(), String> {
+async fn wait_for_modifiers_released(
+    mut pressed: impl FnMut() -> bool,
+    timeout: Duration,
+) -> Result<(), String> {
     let deadline = tokio::time::Instant::now() + timeout;
     while pressed() {
         if tokio::time::Instant::now() >= deadline {
@@ -3935,6 +4064,25 @@ fn reveal_file(path: &Path) {
     }
 }
 
+fn safe_file_label(value: &str) -> String {
+    let label: String = value
+        .chars()
+        .map(|ch| {
+            if ch.is_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .take(48)
+        .collect();
+    if label.is_empty() {
+        "peer".into()
+    } else {
+        label
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(target_os = "windows")]
@@ -3947,13 +4095,23 @@ mod tests {
     #[tokio::test]
     async fn clipboard_shortcut_waits_for_modifier_release() {
         let mut polls = 0;
-        super::wait_for_modifiers_released(|| { polls += 1; polls < 3 }, std::time::Duration::from_secs(1)).await.unwrap();
+        super::wait_for_modifiers_released(
+            || {
+                polls += 1;
+                polls < 3
+            },
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
         assert_eq!(polls, 3);
     }
 
     #[tokio::test]
     async fn clipboard_shortcut_reports_held_modifiers_instead_of_copying() {
-        let error = super::wait_for_modifiers_released(|| true, std::time::Duration::ZERO).await.unwrap_err();
+        let error = super::wait_for_modifiers_released(|| true, std::time::Duration::ZERO)
+            .await
+            .unwrap_err();
         assert!(error.contains("松开"));
     }
 

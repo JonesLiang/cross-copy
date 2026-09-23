@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     net::IpAddr,
@@ -9,6 +10,7 @@ use std::{
 
 const MAX_LOG_BYTES: u64 = 2 * 1024 * 1024;
 const ROTATED_LOGS: usize = 3;
+const MOUSE_TRACE_CAPACITY: usize = 50_000;
 
 struct LogState {
     file: File,
@@ -26,6 +28,7 @@ pub struct Logger {
     general: LogTarget,
     mouse: LogTarget,
     clipboard: LogTarget,
+    mouse_trace: Mutex<VecDeque<String>>,
 }
 
 impl Logger {
@@ -36,6 +39,7 @@ impl Logger {
             general: open_target(&directory, "crosscopy.log")?,
             mouse: open_target(&directory, "mouse.log")?,
             clipboard: open_target(&directory, "clipboard.log")?,
+            mouse_trace: Mutex::new(VecDeque::with_capacity(MOUSE_TRACE_CAPACITY)),
             directory,
         })
     }
@@ -52,11 +56,27 @@ impl Logger {
         self.write("ERROR", event, detail.as_ref());
     }
 
-    pub fn export(&self, destination_directory: &Path, summary: &str) -> io::Result<PathBuf> {
-        fs::create_dir_all(destination_directory)?;
-        let destination =
-            destination_directory.join(format!("CrossCopy-diagnostics-{}.txt", now_ms()));
-        let mut output = File::create(&destination)?;
+    /// High-volume mouse diagnostics are kept in memory so tracing cannot add
+    /// synchronous disk I/O to an input hook or the realtime network path.
+    pub fn mouse_trace(&self, event: &str, detail: impl AsRef<str>) {
+        let detail = sanitize(detail.as_ref());
+        let line = format!("{} event={} detail={}", now_ms(), event, detail);
+        let Ok(mut trace) = self.mouse_trace.lock() else {
+            return;
+        };
+        if trace.len() == MOUSE_TRACE_CAPACITY {
+            trace.pop_front();
+        }
+        trace.push_back(line);
+    }
+
+    pub fn export_bytes(&self, summary: &str) -> io::Result<Vec<u8>> {
+        let mut output = Vec::new();
+        self.write_export(&mut output, summary)?;
+        Ok(output)
+    }
+
+    fn write_export(&self, output: &mut impl Write, summary: &str) -> io::Result<()> {
         writeln!(output, "CrossCopy diagnostics")?;
         writeln!(output, "generated_at_ms={}", now_ms())?;
         writeln!(output, "app_version={}", env!("CARGO_PKG_VERSION"))?;
@@ -67,18 +87,27 @@ impl Logger {
             std::env::consts::ARCH
         )?;
         writeln!(output, "{summary}")?;
-        self.append_target("general logs", &self.general, &mut output)?;
-        self.append_target("mouse logs", &self.mouse, &mut output)?;
-        self.append_target("clipboard logs", &self.clipboard, &mut output)?;
-        output.flush()?;
-        Ok(destination)
+        self.append_target("general logs", &self.general, output)?;
+        self.append_target("mouse logs", &self.mouse, output)?;
+        self.append_target("clipboard logs", &self.clipboard, output)?;
+        writeln!(output, "\n--- realtime mouse trace (oldest to newest) ---")?;
+        if let Ok(trace) = self.mouse_trace.lock() {
+            writeln!(
+                output,
+                "retained_entries={} capacity={} older_entries_may_have_been_evicted={}",
+                trace.len(),
+                MOUSE_TRACE_CAPACITY,
+                trace.len() == MOUSE_TRACE_CAPACITY
+            )?;
+            for line in trace.iter() {
+                writeln!(output, "{line}")?;
+            }
+        }
+        Ok(())
     }
 
     fn write(&self, level: &str, event: &str, detail: &str) {
-        let mut clean_detail = detail.replace(['\r', '\n'], " ");
-        if let Some(home) = dirs::home_dir() {
-            clean_detail = clean_detail.replace(&home.to_string_lossy().to_string(), "$HOME");
-        }
+        let clean_detail = sanitize(detail);
         let line = format!(
             "{} level={} event={} detail={}\n",
             now_ms(),
@@ -144,7 +173,12 @@ impl Logger {
         Ok(())
     }
 
-    fn append_target(&self, title: &str, target: &LogTarget, output: &mut File) -> io::Result<()> {
+    fn append_target(
+        &self,
+        title: &str,
+        target: &LogTarget,
+        output: &mut impl Write,
+    ) -> io::Result<()> {
         writeln!(output, "\n--- {title} ---")?;
         for index in (1..=ROTATED_LOGS).rev() {
             self.append_file(
@@ -155,7 +189,7 @@ impl Logger {
         self.append_file(&target.current, output)
     }
 
-    fn append_file(&self, path: &Path, output: &mut File) -> io::Result<()> {
+    fn append_file(&self, path: &Path, output: &mut impl Write) -> io::Result<()> {
         if !path.exists() {
             return Ok(());
         }
@@ -170,6 +204,14 @@ impl Logger {
         }
         Ok(())
     }
+}
+
+fn sanitize(detail: &str) -> String {
+    let mut clean = detail.replace(['\r', '\n'], " ");
+    if let Some(home) = dirs::home_dir() {
+        clean = clean.replace(&home.to_string_lossy().to_string(), "$HOME");
+    }
+    clean
 }
 
 fn open_target(directory: &Path, name: &'static str) -> io::Result<LogTarget> {
