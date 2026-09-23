@@ -68,6 +68,23 @@ pub struct Settings {
     pub mouse_shortcut: String,
     #[serde(default)]
     pub mouse_position: ScreenPosition,
+    #[serde(default)]
+    pub diagnostics: DiagnosticsState,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticsState {
+    pub enabled: bool,
+    pub revision: u64,
+    pub origin: String,
+    pub capture_id: String,
+}
+
+impl DiagnosticsState {
+    pub fn is_newer_than(&self, other: &Self) -> bool {
+        (self.revision, &self.origin) > (other.revision, &other.origin)
+    }
 }
 
 pub fn default_copy_shortcut() -> String {
@@ -149,6 +166,7 @@ pub struct UiState {
     pub device_name: String,
     pub displays: Vec<DisplayView>,
     pub sync_enabled: bool,
+    pub diagnostics_enabled: bool,
     pub launch_at_login: bool,
     pub copy_shortcut: String,
     pub paste_shortcut: String,
@@ -202,4 +220,34 @@ pub struct DiscoveryPacket {
     pub mouse_share_enabled: bool,
     #[serde(default)]
     pub mouse_position: ScreenPosition,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DiagnosticsState;
+
+    #[test]
+    fn diagnostics_revision_converges_without_clock_comparison() {
+        let old = DiagnosticsState {
+            enabled: true,
+            revision: 1,
+            origin: "a".into(),
+            capture_id: "one".into(),
+        };
+        let concurrent = DiagnosticsState {
+            enabled: false,
+            revision: 1,
+            origin: "b".into(),
+            capture_id: "one".into(),
+        };
+        let newer = DiagnosticsState {
+            enabled: true,
+            revision: 2,
+            origin: "a".into(),
+            capture_id: "two".into(),
+        };
+        assert!(concurrent.is_newer_than(&old));
+        assert!(newer.is_newer_than(&concurrent));
+        assert!(!old.is_newer_than(&newer));
+    }
 }

@@ -4,7 +4,7 @@ use std::{
     io::{self, Read, Write},
     net::IpAddr,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Mutex, RwLock},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -29,6 +29,7 @@ pub struct Logger {
     mouse: LogTarget,
     clipboard: LogTarget,
     mouse_trace: Mutex<VecDeque<String>>,
+    capture_enabled: RwLock<bool>,
 }
 
 impl Logger {
@@ -40,6 +41,7 @@ impl Logger {
             mouse: open_target(&directory, "mouse.log")?,
             clipboard: open_target(&directory, "clipboard.log")?,
             mouse_trace: Mutex::new(VecDeque::with_capacity(MOUSE_TRACE_CAPACITY)),
+            capture_enabled: RwLock::new(false),
             directory,
         })
     }
@@ -59,7 +61,17 @@ impl Logger {
     /// High-volume mouse diagnostics are kept in memory so tracing cannot add
     /// synchronous disk I/O to an input hook or the realtime network path.
     pub fn mouse_trace(&self, event: &str, detail: impl AsRef<str>) {
-        let detail = sanitize(detail.as_ref());
+        let Ok(enabled) = self.capture_enabled.read() else {
+            return;
+        };
+        if !*enabled {
+            return;
+        }
+        self.trace_direct(event, detail.as_ref());
+    }
+
+    fn trace_direct(&self, event: &str, detail: &str) {
+        let detail = sanitize(detail);
         let line = format!("{} event={} detail={}", now_ms(), event, detail);
         let Ok(mut trace) = self.mouse_trace.lock() else {
             return;
@@ -77,6 +89,67 @@ impl Logger {
     }
 
     pub fn clear(&self) -> io::Result<u64> {
+        let enabled = self
+            .capture_enabled
+            .write()
+            .map_err(|_| io::Error::other("capture lock poisoned"))?;
+        let cleared_at = self.clear_storage()?;
+        if *enabled {
+            self.write_direct(
+                "INFO",
+                "diagnostics_log_started",
+                &format!("cleared_at_ms={cleared_at}"),
+            );
+            self.trace_direct(
+                "diagnostics_log_started",
+                &format!("cleared_at_ms={cleared_at}"),
+            );
+        }
+        Ok(cleared_at)
+    }
+
+    pub fn set_capture_enabled(
+        &self,
+        enabled: bool,
+        capture_id: &str,
+        reset: bool,
+    ) -> io::Result<()> {
+        let mut current = self
+            .capture_enabled
+            .write()
+            .map_err(|_| io::Error::other("capture lock poisoned"))?;
+        if *current == enabled && !reset {
+            return Ok(());
+        }
+        if enabled {
+            if reset {
+                self.clear_storage()?;
+            }
+            self.write_direct(
+                "INFO",
+                "diagnostics_capture_started",
+                &format!("capture_id={capture_id}"),
+            );
+            self.trace_direct(
+                "diagnostics_capture_started",
+                &format!("capture_id={capture_id}"),
+            );
+        } else if *current {
+            self.write_direct(
+                "INFO",
+                "diagnostics_capture_stopped",
+                &format!("capture_id={capture_id}"),
+            );
+            self.trace_direct(
+                "diagnostics_capture_stopped",
+                &format!("capture_id={capture_id}"),
+            );
+        }
+        *current = enabled;
+        Ok(())
+    }
+
+    fn clear_storage(&self) -> io::Result<u64> {
         for target in [&self.general, &self.mouse, &self.clipboard] {
             let mut state = target
                 .state
@@ -95,16 +168,7 @@ impl Logger {
         if let Ok(mut trace) = self.mouse_trace.lock() {
             trace.clear();
         }
-        let cleared_at = now_ms();
-        self.info(
-            "diagnostics_log_started",
-            format!("cleared_at_ms={cleared_at}"),
-        );
-        self.mouse_trace(
-            "diagnostics_log_started",
-            format!("cleared_at_ms={cleared_at}"),
-        );
-        Ok(cleared_at)
+        Ok(now_ms())
     }
 
     fn write_export(&self, output: &mut impl Write, summary: &str) -> io::Result<()> {
@@ -138,6 +202,16 @@ impl Logger {
     }
 
     fn write(&self, level: &str, event: &str, detail: &str) {
+        let Ok(enabled) = self.capture_enabled.read() else {
+            return;
+        };
+        if !*enabled {
+            return;
+        }
+        self.write_direct(level, event, detail);
+    }
+
+    fn write_direct(&self, level: &str, event: &str, detail: &str) {
         let clean_detail = sanitize(detail);
         let line = format!(
             "{} level={} event={} detail={}\n",
@@ -287,4 +361,37 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Logger;
+    use uuid::Uuid;
+
+    #[test]
+    fn capture_only_keeps_entries_between_start_and_stop() {
+        let directory = std::env::temp_dir().join(format!("crosscopy-logger-{}", Uuid::new_v4()));
+        let logger = Logger::new(&directory).unwrap();
+        logger.info("before_capture", "ignored");
+        logger.mouse_trace("before_capture", "ignored");
+        logger.set_capture_enabled(true, "capture-1", true).unwrap();
+        logger.info("during_capture", "retained");
+        logger.mouse_trace("during_capture", "retained");
+        logger
+            .set_capture_enabled(false, "capture-1", false)
+            .unwrap();
+        logger.info("after_capture", "ignored");
+        logger.mouse_trace("after_capture", "ignored");
+        let export = String::from_utf8(logger.export_bytes("test").unwrap()).unwrap();
+        assert!(export.contains("during_capture"));
+        assert!(export.contains("diagnostics_capture_stopped"));
+        assert!(!export.contains("before_capture"));
+        assert!(!export.contains("after_capture"));
+        logger.set_capture_enabled(true, "capture-2", true).unwrap();
+        let export = String::from_utf8(logger.export_bytes("test").unwrap()).unwrap();
+        assert!(export.contains("capture-2"));
+        assert!(!export.contains("capture-1"));
+        drop(logger);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 }

@@ -63,6 +63,8 @@ const crosscopy = {
     invoke<string>("export_diagnostics", { peerId: peerId ?? null }),
   clearDiagnostics: (peerId?: string) =>
     invoke<string>("clear_diagnostics", { peerId: peerId ?? null }),
+  setDiagnosticsEnabled: (enabled: boolean) =>
+    invoke<string>("set_diagnostics_enabled", { enabled }),
   getUpdateEnvironment: () =>
     invoke<UpdateEnvironment>("get_update_environment"),
   logUpdateEvent: (level: string, event: string, detail: string) =>
@@ -117,6 +119,7 @@ const EMPTY_STATE: UiState = {
   deviceName: "",
   displays: [],
   syncEnabled: true,
+  diagnosticsEnabled: false,
   launchAtLogin: false,
   copyShortcut: "Ctrl+Shift+C",
   pasteShortcut: "Ctrl+Shift+V",
@@ -256,6 +259,15 @@ function App(): React.JSX.Element {
       setDiagnosticsMessage(
         typeof reason === "string" ? reason : "诊断日志清空失败"
       );
+    }
+  }
+
+  async function setDiagnosticsEnabled(enabled: boolean): Promise<void> {
+    setDiagnosticsMessage(enabled ? "正在开启所有设备的日志采集" : "正在停止所有设备的日志采集");
+    try {
+      setDiagnosticsMessage(await crosscopy.setDiagnosticsEnabled(enabled));
+    } catch (reason) {
+      setDiagnosticsMessage(typeof reason === "string" ? reason : "日志采集状态同步失败");
     }
   }
 
@@ -487,6 +499,7 @@ function App(): React.JSX.Element {
             diagnosticsMessage={diagnosticsMessage}
             onDiagnostics={exportDiagnostics}
             onClearDiagnostics={clearDiagnostics}
+            onSetDiagnosticsEnabled={setDiagnosticsEnabled}
           />
         ) : view === "mouse" ? (
           <MousePanel state={state} />
@@ -2455,6 +2468,7 @@ function SettingsPanel(props: {
   diagnosticsMessage: string;
   onDiagnostics(peerId?: string): Promise<void>;
   onClearDiagnostics(peerId?: string): Promise<void>;
+  onSetDiagnosticsEnabled(enabled: boolean): Promise<void>;
 }): React.JSX.Element {
   const isMac = navigator.userAgent.includes("Mac");
 
@@ -2579,9 +2593,17 @@ function SettingsPanel(props: {
         <div className="preference-row">
           <span>
             <strong>诊断日志</strong>
-            <small>可导出本机或在线配对设备；不包含配对码、剪贴板内容、输入字符或完整文件路径</small>
+            <small>开启时在线配对设备同时开始记录并清空旧日志；关闭后停止写入，可分别导出。不包含配对码、剪贴板内容、输入字符或完整文件路径。</small>
           </span>
           <div className="diagnostics-setting">
+            <label className="diagnostics-toggle">
+              <input
+                type="checkbox"
+                checked={props.state.diagnosticsEnabled}
+                onChange={(event) => void props.onSetDiagnosticsEnabled(event.target.checked)}
+              />
+              {props.state.diagnosticsEnabled ? "正在记录" : "已停止记录"}
+            </label>
             <button
               className="secondary-button"
               type="button"

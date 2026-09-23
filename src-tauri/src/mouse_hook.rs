@@ -9,11 +9,14 @@ use std::sync::{
 static SOURCE_CURSOR_CAPTURED: AtomicBool = AtomicBool::new(false);
 static SOURCE_CURSOR_LOCK: Mutex<()> = Mutex::new(());
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::sync::atomic::AtomicU64;
 
 #[cfg(target_os = "macos")]
 static LAST_CURSOR_GUARD_AT: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(target_os = "windows")]
+static LAST_WINDOWS_CURSOR_GUARD_AT: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DesktopBounds {
@@ -294,9 +297,8 @@ pub fn screen_bounds() -> DesktopBounds {
 pub fn recenter_cursor(x: i32, y: i32, bounds: DesktopBounds) -> Result<(), String> {
     use core_graphics::{display::CGDisplay, geometry::CGPoint};
 
-    // Warping does not generate a mouse event, so the event tap only observes
-    // real hardware deltas while the hidden source cursor remains away from
-    // the screen edge.
+    // Keep the hidden source cursor away from the edge. Some macOS event taps
+    // report this relocation in the next HID delta; mouse_share subtracts it.
     CGDisplay::warp_mouse_cursor_position(CGPoint::new(
         f64::from(bounds.x + x.clamp(0, bounds.width - 1)),
         f64::from(bounds.y + y.clamp(0, bounds.height - 1)),
@@ -530,17 +532,31 @@ pub fn cursor_diagnostics() -> String {
 
 #[cfg(target_os = "windows")]
 pub fn cursor_diagnostics() -> String {
-    use windows::Win32::{Foundation::POINT, UI::WindowsAndMessaging::GetCursorPos};
-    let mut point = POINT::default();
-    let position = if unsafe { GetCursorPos(&mut point) }.is_ok() {
-        format!("x={} y={}", point.x, point.y)
-    } else {
-        "x=unknown y=unknown".to_string()
+    let captured = SOURCE_CURSOR_CAPTURED.load(Ordering::Acquire);
+    match windows_cursor_info() {
+        Ok(info) => {
+            use windows::Win32::UI::WindowsAndMessaging::CURSOR_SHOWING;
+            let visible = info.flags.0 & CURSOR_SHOWING.0 != 0;
+            format!(
+                "captured={captured} visible={visible} capture_visibility_conflict={} x={} y={}",
+                captured && visible,
+                info.ptScreenPos.x,
+                info.ptScreenPos.y
+            )
+        }
+        Err(_) => format!("captured={captured} visible=unknown x=unknown y=unknown"),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_cursor_info() -> Result<windows::Win32::UI::WindowsAndMessaging::CURSORINFO, String> {
+    use windows::Win32::UI::WindowsAndMessaging::{GetCursorInfo, CURSORINFO};
+    let mut info = CURSORINFO {
+        cbSize: std::mem::size_of::<CURSORINFO>() as u32,
+        ..Default::default()
     };
-    format!(
-        "captured={} {position}",
-        SOURCE_CURSOR_CAPTURED.load(Ordering::Acquire)
-    )
+    unsafe { GetCursorInfo(&mut info) }.map_err(|error| error.to_string())?;
+    Ok(info)
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -577,7 +593,24 @@ pub fn ensure_source_cursor_captured() -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+pub fn ensure_source_cursor_captured() -> Result<(), String> {
+    use windows::Win32::UI::WindowsAndMessaging::CURSOR_SHOWING;
+    if !SOURCE_CURSOR_CAPTURED.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    let now = monotonic_ms();
+    if now.saturating_sub(LAST_WINDOWS_CURSOR_GUARD_AT.load(Ordering::Relaxed)) < 250 {
+        return Ok(());
+    }
+    LAST_WINDOWS_CURSOR_GUARD_AT.store(now, Ordering::Relaxed);
+    if windows_cursor_info()?.flags.0 & CURSOR_SHOWING.0 != 0 {
+        set_cursor_visible(false)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub fn ensure_source_cursor_captured() -> Result<(), String> {
     Ok(())
 }

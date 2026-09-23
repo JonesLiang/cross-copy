@@ -73,6 +73,7 @@ export type UiState = {
   deviceName: string;
   displays: DisplayInfo[];
   syncEnabled: boolean;
+  diagnosticsEnabled: boolean;
   launchAtLogin: boolean;
   copyShortcut: string;
   pasteShortcut: string;

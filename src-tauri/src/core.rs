@@ -5,8 +5,8 @@ use crate::{
     },
     logger::{masked_ip, Logger},
     model::{
-        default_mouse_receive_dpi, Activity, ClipboardPayload, DiscoveryPacket, DisplayView, Peer,
-        PeerView, ScreenPosition, TransferProgress, UiState,
+        default_mouse_receive_dpi, Activity, ClipboardPayload, DiagnosticsState, DiscoveryPacket,
+        DisplayView, Peer, PeerView, ScreenPosition, TransferProgress, UiState,
     },
     mouse_hook::SYNTHETIC_INPUT_MARKER,
     mouse_share::{describe_mouse_signal, MouseShare, MouseSignal, OutboundMouseSignal},
@@ -71,7 +71,7 @@ const CLIPBOARD_RETRY_ATTEMPTS: usize = 16;
 const CLIPBOARD_RETRY_DELAY_MS: u64 = 50;
 const ACTIVE_DISCOVERY_MS: u64 = 30_000;
 const MOUSE_PRESENCE_REFRESH_MS: u64 = 5_000;
-const MOUSE_PROTOCOL: u8 = 7;
+const MOUSE_PROTOCOL: u8 = 8;
 
 #[derive(Clone)]
 struct SeenPeer {
@@ -183,6 +183,9 @@ enum SecureMessage {
     },
     DiagnosticsRequest,
     DiagnosticsClear,
+    DiagnosticsState {
+        state: DiagnosticsState,
+    },
     Filesystem {
         request: FsRequest,
     },
@@ -270,6 +273,7 @@ pub struct Core {
     last_progress_emit: AtomicU64,
     last_mouse_presence_refresh: AtomicU64,
     last_trust_sync: Mutex<HashMap<String, String>>,
+    diagnostics_change: Mutex<()>,
     display_cache: Mutex<(u64, Vec<DisplayView>)>,
     discovery_wake: Notify,
     port: AtomicU64,
@@ -284,7 +288,11 @@ pub struct Core {
 
 impl Core {
     pub fn new(store: Arc<Store>, logger: Arc<Logger>, app: AppHandle) -> Arc<Self> {
-        let device_id = store.get().device_id;
+        let settings = store.get();
+        let device_id = settings.device_id;
+        if settings.diagnostics.enabled {
+            let _ = logger.set_capture_enabled(true, &settings.diagnostics.capture_id, false);
+        }
         let (mouse_sender, mouse_receiver) = mpsc::unbounded_channel();
         let mouse = MouseShare::new(Arc::clone(&logger), mouse_sender);
         Arc::new(Self {
@@ -303,6 +311,7 @@ impl Core {
             last_progress_emit: AtomicU64::new(0),
             last_mouse_presence_refresh: AtomicU64::new(0),
             last_trust_sync: Mutex::new(HashMap::new()),
+            diagnostics_change: Mutex::new(()),
             display_cache: Mutex::new((0, Vec::new())),
             discovery_wake: Notify::new(),
             port: AtomicU64::new(0),
@@ -395,6 +404,7 @@ impl Core {
             device_name: settings.device_name,
             displays: self.display_views(now),
             sync_enabled: settings.sync_enabled,
+            diagnostics_enabled: settings.diagnostics.enabled,
             launch_at_login: settings.launch_at_login,
             copy_shortcut: settings.copy_shortcut,
             paste_shortcut: settings.paste_shortcut,
@@ -1305,6 +1315,165 @@ impl Core {
             .info("service_stop", "mouse_sessions_released=true");
     }
 
+    fn apply_diagnostics_state(&self, state: DiagnosticsState) -> Result<DiagnosticsState, String> {
+        let _change = self
+            .diagnostics_change
+            .lock()
+            .map_err(|_| "诊断状态锁不可用")?;
+        let current = self.store.get().diagnostics;
+        if !state.is_newer_than(&current) {
+            return Ok(current);
+        }
+        self.logger
+            .set_capture_enabled(
+                state.enabled,
+                &state.capture_id,
+                state.enabled && state.capture_id != current.capture_id,
+            )
+            .map_err(|error| error.to_string())?;
+        self.store
+            .update(|settings| settings.diagnostics = state.clone())
+            .map_err(|error| error.to_string())?;
+        self.last_trust_sync
+            .lock()
+            .expect("trust sync lock")
+            .clear();
+        self.discovery_wake.notify_one();
+        self.publish();
+        Ok(state)
+    }
+
+    pub async fn set_diagnostics_enabled(
+        self: &Arc<Self>,
+        enabled: bool,
+    ) -> Result<String, String> {
+        let state = {
+            let _change = self
+                .diagnostics_change
+                .lock()
+                .map_err(|_| "诊断状态锁不可用")?;
+            let settings = self.store.get();
+            if settings.diagnostics.enabled == enabled {
+                return Ok(if enabled {
+                    "日志采集已开启"
+                } else {
+                    "日志采集已关闭"
+                }
+                .into());
+            }
+            let state = DiagnosticsState {
+                enabled,
+                revision: settings.diagnostics.revision + 1,
+                origin: settings.device_id,
+                capture_id: if enabled {
+                    Uuid::new_v4().to_string()
+                } else {
+                    settings.diagnostics.capture_id
+                },
+            };
+            self.logger
+                .set_capture_enabled(enabled, &state.capture_id, enabled)
+                .map_err(|error| error.to_string())?;
+            self.store
+                .update(|settings| settings.diagnostics = state.clone())
+                .map_err(|error| error.to_string())?;
+            self.last_trust_sync
+                .lock()
+                .expect("trust sync lock")
+                .clear();
+            self.discovery_wake.notify_one();
+            self.publish();
+            state
+        };
+        let peers: Vec<_> = self
+            .ui_state()
+            .peers
+            .into_iter()
+            .filter(|peer| peer.online)
+            .collect();
+        let mut jobs = tokio::task::JoinSet::new();
+        for peer in peers {
+            let core = Arc::clone(self);
+            let state = state.clone();
+            jobs.spawn(async move {
+                (
+                    peer.name,
+                    core.send_diagnostics_state(&peer.id, state).await,
+                )
+            });
+        }
+        let mut failures = Vec::new();
+        while let Some(result) = jobs.join_next().await {
+            match result {
+                Ok((name, Err(error))) => failures.push(format!("{name}: {error}")),
+                Err(error) => failures.push(error.to_string()),
+                _ => {}
+            }
+        }
+        if failures.is_empty() {
+            Ok(if enabled {
+                "所有在线设备已开始记录；本次采集已清空旧日志"
+            } else {
+                "所有在线设备已停止记录，可导出日志"
+            }
+            .into())
+        } else {
+            Ok(format!(
+                "本机已{}；部分设备同步失败（{}）。重连后会重试",
+                if enabled {
+                    "开始记录"
+                } else {
+                    "停止记录"
+                },
+                failures.join("；")
+            ))
+        }
+    }
+
+    async fn send_diagnostics_state(
+        &self,
+        peer_id: &str,
+        state: DiagnosticsState,
+    ) -> Result<(), String> {
+        let settings = self.store.get();
+        let peer = settings
+            .peers
+            .iter()
+            .find(|peer| peer.id == peer_id)
+            .ok_or("诊断同步目标不存在")?;
+        let seen = self
+            .discovered
+            .lock()
+            .expect("discovery lock")
+            .get(peer_id)
+            .cloned()
+            .ok_or("诊断同步目标离线")?;
+        let key = decode_secret(&peer.secret)?;
+        let mut stream = tokio::time::timeout(
+            Duration::from_secs(3),
+            TcpStream::connect((seen.host, seen.packet.port)),
+        )
+        .await
+        .map_err(|_| "诊断同步连接超时".to_string())?
+        .map_err(|error| error.to_string())?;
+        write_json(
+            &mut stream,
+            &WireMessage::Secure {
+                sender_id: settings.device_id,
+                envelope: encrypt(&key, &SecureMessage::DiagnosticsState { state })?,
+            },
+        )
+        .await?;
+        let bytes =
+            tokio::time::timeout(Duration::from_secs(5), read_secure_frame(&mut stream, &key))
+                .await
+                .map_err(|_| "诊断同步响应超时".to_string())??;
+        let remote: DiagnosticsState =
+            serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+        self.apply_diagnostics_state(remote)?;
+        Ok(())
+    }
+
     fn diagnostics_summary(&self) -> String {
         let settings = self.store.get();
         let now = now_ms();
@@ -1316,8 +1485,10 @@ impl Core {
             .filter(|peer| now.saturating_sub(peer.last_seen) < ONLINE_WINDOW_MS)
             .count();
         format!(
-            "sync_enabled={}\nmouse_share_enabled={}\nmouse_extreme_performance={}\nmouse_protocol={}\nmouse_position={:?}\nmouse_listener_started={}\nmouse_latency_ms={:?}\npaired_peers={}\nonline_peers={}\ndiscovery_port={}\ntransfer_port={}\nmouse_port={}",
+            "sync_enabled={}\ndiagnostics_enabled={}\ndiagnostics_capture_id={}\nmouse_share_enabled={}\nmouse_extreme_performance={}\nmouse_protocol={}\nmouse_position={:?}\nmouse_listener_started={}\nmouse_latency_ms={:?}\npaired_peers={}\nonline_peers={}\ndiscovery_port={}\ntransfer_port={}\nmouse_port={}",
             settings.sync_enabled,
+            settings.diagnostics.enabled,
+            settings.diagnostics.capture_id,
             settings.mouse_share_enabled,
             settings.mouse_extreme_performance,
             MOUSE_PROTOCOL,
@@ -1441,13 +1612,10 @@ impl Core {
             .map_err(|_| "等待对端清空诊断日志超时".to_string())??;
             let cleared_at =
                 String::from_utf8(response).map_err(|_| "对端返回无效响应".to_string())?;
-            Ok(format!(
-                "已清空 {} 的日志，从 {cleared_at} 开始记录",
-                peer.name
-            ))
+            Ok(format!("已清空 {} 的日志（{cleared_at}）", peer.name))
         } else {
             let cleared_at = self.logger.clear().map_err(|error| error.to_string())?;
-            Ok(format!("已清空本机日志，从 {cleared_at} 开始记录"))
+            Ok(format!("已清空本机日志（{cleared_at}）"))
         }
     }
 
@@ -1471,15 +1639,23 @@ impl Core {
             format!("port={DISCOVERY_PORT} multicast={MULTICAST} broadcast=true"),
         );
         let socket = Arc::new(socket);
-        let mouse_socket = Arc::new(
-            UdpSocket::bind(("0.0.0.0", MOUSE_PORT))
-                .await
-                .map_err(|error| format!("无法监听鼠标实时端口 {MOUSE_PORT}：{error}"))?,
-        );
+        let native_mouse_socket = std::net::UdpSocket::bind(("0.0.0.0", MOUSE_PORT))
+            .map_err(|error| format!("无法监听鼠标实时端口 {MOUSE_PORT}：{error}"))?;
+        let socket_ref = socket2::SockRef::from(&native_mouse_socket);
+        if let Err(error) = socket_ref.set_recv_buffer_size(4 * 1024 * 1024) {
+            self.logger
+                .warn("mouse_receive_buffer_config_failed", error.to_string());
+        }
+        let receive_buffer_size = socket_ref.recv_buffer_size().unwrap_or(0);
+        native_mouse_socket
+            .set_nonblocking(true)
+            .map_err(|error| error.to_string())?;
+        let mouse_socket =
+            Arc::new(UdpSocket::from_std(native_mouse_socket).map_err(|error| error.to_string())?);
         *self.mouse_socket.lock().expect("mouse socket lock") = Some(Arc::clone(&mouse_socket));
         self.logger.info(
             "mouse_realtime_channel_started",
-            format!("port={MOUSE_PORT} isolated_from_discovery=true"),
+            format!("port={MOUSE_PORT} isolated_from_discovery=true receive_buffer_bytes={receive_buffer_size}"),
         );
 
         let mouse_receive_core = Arc::clone(self);
@@ -1606,6 +1782,13 @@ impl Core {
                                 }
                                 if let Err(error) = core.send_mouse_config(&packet_id).await {
                                     core.logger.warn("mouse_config_send_failed", error);
+                                    retry = true;
+                                }
+                                let diagnostics = core.store.get().diagnostics;
+                                if let Err(error) =
+                                    core.send_diagnostics_state(&packet_id, diagnostics).await
+                                {
+                                    core.logger.warn("diagnostics_state_sync_failed", error);
                                     retry = true;
                                 }
                                 if retry {
@@ -2759,6 +2942,12 @@ impl Core {
                         );
                         write_secure_frame(&mut stream, &key, cleared_at.to_string().as_bytes())
                             .await
+                    }
+                    SecureMessage::DiagnosticsState { state } => {
+                        let current = self.apply_diagnostics_state(state)?;
+                        let response =
+                            serde_json::to_vec(&current).map_err(|error| error.to_string())?;
+                        write_secure_frame(&mut stream, &key, &response).await
                     }
                     SecureMessage::Filesystem { request } => {
                         let response = if peer.filesystem_allowed {
@@ -4052,6 +4241,8 @@ fn mouse_signal_changes_state(signal: &MouseSignal) -> bool {
             | MouseSignal::Button { .. }
             | MouseSignal::Scroll { .. }
             | MouseSignal::Key { .. }
+            | MouseSignal::ReturnAck { .. }
+            | MouseSignal::CancelAck { .. }
             | MouseSignal::KeepAlive { .. }
     )
 }

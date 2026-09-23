@@ -1456,6 +1456,25 @@ nav {
   gap: 10px;
 }
 
+.diagnostics-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 10px;
+  color: var(--text);
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.diagnostics-toggle input {
+  margin: 0;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
 .diagnostics-setting button {
   display: inline-flex;
   align-items: center;

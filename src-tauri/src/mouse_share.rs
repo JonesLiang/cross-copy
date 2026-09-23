@@ -31,6 +31,7 @@ const EDGE_REARM_PIXELS: i32 = 32;
 const TAKEOVER_DISTANCE: u32 = 6;
 const TAKEOVER_WINDOW_MS: u64 = 150;
 const ENTER_RETRY_MS: u64 = 120;
+const RETURN_RETRY_MS: u64 = 100;
 const SESSION_TIMEOUT_MS: u64 = 5_000;
 const KEEP_ALIVE_MS: u64 = 1_000;
 const EXTREME_MOVE_SEND_INTERVAL_MS: u64 = 2;
@@ -87,7 +88,13 @@ pub enum MouseSignal {
         session_id: String,
         ratio: f64,
     },
+    ReturnAck {
+        session_id: String,
+    },
     Cancel {
+        session_id: String,
+    },
+    CancelAck {
         session_id: String,
     },
     Ack {
@@ -115,6 +122,7 @@ struct OutgoingSession {
     exit_edge: ScreenPosition,
     anchor_x: i32,
     anchor_y: i32,
+    pending_recenter_delta: Option<(i32, i32)>,
     enter_ratio: f64,
     last_enter_retry_at: u64,
     acknowledged: bool,
@@ -160,6 +168,21 @@ struct IncomingSession {
     held_keys: HashSet<HookKey>,
     last_event_at: u64,
     last_input_at: u64,
+}
+
+struct PendingReturn {
+    peer_id: String,
+    session_id: String,
+    ratio: f64,
+    last_sent_at: u64,
+    created_at: u64,
+}
+
+struct PendingCancel {
+    peer_id: String,
+    session_id: String,
+    last_sent_at: u64,
+    created_at: u64,
 }
 
 #[derive(Clone)]
@@ -251,6 +274,8 @@ struct Runtime {
     takeover_delta: (i32, i32),
     takeover_started_at: u64,
     retired_sessions: VecDeque<(String, String)>,
+    pending_returns: VecDeque<PendingReturn>,
+    pending_cancels: VecDeque<PendingCancel>,
     outgoing: Option<OutgoingSession>,
     incoming: Option<IncomingSession>,
     local_held_keys: HashSet<HookKey>,
@@ -258,6 +283,110 @@ struct Runtime {
 }
 
 impl Runtime {
+    fn track_cancel(&mut self, peer_id: &str, session_id: &str, now: u64) {
+        if self
+            .pending_cancels
+            .iter()
+            .any(|pending| pending.peer_id == peer_id && pending.session_id == session_id)
+        {
+            return;
+        }
+        self.pending_cancels.push_back(PendingCancel {
+            peer_id: peer_id.to_string(),
+            session_id: session_id.to_string(),
+            last_sent_at: now,
+            created_at: now,
+        });
+        while self.pending_cancels.len() > 64 {
+            self.pending_cancels.pop_front();
+        }
+    }
+
+    fn retry_pending_cancels(&mut self, now: u64) -> Vec<OutboundMouseSignal> {
+        self.pending_cancels
+            .retain(|pending| now.saturating_sub(pending.created_at) < SESSION_TIMEOUT_MS);
+        let mut signals = Vec::new();
+        for pending in &mut self.pending_cancels {
+            if now.saturating_sub(pending.last_sent_at) >= RETURN_RETRY_MS {
+                pending.last_sent_at = now;
+                signals.push(outbound(
+                    &pending.peer_id,
+                    MouseSignal::Cancel {
+                        session_id: pending.session_id.clone(),
+                    },
+                ));
+            }
+        }
+        signals
+    }
+
+    fn retry_pending_returns(&mut self, now: u64) -> Vec<OutboundMouseSignal> {
+        self.pending_returns
+            .retain(|pending| now.saturating_sub(pending.created_at) < SESSION_TIMEOUT_MS);
+        let mut signals = Vec::new();
+        for pending in &mut self.pending_returns {
+            if now.saturating_sub(pending.last_sent_at) >= RETURN_RETRY_MS {
+                pending.last_sent_at = now;
+                signals.push(outbound(
+                    &pending.peer_id,
+                    MouseSignal::Return {
+                        session_id: pending.session_id.clone(),
+                        ratio: pending.ratio,
+                    },
+                ));
+            }
+        }
+        signals
+    }
+
+    fn normalize_incoming_move(&mut self, event: HookMouseEvent) -> (HookMouseEvent, bool) {
+        let HookMouseEvent::Move {
+            x,
+            y,
+            native_delta: Some((dx, dy)),
+        } = event
+        else {
+            return (event, false);
+        };
+        let Some(incoming) = self.incoming.as_ref() else {
+            return (event, false);
+        };
+        let relocation = (
+            incoming.last_injected_x.saturating_sub(self.last_x),
+            incoming.last_injected_y.saturating_sub(self.last_y),
+        );
+        let from_remote = (
+            x.saturating_sub(incoming.last_injected_x),
+            y.saturating_sub(incoming.last_injected_y),
+        );
+        // After an injected cursor move, the next HID event can report the
+        // entire cursor relocation as a hardware delta. Only correct it when
+        // the event position and delta both agree with that relocation.
+        let relocation_detected = relocation.0.unsigned_abs().max(relocation.1.unsigned_abs())
+            > MAX_PHYSICAL_DELTA_PER_EVENT as u32
+            && from_remote
+                .0
+                .unsigned_abs()
+                .max(from_remote.1.unsigned_abs())
+                <= 64
+            && dx.abs_diff(x.saturating_sub(self.last_x)) <= 4
+            && dy.abs_diff(y.saturating_sub(self.last_y)) <= 4;
+        self.last_x = x;
+        self.last_y = y;
+        if relocation_detected {
+            (
+                HookMouseEvent::Move {
+                    x,
+                    y,
+                    native_delta: Some(from_remote),
+                },
+                true,
+            )
+        } else {
+            (event, false)
+        }
+    }
+
     fn trace_state(&self) -> String {
         let outgoing = self.outgoing.as_ref().map_or_else(
             || "none".to_string(),
@@ -352,6 +481,7 @@ struct Inner {
     keyboard_listener_attempted: AtomicBool,
     keyboard_listener_started: AtomicBool,
     source_control_active: Arc<AtomicBool>,
+    injection_failed: Arc<AtomicBool>,
     latency_ms: AtomicU64,
     last_physical_at: AtomicU64,
     runtime: Mutex<Runtime>,
@@ -378,6 +508,8 @@ impl MouseShare {
         let injector_extreme_performance = Arc::clone(&extreme_performance);
         let source_control_active = Arc::new(AtomicBool::new(false));
         let injector_source_control_active = Arc::clone(&source_control_active);
+        let injection_failed = Arc::new(AtomicBool::new(false));
+        let injector_failed = Arc::clone(&injection_failed);
         let bounds = screen_bounds();
         let injection_logger = Arc::clone(&logger);
         let _ = std::thread::Builder::new()
@@ -414,6 +546,7 @@ impl MouseShare {
                         match Enigo::new(&mouse_input_settings()) {
                             Ok(value) => enigo = Some(value),
                             Err(error) => {
+                                injector_failed.store(true, Ordering::Release);
                                 injection_logger.warn("mouse_injector_retry", error.to_string());
                                 // Do not replay old clicks/keys after permission
                                 // is granted seconds later.
@@ -436,6 +569,7 @@ impl MouseShare {
                     let started = std::time::Instant::now();
                     let result = inject_mouse_event(enigo.as_mut().unwrap(), event);
                     if let Err(error) = &result {
+                        injector_failed.store(true, Ordering::Release);
                         let now = now_ms();
                         if now.saturating_sub(last_error_log) >= 1_000 {
                             last_error_log = now;
@@ -464,6 +598,7 @@ impl MouseShare {
                 keyboard_listener_attempted: AtomicBool::new(false),
                 keyboard_listener_started: AtomicBool::new(false),
                 source_control_active,
+                injection_failed,
                 latency_ms: AtomicU64::new(NO_LATENCY),
                 last_physical_at: AtomicU64::new(0),
                 runtime: Mutex::new(Runtime {
@@ -476,6 +611,8 @@ impl MouseShare {
                     takeover_delta: (0, 0),
                     takeover_started_at: 0,
                     retired_sessions: VecDeque::new(),
+                    pending_returns: VecDeque::new(),
+                    pending_cancels: VecDeque::new(),
                     outgoing: None,
                     incoming: None,
                     local_held_keys: HashSet::new(),
@@ -534,6 +671,10 @@ impl MouseShare {
             });
         runtime.targets = targets;
         runtime.receive_dpi = receive_dpi;
+        if !enabled {
+            runtime.pending_returns.clear();
+            runtime.pending_cancels.clear();
+        }
         let active_receive_dpi = runtime.incoming.as_ref().map(|incoming| {
             (
                 incoming.peer_id.clone(),
@@ -565,6 +706,9 @@ impl MouseShare {
                 cancelled.push((session.peer_id.clone(), session.session_id.clone()));
                 release_events.extend(release_held_input(&session));
             }
+        }
+        for (peer_id, session_id) in &cancelled {
+            runtime.track_cancel(peer_id, session_id, now_ms());
         }
         if !cancelled.is_empty() {
             runtime.edge_armed = false;
@@ -649,8 +793,11 @@ impl MouseShare {
 
     pub fn force_stop(&self) {
         self.inner.enabled.store(false, Ordering::Release);
+        self.inner.injection_failed.store(false, Ordering::Release);
         let mut runtime = self.inner.runtime.lock().expect("mouse runtime lock");
         runtime.outgoing.take();
+        runtime.pending_returns.clear();
+        runtime.pending_cancels.clear();
         self.inner.injector.invalidate();
         let releases = runtime
             .retire_incoming()
@@ -661,6 +808,26 @@ impl MouseShare {
         }
         drop(runtime);
         self.inner.reconcile_source_cursor_capture();
+    }
+
+    fn recover_injection_failure(&self) {
+        if !self.inner.injection_failed.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        if self
+            .inner
+            .runtime
+            .lock()
+            .expect("mouse runtime lock")
+            .incoming
+            .is_some()
+        {
+            self.inner.logger.warn(
+                "mouse_incoming_cancelled",
+                "reason=local_input_injection_failed",
+            );
+            self.inner.focus_local();
+        }
     }
 
     pub fn apply_remote(&self, peer_id: &str, signal: MouseSignal) -> Vec<OutboundMouseSignal> {
@@ -888,6 +1055,16 @@ impl MouseShare {
                     let session_id = incoming.session_id.clone();
                     simulated_events.extend(release_held_input(incoming));
                     runtime.retire_incoming();
+                    runtime.pending_returns.push_back(PendingReturn {
+                        peer_id: peer_id.to_string(),
+                        session_id: session_id.clone(),
+                        ratio,
+                        last_sent_at: now_ms(),
+                        created_at: now_ms(),
+                    });
+                    while runtime.pending_returns.len() > 64 {
+                        runtime.pending_returns.pop_front();
+                    }
                     self.inner.injector.invalidate();
                     responses.push(outbound(peer_id, MouseSignal::Return { session_id, ratio }));
                     self.inner
@@ -973,25 +1150,28 @@ impl MouseShare {
                 }
             }
             MouseSignal::Return { session_id, ratio } => {
-                let Some(outgoing_session) = runtime.outgoing.as_ref() else {
-                    return responses;
-                };
-                if outgoing_session.peer_id != peer_id || outgoing_session.session_id != session_id
-                {
-                    return responses;
+                if let Some(outgoing_session) = runtime.outgoing.as_ref().filter(|session| {
+                    session.peer_id == peer_id && session.session_id == session_id
+                }) {
+                    let point = edge_point(outgoing_session.exit_edge, ratio, width, height);
+                    runtime.outgoing = None;
+                    source_ownership_changed = true;
+                    runtime.last_x = point.0;
+                    runtime.last_y = point.1;
+                    runtime.edge_armed = false;
+                    runtime.crossing_blocked_until = now_ms() + EDGE_TRANSITION_COOLDOWN_MS;
+                    simulated_events.push(absolute_move(point.0, point.1));
+                    self.inner.logger.info(
+                        "mouse_outgoing_return_received",
+                        format!("reason=remote_crossed_return_edge ratio={ratio:.3}"),
+                    );
                 }
-                let point = edge_point(outgoing_session.exit_edge, ratio, width, height);
-                runtime.outgoing = None;
-                source_ownership_changed = true;
-                runtime.last_x = point.0;
-                runtime.last_y = point.1;
-                runtime.edge_armed = false;
-                runtime.crossing_blocked_until = now_ms() + EDGE_TRANSITION_COOLDOWN_MS;
-                simulated_events.push(absolute_move(point.0, point.1));
-                self.inner.logger.info(
-                    "mouse_outgoing_return_received",
-                    format!("reason=remote_crossed_return_edge ratio={ratio:.3}"),
-                );
+                responses.push(outbound(peer_id, MouseSignal::ReturnAck { session_id }));
+            }
+            MouseSignal::ReturnAck { session_id } => {
+                runtime.pending_returns.retain(|pending| {
+                    pending.peer_id != peer_id || pending.session_id != session_id
+                });
             }
             MouseSignal::Cancel { session_id } => {
                 let cancelled_edge = runtime
@@ -1023,6 +1203,12 @@ impl MouseShare {
                         simulated_events.extend(release_held_input(&incoming));
                     }
                 }
+                responses.push(outbound(peer_id, MouseSignal::CancelAck { session_id }));
+            }
+            MouseSignal::CancelAck { session_id } => {
+                runtime.pending_cancels.retain(|pending| {
+                    pending.peer_id != peer_id || pending.session_id != session_id
+                });
             }
             MouseSignal::Ack {
                 session_id,
@@ -1279,6 +1465,7 @@ impl MouseShare {
                     };
                     std::thread::sleep(std::time::Duration::from_millis(delay));
                     mouse_share.expire_unresponsive_outgoing();
+                    mouse_share.recover_injection_failure();
 
                     let now = now_ms();
                     if now.saturating_sub(last_listener_retry) >= 1_000 {
@@ -1369,6 +1556,7 @@ impl MouseShare {
                     if let Some(incoming) = runtime.expire_incoming(now) {
                         mouse_share.inner.injector.invalidate();
                         releases.extend(release_held_input(&incoming));
+                        runtime.track_cancel(&incoming.peer_id, &incoming.session_id, now);
                         signals.push(outbound(
                             &incoming.peer_id,
                             MouseSignal::Cancel {
@@ -1391,6 +1579,8 @@ impl MouseShare {
                             ));
                         }
                     }
+                    signals.extend(runtime.retry_pending_returns(now));
+                    signals.extend(runtime.retry_pending_cancels(now));
                     releases.extend(runtime.release_idle_input(now));
                     let released_any = !releases.is_empty();
                     for event in releases {
@@ -1460,6 +1650,7 @@ impl Inner {
             return Err("目标屏幕当前不可用".into());
         }
         if let Some(previous) = runtime.outgoing.take() {
+            runtime.track_cancel(&previous.peer_id, &previous.session_id, now_ms());
             let _ = self.outbound.send(outbound(
                 &previous.peer_id,
                 MouseSignal::Cancel {
@@ -1468,6 +1659,7 @@ impl Inner {
             ));
         }
         let releases = if let Some(previous) = runtime.retire_incoming() {
+            runtime.track_cancel(&previous.peer_id, &previous.session_id, now_ms());
             let _ = self.outbound.send(outbound(
                 &previous.peer_id,
                 MouseSignal::Cancel {
@@ -1485,7 +1677,11 @@ impl Inner {
         let sent_at = now_ms();
         let anchor_x = width / 2;
         let anchor_y = height / 2;
-        runtime.outgoing = Some(new_outgoing_session(
+        let recenter_delta = (
+            anchor_x.saturating_sub(runtime.last_x),
+            anchor_y.saturating_sub(runtime.last_y),
+        );
+        let mut session = new_outgoing_session(
             peer_id.clone(),
             session_id.clone(),
             position,
@@ -1493,7 +1689,9 @@ impl Inner {
             sent_at,
             anchor_x,
             anchor_y,
-        ));
+        );
+        session.pending_recenter_delta = Some(recenter_delta);
+        runtime.outgoing = Some(session);
         for event in releases {
             self.inject(event);
         }
@@ -1528,6 +1726,7 @@ impl Inner {
         let incoming = runtime.retire_incoming();
         self.injector.invalidate();
         if let Some(session) = &outgoing {
+            runtime.track_cancel(&session.peer_id, &session.session_id, now_ms());
             let _ = self.outbound.send(outbound(
                 &session.peer_id,
                 MouseSignal::Cancel {
@@ -1536,6 +1735,7 @@ impl Inner {
             ));
         }
         if let Some(session) = &incoming {
+            runtime.track_cancel(&session.peer_id, &session.session_id, now_ms());
             let _ = self.outbound.send(outbound(
                 &session.peer_id,
                 MouseSignal::Cancel {
@@ -1569,6 +1769,7 @@ impl Inner {
             for event in release_held_input(&incoming) {
                 self.inject(event);
             }
+            runtime.track_cancel(&incoming.peer_id, &incoming.session_id, now);
             let _ = self.outbound.send(outbound(
                 &incoming.peer_id,
                 MouseSignal::Cancel {
@@ -1602,7 +1803,19 @@ impl Inner {
             ),
         );
         if runtime.incoming.is_some() {
-            if runtime.local_intent(event, now) {
+            let (physical_event, cursor_relocation) = runtime.normalize_incoming_move(event);
+            if cursor_relocation {
+                self.logger.mouse_trace(
+                    "local_cursor_relocation_filtered",
+                    format!(
+                        "observed={} physical={} state={}",
+                        describe_hook_event(event),
+                        describe_hook_event(physical_event),
+                        runtime.trace_state()
+                    ),
+                );
+            }
+            if runtime.local_intent(physical_event, now) {
                 self.logger.mouse_trace(
                     "local_mouse_decision",
                     format!(
@@ -1636,8 +1849,29 @@ impl Inner {
             let session_id = outgoing.session_id.clone();
             match event {
                 HookMouseEvent::Move { x, y, native_delta } => {
-                    let (raw_delta_x, raw_delta_y) =
+                    let (mut raw_delta_x, mut raw_delta_y) =
                         native_delta.unwrap_or((x - outgoing.anchor_x, y - outgoing.anchor_y));
+                    if let Some((recenter_x, recenter_y)) = outgoing.pending_recenter_delta {
+                        if now.saturating_sub(outgoing.last_enter_retry_at) > 100 {
+                            outgoing.pending_recenter_delta = None;
+                        } else if x.abs_diff(outgoing.anchor_x) <= 2
+                            && y.abs_diff(outgoing.anchor_y) <= 2
+                            && recenter_x.unsigned_abs().max(recenter_y.unsigned_abs())
+                                > MAX_PHYSICAL_DELTA_PER_EVENT as u32
+                            && raw_delta_x.abs_diff(recenter_x)
+                                <= MAX_PHYSICAL_DELTA_PER_EVENT as u32
+                            && raw_delta_y.abs_diff(recenter_y)
+                                <= MAX_PHYSICAL_DELTA_PER_EVENT as u32
+                        {
+                            raw_delta_x = raw_delta_x.saturating_sub(recenter_x);
+                            raw_delta_y = raw_delta_y.saturating_sub(recenter_y);
+                            outgoing.pending_recenter_delta = None;
+                            self.logger.mouse_trace(
+                                "source_recenter_delta_filtered",
+                                format!("recenter=({recenter_x},{recenter_y}) physical=({raw_delta_x},{raw_delta_y})"),
+                            );
+                        }
+                    }
                     let (delta_x, delta_y) = (
                         clamp_physical_delta(raw_delta_x),
                         clamp_physical_delta(raw_delta_y),
@@ -1792,6 +2026,10 @@ impl Inner {
                         exit_edge: position,
                         anchor_x,
                         anchor_y,
+                        pending_recenter_delta: Some((
+                            anchor_x.saturating_sub(x),
+                            anchor_y.saturating_sub(y),
+                        )),
                         enter_ratio: ratio,
                         last_enter_retry_at: sent_at,
                         acknowledged: false,
@@ -2052,7 +2290,13 @@ pub fn describe_mouse_signal(signal: &MouseSignal) -> String {
         MouseSignal::Return { session_id, ratio } => {
             format!("return session={} ratio={ratio:.4}", short_id(session_id))
         }
+        MouseSignal::ReturnAck { session_id } => {
+            format!("return_ack session={}", short_id(session_id))
+        }
         MouseSignal::Cancel { session_id } => format!("cancel session={}", short_id(session_id)),
+        MouseSignal::CancelAck { session_id } => {
+            format!("cancel_ack session={}", short_id(session_id))
+        }
         MouseSignal::Ack {
             session_id,
             sent_at,
@@ -2089,6 +2333,7 @@ fn new_outgoing_session(
         exit_edge,
         anchor_x,
         anchor_y,
+        pending_recenter_delta: None,
         enter_ratio,
         last_enter_retry_at: sent_at,
         acknowledged: false,
@@ -2473,6 +2718,7 @@ mod tests {
             keyboard_listener_attempted: AtomicBool::new(false),
             keyboard_listener_started: AtomicBool::new(false),
             source_control_active: Arc::new(AtomicBool::new(outgoing)),
+            injection_failed: Arc::new(AtomicBool::new(false)),
             latency_ms: AtomicU64::new(NO_LATENCY),
             last_physical_at: AtomicU64::new(0),
             runtime: Mutex::new(Runtime {
@@ -2485,6 +2731,8 @@ mod tests {
                 takeover_delta: (0, 0),
                 takeover_started_at: 0,
                 retired_sessions: VecDeque::new(),
+                pending_returns: VecDeque::new(),
+                pending_cancels: VecDeque::new(),
                 outgoing: outgoing.then_some(session),
                 incoming: None,
                 local_held_keys: HashSet::new(),
@@ -2626,6 +2874,202 @@ mod tests {
             .unwrap()
             .incoming
             .is_none());
+    }
+
+    #[test]
+    fn remote_cursor_relocation_does_not_take_back_control() {
+        let fixture = fixture(false);
+        enter(&fixture.share);
+        {
+            let mut runtime = fixture.share.inner.runtime.lock().unwrap();
+            runtime.last_x = 1674;
+            runtime.last_y = 559;
+            let incoming = runtime.incoming.as_mut().unwrap();
+            incoming.last_injected_x = 1094;
+            incoming.last_injected_y = 407;
+        }
+        assert!(fixture
+            .share
+            .inner
+            .handle_local_event(HookMouseEvent::Move {
+                x: 1094,
+                y: 407,
+                native_delta: Some((-579, -152)),
+            }));
+        assert!(fixture
+            .share
+            .inner
+            .runtime
+            .lock()
+            .unwrap()
+            .incoming
+            .is_some());
+        assert!(!fixture
+            .share
+            .inner
+            .handle_local_event(HookMouseEvent::Move {
+                x: 1104,
+                y: 407,
+                native_delta: Some((10, 0)),
+            }));
+        assert!(fixture
+            .share
+            .inner
+            .runtime
+            .lock()
+            .unwrap()
+            .incoming
+            .is_none());
+    }
+
+    #[test]
+    fn source_recenter_is_removed_from_first_remote_delta() {
+        let mut fixture = fixture(true);
+        {
+            let mut runtime = fixture.share.inner.runtime.lock().unwrap();
+            runtime.outgoing.as_mut().unwrap().pending_recenter_delta = Some((-960, -25));
+        }
+        assert!(fixture
+            .share
+            .inner
+            .handle_local_event(HookMouseEvent::Move {
+                x: 500,
+                y: 400,
+                native_delta: Some((-938, -27)),
+            }));
+        assert!(matches!(
+            fixture.receiver.try_recv().unwrap().signal,
+            MouseSignal::Move { total_x_milli, total_y_milli, .. }
+                if total_x_milli == scaled_pointer_delta(22)
+                    && total_y_milli == scaled_pointer_delta(-2)
+        ));
+    }
+
+    #[test]
+    fn lost_return_is_retried_until_acknowledged() {
+        let receiver_fixture = fixture(false);
+        enter(&receiver_fixture.share);
+        {
+            let mut runtime = receiver_fixture.share.inner.runtime.lock().unwrap();
+            let incoming = runtime.incoming.as_mut().unwrap();
+            incoming.return_armed = true;
+            incoming.x_milli = 0;
+        }
+        let responses = receiver_fixture.share.apply_remote(
+            "peer",
+            MouseSignal::Move {
+                session_id: "incoming".into(),
+                sequence: 1,
+                total_x_milli: -50_000,
+                total_y_milli: 0,
+            },
+        );
+        assert!(responses
+            .iter()
+            .any(|response| matches!(response.signal, MouseSignal::Return { .. })));
+        let mut runtime = receiver_fixture.share.inner.runtime.lock().unwrap();
+        assert!(runtime.retry_pending_returns(now_ms()).is_empty());
+        assert!(runtime
+            .retry_pending_returns(now_ms() + RETURN_RETRY_MS + 1)
+            .iter()
+            .any(|signal| matches!(signal.signal, MouseSignal::Return { .. })));
+        drop(runtime);
+        receiver_fixture.share.apply_remote(
+            "peer",
+            MouseSignal::ReturnAck {
+                session_id: "incoming".into(),
+            },
+        );
+        assert!(receiver_fixture
+            .share
+            .inner
+            .runtime
+            .lock()
+            .unwrap()
+            .pending_returns
+            .is_empty());
+        let source = fixture(true);
+        let response = source.share.apply_remote(
+            "peer",
+            MouseSignal::Return {
+                session_id: "session".into(),
+                ratio: 0.5,
+            },
+        );
+        assert!(response
+            .iter()
+            .any(|signal| matches!(signal.signal, MouseSignal::ReturnAck { .. })));
+    }
+
+    #[test]
+    fn local_takeover_retries_cancel_until_acknowledged() {
+        let mut fixture = fixture(false);
+        enter(&fixture.share);
+        assert!(!fixture
+            .share
+            .inner
+            .handle_local_event(HookMouseEvent::Button {
+                button: HookMouseButton::Left,
+                pressed: true,
+            }));
+        assert!(matches!(
+            fixture.receiver.try_recv().unwrap().signal,
+            MouseSignal::Cancel { .. }
+        ));
+        let mut runtime = fixture.share.inner.runtime.lock().unwrap();
+        assert_eq!(runtime.pending_cancels.len(), 1);
+        assert!(runtime
+            .retry_pending_cancels(now_ms() + RETURN_RETRY_MS + 1)
+            .iter()
+            .any(|signal| matches!(signal.signal, MouseSignal::Cancel { .. })));
+        drop(runtime);
+        let responses = fixture.share.apply_remote(
+            "peer",
+            MouseSignal::Cancel {
+                session_id: "incoming".into(),
+            },
+        );
+        assert!(responses
+            .iter()
+            .any(|signal| matches!(signal.signal, MouseSignal::CancelAck { .. })));
+        fixture.share.apply_remote(
+            "peer",
+            MouseSignal::CancelAck {
+                session_id: "incoming".into(),
+            },
+        );
+        assert!(fixture
+            .share
+            .inner
+            .runtime
+            .lock()
+            .unwrap()
+            .pending_cancels
+            .is_empty());
+    }
+
+    #[test]
+    fn failed_remote_injection_releases_local_control() {
+        let mut fixture = fixture(false);
+        enter(&fixture.share);
+        fixture
+            .share
+            .inner
+            .injection_failed
+            .store(true, Ordering::Release);
+        fixture.share.recover_injection_failure();
+        assert!(fixture
+            .share
+            .inner
+            .runtime
+            .lock()
+            .unwrap()
+            .incoming
+            .is_none());
+        assert!(matches!(
+            fixture.receiver.try_recv().unwrap().signal,
+            MouseSignal::Cancel { .. }
+        ));
     }
 
     #[test]

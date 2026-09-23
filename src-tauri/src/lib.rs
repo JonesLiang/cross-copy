@@ -262,6 +262,16 @@ async fn clear_diagnostics(
 }
 
 #[tauri::command]
+async fn set_diagnostics_enabled(
+    core: State<'_, Arc<Core>>,
+    enabled: bool,
+) -> Result<String, String> {
+    Arc::clone(core.inner())
+        .set_diagnostics_enabled(enabled)
+        .await
+}
+
+#[tauri::command]
 fn wake_network(core: State<'_, Arc<Core>>) {
     core.wake_network();
 }
@@ -551,6 +561,7 @@ pub fn run() {
             unpair,
             export_diagnostics,
             clear_diagnostics,
+            set_diagnostics_enabled,
             wake_network,
             open_input_permissions,
             get_update_environment,

@@ -1,6 +1,7 @@
 use crate::crypto::random_secret;
 use crate::model::{
-    default_copy_shortcut, default_mouse_shortcut, default_paste_shortcut, ScreenPosition, Settings,
+    default_copy_shortcut, default_mouse_shortcut, default_paste_shortcut, DiagnosticsState,
+    ScreenPosition, Settings,
 };
 use std::{collections::HashSet, fs, io, path::PathBuf, sync::RwLock};
 use uuid::Uuid;
@@ -34,6 +35,7 @@ impl Store {
                 mouse_extreme_performance: false,
                 mouse_shortcut: default_mouse_shortcut(),
                 mouse_position: ScreenPosition::Right,
+                diagnostics: DiagnosticsState::default(),
             });
         if value.group_id.is_empty() {
             value.group_id = value.device_id.clone();
