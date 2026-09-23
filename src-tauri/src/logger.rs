@@ -76,6 +76,37 @@ impl Logger {
         Ok(output)
     }
 
+    pub fn clear(&self) -> io::Result<u64> {
+        for target in [&self.general, &self.mouse, &self.clipboard] {
+            let mut state = target
+                .state
+                .lock()
+                .map_err(|_| io::Error::other("log state lock poisoned"))?;
+            state.file.flush()?;
+            state.file.set_len(0)?;
+            state.bytes = 0;
+            for index in 1..=ROTATED_LOGS {
+                let rotated = self.directory.join(format!("{}.{index}", target.name));
+                if rotated.exists() {
+                    fs::remove_file(rotated)?;
+                }
+            }
+        }
+        if let Ok(mut trace) = self.mouse_trace.lock() {
+            trace.clear();
+        }
+        let cleared_at = now_ms();
+        self.info(
+            "diagnostics_log_started",
+            format!("cleared_at_ms={cleared_at}"),
+        );
+        self.mouse_trace(
+            "diagnostics_log_started",
+            format!("cleared_at_ms={cleared_at}"),
+        );
+        Ok(cleared_at)
+    }
+
     fn write_export(&self, output: &mut impl Write, summary: &str) -> io::Result<()> {
         writeln!(output, "CrossCopy diagnostics")?;
         writeln!(output, "generated_at_ms={}", now_ms())?;

@@ -182,6 +182,7 @@ enum SecureMessage {
         snapshot: TrustSnapshot,
     },
     DiagnosticsRequest,
+    DiagnosticsClear,
     Filesystem {
         request: FsRequest,
     },
@@ -1397,6 +1398,57 @@ impl Core {
         self.logger
             .info("diagnostics_exported", "destination=downloads/CrossCopy");
         Ok(path.to_string_lossy().into_owned())
+    }
+
+    pub async fn clear_diagnostics(&self, peer_id: Option<String>) -> Result<String, String> {
+        if let Some(peer_id) = peer_id {
+            let settings = self.store.get();
+            let peer = settings
+                .peers
+                .iter()
+                .find(|peer| peer.id == peer_id)
+                .ok_or("诊断日志目标不存在")?;
+            let seen = self
+                .discovered
+                .lock()
+                .expect("discovery lock")
+                .get(&peer_id)
+                .cloned()
+                .ok_or("诊断日志目标离线")?;
+            if now_ms().saturating_sub(seen.last_seen) >= ONLINE_WINDOW_MS {
+                return Err("诊断日志目标离线".into());
+            }
+            let key = decode_secret(&peer.secret)?;
+            let address = SocketAddr::new(seen.host, seen.packet.port);
+            let mut stream =
+                tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(address))
+                    .await
+                    .map_err(|_| "连接对端诊断服务超时".to_string())?
+                    .map_err(|error| error.to_string())?;
+            write_json(
+                &mut stream,
+                &WireMessage::Secure {
+                    sender_id: settings.device_id,
+                    envelope: encrypt(&key, &SecureMessage::DiagnosticsClear)?,
+                },
+            )
+            .await?;
+            let response = tokio::time::timeout(
+                Duration::from_secs(10),
+                read_secure_frame(&mut stream, &key),
+            )
+            .await
+            .map_err(|_| "等待对端清空诊断日志超时".to_string())??;
+            let cleared_at =
+                String::from_utf8(response).map_err(|_| "对端返回无效响应".to_string())?;
+            Ok(format!(
+                "已清空 {} 的日志，从 {cleared_at} 开始记录",
+                peer.name
+            ))
+        } else {
+            let cleared_at = self.logger.clear().map_err(|error| error.to_string())?;
+            Ok(format!("已清空本机日志，从 {cleared_at} 开始记录"))
+        }
     }
 
     async fn start_discovery(self: &Arc<Self>) -> Result<(), String> {
@@ -2698,6 +2750,15 @@ impl Core {
                             format!("peer={} bytes={}", peer.id, bytes.len()),
                         );
                         write_secure_frame(&mut stream, &key, &bytes).await
+                    }
+                    SecureMessage::DiagnosticsClear => {
+                        let cleared_at = self.logger.clear().map_err(|error| error.to_string())?;
+                        self.logger.info(
+                            "diagnostics_remote_clear_completed",
+                            format!("requested_by_peer={} cleared_at_ms={cleared_at}", peer.id),
+                        );
+                        write_secure_frame(&mut stream, &key, cleared_at.to_string().as_bytes())
+                            .await
                     }
                     SecureMessage::Filesystem { request } => {
                         let response = if peer.filesystem_allowed {

@@ -61,6 +61,8 @@ const crosscopy = {
   unpair: (peerId: string) => invoke<void>("unpair", { peerId }),
   exportDiagnostics: (peerId?: string) =>
     invoke<string>("export_diagnostics", { peerId: peerId ?? null }),
+  clearDiagnostics: (peerId?: string) =>
+    invoke<string>("clear_diagnostics", { peerId: peerId ?? null }),
   getUpdateEnvironment: () =>
     invoke<UpdateEnvironment>("get_update_environment"),
   logUpdateEvent: (level: string, event: string, detail: string) =>
@@ -242,6 +244,17 @@ function App(): React.JSX.Element {
     } catch (reason) {
       setDiagnosticsMessage(
         typeof reason === "string" ? reason : "诊断日志导出失败"
+      );
+    }
+  }
+
+  async function clearDiagnostics(peerId?: string): Promise<void> {
+    setDiagnosticsMessage("正在清空");
+    try {
+      setDiagnosticsMessage(await crosscopy.clearDiagnostics(peerId));
+    } catch (reason) {
+      setDiagnosticsMessage(
+        typeof reason === "string" ? reason : "诊断日志清空失败"
       );
     }
   }
@@ -473,6 +486,7 @@ function App(): React.JSX.Element {
             state={state}
             diagnosticsMessage={diagnosticsMessage}
             onDiagnostics={exportDiagnostics}
+            onClearDiagnostics={clearDiagnostics}
           />
         ) : view === "mouse" ? (
           <MousePanel state={state} />
@@ -2440,6 +2454,7 @@ function SettingsPanel(props: {
   state: UiState;
   diagnosticsMessage: string;
   onDiagnostics(peerId?: string): Promise<void>;
+  onClearDiagnostics(peerId?: string): Promise<void>;
 }): React.JSX.Element {
   const isMac = navigator.userAgent.includes("Mac");
 
@@ -2575,16 +2590,33 @@ function SettingsPanel(props: {
               <FileText size={16} />
               导出本机日志
             </button>
+            <button
+              className="secondary-button"
+              type="button"
+              onClick={() => void props.onClearDiagnostics()}
+            >
+              <Trash size={16} />
+              清空本机日志
+            </button>
             {props.state.peers.filter((peer) => peer.online).map((peer) => (
-              <button
-                className="secondary-button"
-                type="button"
-                key={peer.id}
-                onClick={() => void props.onDiagnostics(peer.id)}
-              >
-                <FileText size={16} />
-                导出 {peer.name} 日志
-              </button>
+              <React.Fragment key={peer.id}>
+                <button
+                  className="secondary-button"
+                  type="button"
+                  onClick={() => void props.onDiagnostics(peer.id)}
+                >
+                  <FileText size={16} />
+                  导出 {peer.name} 日志
+                </button>
+                <button
+                  className="secondary-button"
+                  type="button"
+                  onClick={() => void props.onClearDiagnostics(peer.id)}
+                >
+                  <Trash size={16} />
+                  清空 {peer.name} 日志
+                </button>
+              </React.Fragment>
             ))}
             {props.diagnosticsMessage && <small>{props.diagnosticsMessage}</small>}
           </div>

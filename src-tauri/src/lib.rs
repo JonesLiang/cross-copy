@@ -254,6 +254,14 @@ async fn export_diagnostics(
 }
 
 #[tauri::command]
+async fn clear_diagnostics(
+    core: State<'_, Arc<Core>>,
+    peer_id: Option<String>,
+) -> Result<String, String> {
+    core.clear_diagnostics(peer_id).await
+}
+
+#[tauri::command]
 fn wake_network(core: State<'_, Arc<Core>>) {
     core.wake_network();
 }
@@ -542,6 +550,7 @@ pub fn run() {
             set_launch_at_login,
             unpair,
             export_diagnostics,
+            clear_diagnostics,
             wake_network,
             open_input_permissions,
             get_update_environment,
