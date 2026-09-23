@@ -1,6 +1,6 @@
 # 剪贴板与 Win–Mac 跨屏回归
 
-两端使用同一份修改后的版本。以下需要真实双机验证，单元测试不能证明系统休眠、权限和跨屏手感正常。
+两端必须同时使用本次修复后的版本：键鼠协议从 6 升为 7（双向心跳、控制权撤销），不支持与旧版本混用。以下需要真实双机验证，单元测试不能证明系统休眠、权限和跨屏手感正常。
 
 ## 剪贴板
 
@@ -8,7 +8,8 @@
 2. 原剪贴板分别放置空内容、图片、富文本、应用自定义格式，再执行跨设备复制/粘贴。
 3. 两台机器空闲 30 分钟，再分别休眠、唤醒；不重启应用，重复上述操作。
 4. 在目标应用响应较慢时复制；应等待新内容，不能把原剪贴板内容再次发送。未选中可复制内容时应明确报错。
-5. Windows 恢复失败时检查 `clipboard_snapshot_restored` 的 attempt 和 `clipboard_emergency_restore_failed`，保留完整 HRESULT，区分读取、写入和恢复阶段。
+5. 按住 Ctrl+Shift，按下并松开 C，再松开 Ctrl+Shift；验证系统复制是在修饰键全部释放后执行。持续按住修饰键超过 3 秒应提示松键，不能读取旧剪贴板。Windows 还需验证非英文键盘布局下的 C/V 命令。
+6. Windows 恢复失败时检查 `clipboard_snapshot_restored` 的 attempt 和 `clipboard_emergency_restore_failed`，保留完整 HRESULT，区分读取、写入和恢复阶段。
 
 ## 键鼠共享
 
@@ -18,10 +19,25 @@
 4. 断开网络再恢复、关闭再开启共享；确认本机控制权可恢复，远端没有卡住的按键。
 5. macOS 首次未授予辅助功能权限，然后授权；确认监听器与注入器可恢复。检查 `mouse_listener_failed`、`keyboard_listener_failed`、`mouse_injector_retry`。
 
+6. A 控制 B 时，在 B 主动移动、点击或按键：B 应夺回控制，A 恢复本机；单像素往返抖动不应触发夺回。
+7. A 从 B 返回、B 夺回本机以及网络中断恢复后，让光标留在边缘并沿边缘移动，等待至少 5 秒：不应再次切屏。先移入屏内 32px，再向边缘移动，才可以重新跨屏。
+8. 按住远端 Shift 或鼠标键时夺回本机，确认旧会话的按键被释放，迟到的移动、Enter 和心跳不会恢复旧控制权。
+9. 跨屏后静置至少 10 秒，心跳应保留正常会话；控制端断网超过 5 秒，应撤销接收端会话。
+
+## 本机日志结论（2026-09-23）
+
+检查了 `~/Library/Application Support/app.crosscopy.desktop/logs/`。最近一次启动为 09:32:39，版本 3.2.7；该次会话记录了 19 次跨屏握手，显示的延迟中位数 5ms、最大 41ms，没有监听器或注入失败记录。该次启动之后没有本机剪贴板日志，因此不能用这些日志证明 Windows 的复制失败原因。
+
+旧日志没有逐帧时序，不能将“约 200ms 周期卡顿”直接归因为网络。本次修复消除快速移动整帧丢弃、UI 刷新阻塞收发、光标返回事件被提前丢弃三条已确认的代码路径，并改为 macOS Session 层注入移动/拖动事件，保留来源标记、鼠标键和修饰键状态。
+
+新增日志：`mouse_source_gap` 记录源端硬件移动间隔；`mouse_receive_gap` 记录收包间隔与序号差；`mouse_injection_stall` 分开记录队列等待和系统调用耗时；`mouse_local_takeover`、`mouse_incoming_expired` 记录主动夺回与租约过期。间隔日志也可能来自用户暂停移动，需结合连续移动的复现过程判断。
+
+macOS 新事件源将本地输入抑制间隔设置为 0。[Apple 文档](https://developer.apple.com/documentation/coregraphics/cgeventsourcesetlocaleventssuppressioninterval)说明该间隔控制合成事件后的本地输入抑制；这项处理不能单独证明旧版本的周期性卡顿来源。
+
 ## 自动验证
 
 `cargo test --manifest-path src-tauri/Cargo.toml --lib`
 
-新增测试覆盖固定捕获位置下连续位移累积、位移合并不跨越点击，以及 macOS 多项/自定义二进制剪贴板数据的保存恢复。macOS 剪贴板测试使用独立命名剪贴板，不修改用户的通用剪贴板。
+测试覆盖固定捕获位置下连续位移累积、位移合并不跨越点击、主动夺回、抖动过滤、旧会话重放、取消丢包恢复、边缘重新触发、返回光标顺序、租约过期、快速移动、按键释放、快捷键修饰键等待，以及 macOS 拖动/修饰键事件和多项原生剪贴板往返。剪贴板测试使用独立命名剪贴板，鼠标测试只构造事件与状态，不向桌面注入输入。
 
-本次本地验证：macOS 9 项单元测试通过；用项目锁定的依赖，对 Windows 剪贴板、鼠标监听和共享模块执行了 `x86_64-pc-windows-gnu` 的隔离 `cargo check --tests`，检查通过。这不是完整 Windows 安装包构建，也没有运行 Windows 测试或上述双机实测。
+本次本地验证：macOS 25 项单元测试通过；Windows 剪贴板、鼠标监听和共享模块执行了 `x86_64-pc-windows-gnu` 的隔离 `cargo check --tests`。这不是完整 Windows 安装包构建，也没有运行 Windows 测试或上述双机实测。

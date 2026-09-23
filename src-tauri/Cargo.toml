@@ -1,6 +1,6 @@
 [package]
 name = "crosscopy"
-version = "3.2.6"
+version = "3.2.7"
 description = "Fast private LAN mouse sharing and clipboard sync"
 authors = ["CrossCopy"]
 edition = "2021"
@@ -45,6 +45,7 @@ trash = "5.2.6"
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", features = ["NSPasteboard", "NSPasteboardItem"] }
 objc2-foundation = { version = "0.3", features = ["NSArray", "NSData", "NSString"] }
+foreign-types = "0.5"
 core-foundation = "0.10"
 core-graphics = { version = "0.25", features = ["highsierra"] }
 

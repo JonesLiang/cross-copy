@@ -304,19 +304,121 @@ pub fn recenter_cursor(x: i32, y: i32, bounds: DesktopBounds) -> Result<(), Stri
     .map_err(|error| format!("macOS 鼠标回中失败：{error:?}"))
 }
 
-/// Moves the cursor on behalf of a remote controller.  Warping is used
-/// instead of posting `kCGEventMouseMoved`: the WindowServer coalesces and
-/// regenerates HID-posted mouse-moved events, stripping their source
-/// identity, so the event tap cannot reliably tell injected motion from
-/// physical input.  Warped moves generate no events at all, which keeps the
-/// tap observing genuine hardware only (the same reason the source-side
-/// recenter warps).
+#[cfg(target_os = "macos")]
+thread_local! {
+    static REMOTE_BUTTONS: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    static REMOTE_KEYS: std::cell::RefCell<std::collections::HashSet<HookKey>> = std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+#[cfg(target_os = "macos")]
+pub fn record_injected_event(event: HookMouseEvent) {
+    match event {
+        HookMouseEvent::Button { button, pressed } => REMOTE_BUTTONS.with(|buttons| {
+            let mask = match button {
+                HookMouseButton::Left => 1,
+                HookMouseButton::Right => 2,
+                HookMouseButton::Middle => 4,
+            };
+            buttons.set(if pressed {
+                buttons.get() | mask
+            } else {
+                buttons.get() & !mask
+            });
+        }),
+        HookMouseEvent::Key { key, pressed } => REMOTE_KEYS.with(|keys| {
+            if pressed {
+                keys.borrow_mut().insert(key);
+            } else {
+                keys.borrow_mut().remove(&key);
+            }
+        }),
+        _ => {}
+    }
+}
+
+/// Remote motion is posted after the HID tap. It therefore cannot be read
+/// back as physical input by our source hook. Unlike a warp, it also delivers
+/// hover/drag events to applications without repeatedly disassociating hardware.
 #[cfg(target_os = "macos")]
 pub fn move_cursor_absolute(x: i32, y: i32) -> Result<(), String> {
-    use core_graphics::{display::CGDisplay, geometry::CGPoint};
+    make_remote_mouse_event(x, y)?.post(core_graphics::event::CGEventTapLocation::Session);
+    Ok(())
+}
 
-    CGDisplay::warp_mouse_cursor_position(CGPoint::new(f64::from(x), f64::from(y)))
-        .map_err(|error| format!("macOS 鼠标移动失败：{error:?}"))
+#[cfg(target_os = "macos")]
+fn make_remote_mouse_event(x: i32, y: i32) -> Result<core_graphics::event::CGEvent, String> {
+    use core_graphics::{
+        event::{CGEvent, CGEventFlags, CGEventType, CGMouseButton, EventField},
+        event_source::{CGEventSource, CGEventSourceStateID},
+        geometry::CGPoint,
+    };
+    use foreign_types::ForeignType;
+    use std::cell::RefCell;
+    thread_local! {
+        static SOURCE: RefCell<Option<CGEventSource>> = const { RefCell::new(None) };
+    }
+    unsafe extern "C" {
+        fn CGEventSourceSetLocalEventsSuppressionInterval(
+            source: *mut std::ffi::c_void,
+            seconds: f64,
+        );
+    }
+    SOURCE.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            let source = CGEventSource::new(CGEventSourceStateID::Private)
+                .map_err(|_| "无法创建 macOS 鼠标事件源".to_string())?;
+            unsafe {
+                CGEventSourceSetLocalEventsSuppressionInterval(source.as_ptr().cast(), 0.0);
+            }
+            *slot = Some(source);
+        }
+        let buttons = REMOTE_BUTTONS.with(|buttons| buttons.get());
+        let (kind, button) = if buttons & 1 != 0 {
+            (CGEventType::LeftMouseDragged, CGMouseButton::Left)
+        } else if buttons & 2 != 0 {
+            (CGEventType::RightMouseDragged, CGMouseButton::Right)
+        } else if buttons & 4 != 0 {
+            (CGEventType::OtherMouseDragged, CGMouseButton::Center)
+        } else {
+            (CGEventType::MouseMoved, CGMouseButton::Left)
+        };
+        let event = CGEvent::new_mouse_event(
+            slot.as_ref().unwrap().clone(),
+            kind,
+            CGPoint::new(f64::from(x), f64::from(y)),
+            button,
+        )
+        .map_err(|_| "无法创建 macOS 鼠标移动事件".to_string())?;
+        let flags = REMOTE_KEYS.with(|keys| {
+            keys.borrow()
+                .iter()
+                .fold(CGEventFlags::empty(), |flags, key| {
+                    flags
+                        | match key {
+                            HookKey::LeftShift | HookKey::RightShift => {
+                                CGEventFlags::CGEventFlagShift
+                            }
+                            HookKey::LeftControl | HookKey::RightControl => {
+                                CGEventFlags::CGEventFlagControl
+                            }
+                            HookKey::LeftAlt | HookKey::RightAlt => {
+                                CGEventFlags::CGEventFlagAlternate
+                            }
+                            HookKey::LeftMeta | HookKey::RightMeta => {
+                                CGEventFlags::CGEventFlagCommand
+                            }
+                            _ => CGEventFlags::empty(),
+                        }
+                })
+        });
+        event.set_flags(flags);
+        event.set_integer_value_field(
+            EventField::EVENT_SOURCE_USER_DATA,
+            SYNTHETIC_INPUT_MARKER as i64,
+        );
+        Ok(event)
+    })
 }
 
 #[cfg(target_os = "windows")]
@@ -494,12 +596,8 @@ pub fn run_mouse_hook(
                 return CallbackResult::Keep;
             }
             let location = event.location();
-            // Cursor motion injected for a remote controller is applied with
-            // CGWarpMouseCursorPosition, which generates no events, so every
-            // move observed here is physical.  Only Enigo button and scroll
-            // events still arrive through the HID stream; the source process
-            // id unambiguously identifies every event injected by this
-            // CrossCopy process, with EVENT_SOURCE_USER_DATA as a fallback.
+            // Remote motion is posted at the session tap, downstream of HID.
+            // Marked Enigo buttons/scroll still enter at HID and must pass.
             let injected_by_this_process = event
                 .get_integer_value_field(EventField::EVENT_SOURCE_UNIX_PROCESS_ID)
                 == i64::from(std::process::id());
@@ -613,9 +711,7 @@ pub fn run_mouse_hook(
                         y: data.pt.y,
                         native_delta: {
                             let mut current = POINT::default();
-                            if SOURCE_CURSOR_CAPTURED.load(Ordering::Acquire)
-                                && unsafe { GetCursorPos(&mut current) }.is_ok()
-                            {
+                            if unsafe { GetCursorPos(&mut current) }.is_ok() {
                                 Some((data.pt.x - current.x, data.pt.y - current.y))
                             } else {
                                 None
@@ -998,4 +1094,59 @@ fn monotonic_ms() -> u64 {
 
     static START: OnceLock<Instant> = OnceLock::new();
     START.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
+#[cfg(target_os = "macos")]
+pub fn shortcut_modifiers_down() -> bool {
+    unsafe extern "C" {
+        fn CGEventSourceKeyState(state: i32, key: u16) -> bool;
+    }
+    // Hardware state, not synthetic modifier state from the remote peer.
+    [54, 55, 56, 58, 59, 60, 61, 62]
+        .into_iter()
+        .any(|key| unsafe { CGEventSourceKeyState(1, key) })
+}
+
+#[cfg(target_os = "windows")]
+pub fn shortcut_modifiers_down() -> bool {
+    use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+    [0x10, 0x11, 0x12, 0x5B, 0x5C]
+        .into_iter()
+        .any(|key| unsafe { GetAsyncKeyState(key) } < 0)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+    use core_graphics::event::{CGEventFlags, CGEventType, EventField};
+
+    #[test]
+    fn remote_motion_preserves_drag_and_modifier_state_without_posting_input() {
+        record_injected_event(HookMouseEvent::Button {
+            button: HookMouseButton::Left,
+            pressed: true,
+        });
+        record_injected_event(HookMouseEvent::Key {
+            key: HookKey::LeftShift,
+            pressed: true,
+        });
+        let event = make_remote_mouse_event(100, 200).unwrap();
+        assert!(matches!(event.get_type(), CGEventType::LeftMouseDragged));
+        assert!(event.get_flags().contains(CGEventFlags::CGEventFlagShift));
+        assert_eq!(
+            event.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA),
+            SYNTHETIC_INPUT_MARKER as i64
+        );
+        record_injected_event(HookMouseEvent::Button {
+            button: HookMouseButton::Left,
+            pressed: false,
+        });
+        record_injected_event(HookMouseEvent::Key {
+            key: HookKey::LeftShift,
+            pressed: false,
+        });
+        let event = make_remote_mouse_event(100, 200).unwrap();
+        assert!(matches!(event.get_type(), CGEventType::MouseMoved));
+        assert!(event.get_flags().is_empty());
+    }
 }

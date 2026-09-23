@@ -50,7 +50,7 @@ fn send(socket: &UdpSocket, key: &[u8], signal: serde_json::Value) {
     let envelope = encrypt(key, &signal);
     let packet = Packet {
         app: "crosscopy",
-        protocol: 6,
+        protocol: 7,
         senderId: PEER_ID,
         envelope,
     };

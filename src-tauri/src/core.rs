@@ -71,7 +71,7 @@ const CLIPBOARD_RETRY_ATTEMPTS: usize = 16;
 const CLIPBOARD_RETRY_DELAY_MS: u64 = 50;
 const ACTIVE_DISCOVERY_MS: u64 = 30_000;
 const MOUSE_PRESENCE_REFRESH_MS: u64 = 5_000;
-const MOUSE_PROTOCOL: u8 = 6;
+const MOUSE_PROTOCOL: u8 = 7;
 
 #[derive(Clone)]
 struct SeenPeer {
@@ -276,6 +276,7 @@ pub struct Core {
     mouse_receiver: Mutex<Option<mpsc::UnboundedReceiver<OutboundMouseSignal>>>,
     mouse_socket: Mutex<Option<Arc<UdpSocket>>>,
     mouse_routes: Mutex<HashMap<String, MouseRoute>>,
+    mouse_publish: Arc<Notify>,
     device_id: String,
 }
 
@@ -308,6 +309,7 @@ impl Core {
             mouse_receiver: Mutex::new(Some(mouse_receiver)),
             mouse_socket: Mutex::new(None),
             mouse_routes: Mutex::new(HashMap::new()),
+            mouse_publish: Arc::new(Notify::new()),
             device_id,
         })
     }
@@ -377,8 +379,12 @@ impl Core {
     pub fn ui_state(&self) -> UiState {
         let settings = self.store.get();
         let now = now_ms();
-        let discovered = self.discovered.lock().expect("discovery lock");
-        let pairing = self.pairing.lock().expect("pairing lock");
+        // Monitor enumeration may synchronously wait for the UI thread. Never
+        // hold discovery/pairing locks across that call: mouse presence updates
+        // and routing also need them.
+        let discovered = self.discovered.lock().expect("discovery lock").clone();
+        let pairing = self.pairing.lock().expect("pairing lock").as_ref()
+            .map(|session| (session.code.clone(), session.expires_at));
         UiState {
             device_name: settings.device_name,
             displays: self.display_views(now),
@@ -403,8 +409,8 @@ impl Core {
                 .lock()
                 .expect("transfer progress lock")
                 .clone(),
-            pairing_code: pairing.as_ref().map(|session| session.code.clone()),
-            pairing_expires_at: pairing.as_ref().map(|session| session.expires_at),
+            pairing_code: pairing.as_ref().map(|session| session.0.clone()),
+            pairing_expires_at: pairing.as_ref().map(|session| session.1),
             peers: settings
                 .peers
                 .iter()
@@ -1106,6 +1112,11 @@ impl Core {
             self.add_activity("system", "同步已暂停", "请先开启同步", "error");
             return;
         }
+        if let Err(error) = wait_for_shortcut_release().await {
+            self.logger.warn("clipboard_shortcut_modifiers_held", &error);
+            self.add_activity("system", "快捷键尚未释放", &error, "error");
+            return;
+        }
         self.wake_network();
         #[cfg(target_os = "windows")]
         let event = match windows_capture_selection(Arc::clone(&self.logger)).await {
@@ -1191,6 +1202,11 @@ impl Core {
         };
         if !self.store.get().sync_enabled {
             self.add_activity("system", "同步已暂停", "请先开启同步", "error");
+            return;
+        }
+        if let Err(error) = wait_for_shortcut_release().await {
+            self.logger.warn("clipboard_shortcut_modifiers_held", &error);
+            self.add_activity("system", "快捷键尚未释放", &error, "error");
             return;
         }
         self.wake_network();
@@ -1535,6 +1551,16 @@ impl Core {
         else {
             return;
         };
+        let wake = Arc::clone(&self.mouse_publish);
+        let weak = Arc::downgrade(self);
+        tauri::async_runtime::spawn(async move {
+            loop {
+                wake.notified().await;
+                tokio::time::sleep(Duration::from_millis(16)).await;
+                let Some(core) = weak.upgrade() else { return; };
+                let _ = tauri::async_runtime::spawn_blocking(move || core.publish()).await;
+            }
+        });
         let core = Arc::clone(self);
         let spawn_result = std::thread::Builder::new()
             .name("crosscopy-mouse-network".into())
@@ -1580,7 +1606,7 @@ impl Core {
                         }
                     }
                     if publish_state {
-                        core.publish();
+                        core.mouse_publish.notify_one();
                     }
                 }
             });
@@ -1906,7 +1932,7 @@ impl Core {
             self.send_mouse_signal(response).await?;
         }
         if publish_state || response_changes_state {
-            self.publish();
+            self.mouse_publish.notify_one();
         }
         Ok(())
     }
@@ -3359,9 +3385,35 @@ fn native_shortcut_key(key: char) -> Result<Key, String> {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+fn native_shortcut_key(key: char) -> Result<Key, String> {
+    // Copy/paste are virtual-key commands, not text insertion. This also
+    // avoids Enigo falling back to Unicode text under an alternate layout.
+    match key {
+        'c' => Ok(Key::Other(0x43)),
+        'v' => Ok(Key::Other(0x56)),
+        _ => Err("不支持的原生快捷键".into()),
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn native_shortcut_key(key: char) -> Result<Key, String> {
     Ok(Key::Unicode(key))
+}
+
+async fn wait_for_shortcut_release() -> Result<(), String> {
+    wait_for_modifiers_released(crate::mouse_hook::shortcut_modifiers_down, Duration::from_secs(3)).await
+}
+
+async fn wait_for_modifiers_released(mut pressed: impl FnMut() -> bool, timeout: Duration) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while pressed() {
+        if tokio::time::Instant::now() >= deadline {
+            return Err("请松开 Ctrl、Shift、Alt、Command/Win 后再触发复制或粘贴".into());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    Ok(())
 }
 
 fn simulate_native_shortcut_on_current_thread(key: char) -> Result<(), String> {
@@ -3807,6 +3859,7 @@ fn mouse_signal_changes_state(signal: &MouseSignal) -> bool {
     !matches!(
         signal,
         MouseSignal::Move { .. }
+            | MouseSignal::Button { .. }
             | MouseSignal::Scroll { .. }
             | MouseSignal::Key { .. }
             | MouseSignal::KeepAlive { .. }
@@ -3884,6 +3937,26 @@ fn reveal_file(path: &Path) {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_clipboard_shortcuts_use_virtual_keys() {
+        assert_eq!(super::native_shortcut_key('c'), Ok(enigo::Key::Other(0x43)));
+        assert_eq!(super::native_shortcut_key('v'), Ok(enigo::Key::Other(0x56)));
+    }
+
+    #[tokio::test]
+    async fn clipboard_shortcut_waits_for_modifier_release() {
+        let mut polls = 0;
+        super::wait_for_modifiers_released(|| { polls += 1; polls < 3 }, std::time::Duration::from_secs(1)).await.unwrap();
+        assert_eq!(polls, 3);
+    }
+
+    #[tokio::test]
+    async fn clipboard_shortcut_reports_held_modifiers_instead_of_copying() {
+        let error = super::wait_for_modifiers_released(|| true, std::time::Duration::ZERO).await.unwrap_err();
+        assert!(error.contains("松开"));
+    }
+
     use super::*;
     use std::sync::atomic::AtomicBool;
 
